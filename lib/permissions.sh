@@ -45,10 +45,11 @@
 # Read-only (no flags) — the floor, always available:
 #   tools:   Read,Bash
 #   allowed: Read plus read-only shell only:
-#     Bash(grep:*) Bash(rg:*) Bash(ls:*) Bash(wc:*) Bash(head:*) Bash(tail:*)
+#     Bash(grep:*) Bash(ls:*) Bash(wc:*) Bash(head:*) Bash(tail:*)
 #     Bash(git log:*) Bash(git diff:*) Bash(git show:*) Bash(git status:*)
 #     Bash(git blame:*)
-#   `find` stays out deliberately: -delete and -exec write.
+#   `find` and `rg` stay out deliberately: find's -delete and -exec write, and
+#   rg's --pre spawns an arbitrary program. See the note at the floor itself.
 #   Bash EXISTS in read-only mode because there is no Grep or Glob tool here;
 #   searching is done through the shell. So the tool list is not the boundary,
 #   the allow list is.
@@ -79,7 +80,7 @@
 #     assuming the result.
 #   - Which tools exist, matching the grant exactly: Read and Bash on the floor,
 #     plus Edit and Write with --edit. There is never Grep or Glob, so searching
-#     goes through grep or rg under Bash.
+#     goes through grep under Bash.
 #   - A denied Bash command is to be reported, not worked around.
 #   - Never invoke codex, claude or any other AI CLI: they spend the expensive
 #     quota. If a second opinion seems needed, say so in the answer instead.
@@ -181,10 +182,21 @@ dg_perm_resolve() {
 
   # Read-only floor. Bash is a TOOL here even in read-only mode, because this
   # environment has no Grep and no Glob: searching goes through the shell. The
-  # tool list is therefore not the boundary, the allow list is. `find` stays
-  # out of it: -delete and -exec write.
+  # tool list is therefore not the boundary, the allow list is.
+  #
+  # The allow list matches a command NAME, never its options, and that is the
+  # limit of what it can promise. Three consequences, each the reason something
+  # below is missing or qualified:
+  #
+  #   `find` is out: -delete and -exec write.
+  #   `rg` is out: `rg --pre=/usr/bin/rm pattern file` makes ripgrep spawn rm,
+  #     by design and documented. grep has no equivalent and covers the need.
+  #   `git` stays, with its options unconstrained, so `git diff --output=path`
+  #     can still create or truncate a file — verified. It stays because
+  #     log/diff/show is most of what a review task does, and the residual is
+  #     named in CLAUDE.md instead of pretended away.
   local tools='Read,Bash'
-  local allowed='Read,Bash(grep:*),Bash(rg:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*),Bash(git blame:*)'
+  local allowed='Read,Bash(grep:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*),Bash(git blame:*)'
 
   if (( we )); then
     tools="$tools,Edit,Write"
@@ -216,9 +228,9 @@ Si un comando de Bash es denegado, no intentes rodear la denegación: repórtalo
   else
     rules="$rules Herramientas en este entorno: Read y Bash; no existen Edit, Write, Grep ni Glob. Esta corrida es de SOLO LECTURA: no puedes modificar ni crear archivos. Si la tarea requiere cambiarlos, dilo en tu respuesta en vez de intentarlo."
   fi
-  rules="$rules Para buscar en el código usa grep o rg con Bash."
+  rules="$rules Para buscar en el código usa grep con Bash."
   if (( ! wb )); then
-    rules="$rules Por Bash solo corren comandos de lectura (grep, rg, ls, wc, head, tail, y git log/diff/show/status/blame); cualquier otro va a ser denegado, así que no lo intentes."
+    rules="$rules Por Bash solo corren comandos de lectura (grep, ls, wc, head, tail, y git log/diff/show/status/blame); cualquier otro va a ser denegado, así que no lo intentes. rg no está: usa grep."
   fi
 
   # No MCP server is named in this file. Which servers exist is the machine

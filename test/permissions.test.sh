@@ -196,7 +196,11 @@ test_rules_state_the_working_rules() {
   assert_contains "$DG_RULES" "commit" "no commits"
   assert_contains "$DG_RULES" "secrets" "no secrets"
   assert_contains "$DG_RULES" "dilo explícitamente" "say when a check could not run"
-  assert_contains "$DG_RULES" "grep o rg" "search through the shell"
+  # rg left the floor: its --pre spawns an arbitrary program, so a read-only run
+  # could execute anything through it. The rules say so, because a model told to
+  # use a tool that is denied burns turns finding out.
+  assert_contains "$DG_RULES" "usa grep con Bash" "search through the shell"
+  assert_contains "$DG_RULES" "rg no está" "the absence of rg is stated, not left to be discovered"
   assert_contains "$DG_RULES" "denegado" "report a denied command"
   assert_contains "$DG_RULES" "codex" "no codex"
   assert_contains "$DG_RULES" "claude" "no claude"

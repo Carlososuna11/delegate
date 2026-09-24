@@ -14,7 +14,19 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
 
 1. **La key nunca va como argumento ni en literal de shell.** Un argumento queda visible
    en `ps` para cualquier usuario de la máquina. Se lee de un archivo modo 600 y se pasa
-   solo por el environment del proceso hijo.
+   solo por el environment del proceso hijo. Ni siquiera como argumento de `env`:
+   `env ANTHROPIC_API_KEY=... cmd` pone la key en el argv de `env`, y
+   `/proc/<pid>/cmdline` es legible por cualquiera. Se exporta en este shell y el `exec`
+   la hereda. Tres corolarios, cada uno un camino de fuga que existió:
+   - `set +x` y `unset SHELLOPTS BASH_ENV ENV` en la primera línea útil del script: Bash
+     honra un `SHELLOPTS=xtrace` heredado y trazaría `key=<la key>` a stderr, que es el
+     mismo stream que recoge `--json 2>&1`.
+   - `local +x key`: un `local` que tapa una variable exportada del mismo nombre
+     **conserva** el atributo de export, así que con `export key=...` en el shell que
+     invoca, la key entraba al environment de todo helper posterior.
+   - El environment del hijo se **construye** desde una allowlist. `env -u A -u B` deja
+     pasar todo lo demás, así que `GITHUB_TOKEN`, `AWS_*` y `NODE_OPTIONS` llegaban a una
+     corrida sin flags.
 2. **La key se lee una sola vez**, justo después de validar argumentos y config. Una vez
    leída, un cambio de cuenta activa hecho por otro proceso no puede desviar la corrida
    en curso.
@@ -41,6 +53,34 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    define (`ANTHROPIC_*`, `CLAUDE_CODE_*`) se **rechaza**: `env` deja ganar la última
    asignación, así que reenviar `ANTHROPIC_API_KEY` mandaría la key del shell padre al
    endpoint del proveedor.
+
+## Lo que el piso de solo lectura NO promete
+
+Dicho explícito porque dos reviews independientes lo encontraron y porque un
+invariante que se cree más fuerte de lo que es, es peor que no tenerlo.
+
+La allowlist de Claude Code calza el **nombre** de un comando, nunca sus opciones.
+De ahí salen tres consecuencias:
+
+- `find` y `rg` quedaron **fuera** del piso: `-delete`/`-exec` escriben, y
+  `rg --pre=/usr/bin/rm` hace que ripgrep lance ese programa. `grep` cubre la
+  necesidad de búsqueda y no tiene equivalente.
+- `git` se queda, porque `log`/`diff`/`show` es casi todo lo que hace una tarea de
+  review, y con él se queda que `git diff --output=ruta` puede crear o truncar un
+  archivo. Hay un `--disallowedTools` que niega esas formas, pero es prefijo
+  también: sube el costo, no cierra el hueco.
+- **Una corrida de solo lectura puede leer cualquier archivo que pueda leer quien
+  la invoca**, y mandarlo al proveedor. `--add-dir` agrega acceso, no confina;
+  `--restricted` confina las herramientas de archivo pero no el Bash. Por eso el
+  `--dir` de una corrida delegada nunca apunta a un árbol con secretos, y por eso
+  "qué no delegar" no es un consejo, es parte del contrato.
+
+Lo que el piso sí da: que escribir, correr shell sin restricción o alcanzar un MCP
+sea una **decisión explícita** de quien invoca, visible en la línea de comandos, y
+que el modelo sepa exactamente qué tiene. El aislamiento real contra producción lo
+dan otras tres cosas: el environment se construye desde una allowlist en vez de
+heredarse, no hay ningún MCP salvo el que se pida por nombre, y no se leen settings
+de usuario.
 
 ## Superficie
 

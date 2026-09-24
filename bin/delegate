@@ -15,6 +15,17 @@
 #   delegate help
 set -euo pipefail
 
+# FIRST, before anything reads a key. Bash honours an inherited SHELLOPTS, so
+# `env SHELLOPTS=xtrace delegate ...` turns tracing on for this whole script and
+# prints every assignment to stderr — including `key=<the actual key>`, and into
+# the stream that `--json 2>&1` collects. Verified on this machine. BASH_ENV and
+# ENV are the same shape of problem: a file the caller chooses, sourced before
+# the script runs. CDPATH is the third: it makes a later `cd` into a relative
+# directory land somewhere else and print the path, which both misplaces the run
+# and corrupts `--json`.
+set +x +v
+unset -v SHELLOPTS BASH_ENV ENV CDPATH 2>/dev/null || true
+
 # Resolve the real script location so the `dg` symlink finds lib/ too.
 DG_BIN="${BASH_SOURCE[0]}"
 while [[ -L "$DG_BIN" ]]; do
@@ -409,7 +420,12 @@ cmd_run() {
   # Entre resolver la cuenta y abrir el archivo hay una carrera: otro proceso
   # puede cambiar el symlink de la activa. Leerla una vez y en este punto acota
   # esa ventana a lo mínimo, y deja la corrida inmune a un cambio posterior.
-  local key_path key
+  # `+x` is not decoration: a `local` that shadows an exported variable of the
+  # same name KEEPS the export attribute, so with `export key=...` in the
+  # caller's shell the account key silently joined the environment of every
+  # helper this script runs afterwards — including the `grep` in the process
+  # substitution, which is not the child. Verified on Bash 5.2.
+  local +x key_path key
   key_path="$(resolve_account_path "$account")"
   dg_account_validate "${CFG[key_dir]}" "$key_path" || exit 1
   key="$(dg_account_read "$key_path")"
@@ -433,6 +449,15 @@ cmd_run() {
   local claude_args=(
     -p
     --bare
+    # --bare skips hooks and the like, but on its own it still resolves a
+    # `/skill-name` in the prompt against the user's installed skills, and
+    # --add-dir only ADDS access rather than confining anything. --restricted
+    # ignores the user, project and local settings files and confines the file
+    # tools to the working directories; --disable-slash-commands closes the
+    # skill route. Bash survives both because --tools names it, which is why
+    # the read-only floor below is the thing that has to hold.
+    --restricted
+    --disable-slash-commands
     --setting-sources "project,local"
     --strict-mcp-config
     --permission-mode "dontAsk"
@@ -450,6 +475,18 @@ cmd_run() {
   # --strict-mcp-config is already above, so with no --mcp-config the child
   # reaches no server at all. This adds one only when a server was requested.
   [[ -n "$DG_MCP_JSON" ]] && claude_args+=(--mcp-config "$DG_MCP_JSON")
+
+  # Defence in depth, not a boundary. An allow list matches a command name, so
+  # `git diff --output=path` passes the read-only floor and writes a file — two
+  # independent reviews found it. Denying the shapes that write raises the cost
+  # without pretending to close it: a deny list is prefix matching too, and the
+  # honest limit of the floor is written down in CLAUDE.md. It is unconditional
+  # only on the floor: `--bash` is unrestricted shell by definition, and denying
+  # a form there would be a narrower grant than the one that was asked for.
+  if [[ "$mode" == 'agent' ]] && (( ! want_bash )); then
+    claude_args+=(--disallowedTools
+      'Bash(git diff --output*),Bash(git log --output*),Bash(git show --output*)')
+  fi
 
   # LAST on purpose, and it must stay last. `--tools` and `--allowedTools` are
   # variadic (`<tools...>`): they keep eating arguments until the next option,
@@ -477,19 +514,62 @@ cmd_run() {
   # does not know. It goes to stderr, but it dirties any `2>&1` over --json.
   exec 2> >(grep --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
 
-  # The key goes in the child's environment, never as an argument: an argument
-  # is visible in `ps` to every user on the machine.
-  exec env \
-    -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
-    ANTHROPIC_BASE_URL="${CFG[endpoint]}" \
-    "${CFG[auth_env]}=$key" \
-    ANTHROPIC_MODEL="$model" \
-    ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="${CFG[small_model]}" \
-    CLAUDE_CODE_SUBAGENT_MODEL="${CFG[small_model]}" \
-    ${passthrough[@]+"${passthrough[@]}"} \
-    timeout "$timeout_s" \
+  # The environment is BUILT, not inherited. `env -u A -u B VAR=x cmd` keeps
+  # everything else the parent had, so GITHUB_TOKEN, AWS_*, NODE_OPTIONS and
+  # any exported function reached the delegated run even with no flags at all —
+  # which is the opposite of what invariant 3 claims. `env -i` starts from
+  # nothing and only what is named below gets through.
+  #
+  # The names here are what the harness needs to run at all, and none of them
+  # is a credential: HOME (where node and claude keep state), PATH (already
+  # rewritten above so the stubs come first), the identity and locale that
+  # tooling reads, TMPDIR, and the CA overrides, which matter behind a
+  # corporate proxy and carry a path, not a secret.
+  # Keep the values worth carrying over, then drop every exported name and put
+  # only these back. These are what the harness needs to run at all, and none is
+  # a credential: HOME (where node and claude keep state), PATH (already
+  # rewritten above so the stubs come first), the identity and locale that
+  # tooling reads, TMPDIR, and the CA overrides, which matter behind a corporate
+  # proxy and carry a path, not a secret.
+  local -a keep_names=(HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TZ TMPDIR
+                       SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS)
+  local -a keep_pairs=() pass_pairs=()
+  local v n
+  for v in "${keep_names[@]}"; do
+    [[ -n "${!v+set}" ]] && keep_pairs+=("$v=${!v}")
+  done
+  # The passthrough is resolved here too, while the parent's values are still
+  # readable, because the wipe below is about to remove them.
+  for n in ${passthrough[@]+"${passthrough[@]}"}; do pass_pairs+=("$n"); done
+
+  # The wipe. `env -u A -u B VAR=x cmd` keeps everything else the parent had, so
+  # GITHUB_TOKEN, AWS_*, NODE_OPTIONS and any exported function reached the
+  # delegated run even with no flags at all — the opposite of what invariant 3
+  # claims. Clearing the export list here, rather than passing `env -i` a list
+  # of assignments, is what keeps the key out of an argv (see below).
+  for n in $(compgen -e); do unset -v "$n" 2>/dev/null || true; done
+
+  local pair
+  for pair in ${keep_pairs[@]+"${keep_pairs[@]}"} ${pass_pairs[@]+"${pass_pairs[@]}"}; do
+    export "${pair?}"
+  done
+
+  export ANTHROPIC_BASE_URL="${CFG[endpoint]}"
+  export ANTHROPIC_MODEL="$model"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="${CFG[small_model]}"
+  export CLAUDE_CODE_SUBAGENT_MODEL="${CFG[small_model]}"
+
+  # The key enters THIS shell's environment and the exec inherits it. It is
+  # never an argument, not even to `env`: `env ANTHROPIC_API_KEY=<key> ...` puts
+  # the key in env's own argv, and /proc/<pid>/cmdline is world-readable on
+  # Linux, so until env replaced itself any user on the machine could read it.
+  # `export` with a computed name has no such window, and dropping `env`
+  # altogether means one less process that ever saw it.
+  export "${CFG[auth_env]}=$key"
+
+  exec timeout "$timeout_s" \
     "$claude_bin" "${claude_args[@]}" "$prompt" \
     < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
 }

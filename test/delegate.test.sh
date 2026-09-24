@@ -35,10 +35,18 @@ FAKE_KEY='fake-key-para-tests'
 # it: /bin/sh has no arrays, and reading one named variable out of that dump is
 # the only honest way to see what an env_passthrough entry really forwarded.
 write_fake_claude() {
-  cat > "$TMP/bin/claude" <<'FAKE'
+  # The paths are baked in at write time, NOT read from the environment. The CLI
+  # builds the child's environment from an allowlist instead of inheriting the
+  # parent's, so a FAKE_CLAUDE_LOG exported here never reaches the fake — it is
+  # precisely the leak the CLI is supposed to prevent. Anything the fake needs
+  # has to travel in its own text.
+  cat > "$TMP/bin/claude" <<FAKE
 #!/bin/sh
 # Fake Claude Code binary. Records what it was exec'd with and exits 0.
-log="${FAKE_CLAUDE_LOG:?}"
+log='$TMP/claude.log'
+env_log='$TMP/claude.env'
+FAKE
+  cat >> "$TMP/bin/claude" <<'FAKE'
 last=''
 {
   for a in "$@"; do printf 'ARG:%s\n' "$a"; done
@@ -50,7 +58,7 @@ last=''
   printf 'SMALL:%s\n' "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}"
   printf 'SUBAGENT:%s\n' "${CLAUDE_CODE_SUBAGENT_MODEL:-}"
 } > "$log"
-if [ -n "${FAKE_CLAUDE_ENV_LOG:-}" ]; then env > "$FAKE_CLAUDE_ENV_LOG"; fi
+env > "$env_log"
 exit 0
 FAKE
   chmod +x "$TMP/bin/claude"

@@ -32,12 +32,20 @@ SENTINEL_B='SENTINEL-b7d40e15-also-not-a-real-key'
 write_fake_claude() {
   # The fake harness. bin/delegate resolves `claude` before it rewrites PATH, so
   # this file is what a delegated run execs. It only writes down what it got.
-  cat >"$TMP/bin/claude" <<'FAKE'
+  # The dump directory and the mode file are baked in at write time, NOT read
+  # from the environment. The CLI builds the child's environment from an
+  # allowlist instead of inheriting the parent's, so a DELEGATE_TEST_DUMP
+  # exported here never reaches the fake — which is exactly the leak the CLI
+  # exists to prevent. What the fake needs travels in its own text, and the
+  # mode, which a test changes per case, travels through a file next to it.
+  cat >"$TMP/bin/claude" <<FAKE
 #!/usr/bin/env bash
 set -u
-dump="${DELEGATE_TEST_DUMP:-}"
-mode="${DELEGATE_TEST_MODE:-record}"
-sleep_for="${DELEGATE_TEST_SLEEP:-0}"
+dump='$TMP/dump'
+mode="\$(cat '$TMP/fake_mode' 2>/dev/null || echo record)"
+sleep_for="\$(cat '$TMP/fake_sleep' 2>/dev/null || echo 0)"
+FAKE
+  cat >>"$TMP/bin/claude" <<'FAKE'
 
 if [[ -n "$dump" ]]; then
   mkdir -p -- "$dump" 2>/dev/null || true
@@ -176,7 +184,6 @@ dg_run() {
     export XDG_CACHE_HOME="$TMP/cache"
     export DELEGATE_PROVIDERS_DIR="$TMP/providers"
     export DELEGATE_MCP_DIR="$TMP/mcp.d"
-    export DELEGATE_TEST_DUMP="$TMP/dump"
     local kv
     for kv in "${DG_ENV[@]+"${DG_ENV[@]}"}"; do export "$kv"; done
     bash "$DELEGATE_BIN" "$@"
@@ -431,7 +438,9 @@ test_swapping_the_active_account_mid_run_does_not_affect_the_run() {
   setup
   add_key other "$SENTINEL_B"
 
-  DG_ENV=(DELEGATE_TEST_SLEEP=1)
+  # Through a file, not the environment: the child's environment is built from
+  # an allowlist, so an exported knob would never arrive.
+  printf '1\n' >"$TMP/fake_sleep"
   dg_run testprov --dir "$TMP/work" "tarea" >"$TMP/out" 2>"$TMP/err" &
   local runner=$! rc=0
 
@@ -723,7 +732,7 @@ test_edit_and_bash_widen_the_allowed_tools_the_child_gets() {
 
 test_codex_claude_delegate_and_dg_are_blocked_from_the_child() {
   setup
-  DG_ENV=(DELEGATE_TEST_MODE=probe-tools)
+  printf 'probe-tools\n' >"$TMP/fake_mode"
   capture dg_ok "tarea"
   assert_eq 0 "$RC" "the delegated run itself succeeds"
   require_child_ran || return 0

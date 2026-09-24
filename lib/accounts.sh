@@ -312,7 +312,11 @@ dg_account_validate() {
 }
 
 dg_account_read() {
-  local path="${1:-}" key
+  # `+x`: a local shadowing an exported variable of the same name keeps the
+  # export attribute, which would put the key in the environment of every
+  # command this function and its caller run afterwards.
+  local +x key
+  local path="${1:-}"
   [[ -n $path ]] || {
     _dg_account_err "dg_account_read: expects <path>"
     return 1
@@ -373,7 +377,9 @@ dg_account_activate() {
 }
 
 dg_account_add() {
-  local key_dir="${1:-}" pattern="${2:-}" account="${3:-}" path key
+  # Same `+x` reason as dg_account_read: the key must not become exported.
+  local +x key
+  local key_dir="${1:-}" pattern="${2:-}" account="${3:-}" path
 
   path=$(dg_account_path "$key_dir" "$pattern" "$account") || return $?
   key_dir=$(_dg_account_dir "$key_dir") || return 2
