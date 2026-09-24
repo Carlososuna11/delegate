@@ -96,6 +96,17 @@ assert_reject() {
   assert_contains "$ERR" "delegate: mcp $id: " "$msg: stderr carries the server id"
 }
 
+# The mirror of assert_reject_value: a charset narrowed to shut a hole has to
+# be shown still accepting the shapes the contract promises, or the next reader
+# cannot tell a fix from an over-correction.
+assert_accept_value() {
+  local key="$1" value="$2" msg="$3" gen="${4-http_lines}" path="$TMP/accept"
+  write_entry_with "$path" "$gen" "$key" "$value"
+  capture dg_mcp_parse "$path" srv
+  assert_eq 0 "$RC" "$msg: exit code"
+  assert_contains "$OUT" "$value" "$msg: the value survives the parse"
+}
+
 # A rejection coming from one value rule, with the rest of the entry valid.
 assert_reject_value() {
   local key="$1" value="$2" msg="$3" gen="${4-http_lines}" path="$TMP/value"
@@ -426,6 +437,24 @@ test_rejects_a_command_that_climbs_out_of_its_directory() {
   assert_reject_value command '../../bin/sh' 'a command with ..' stdio_lines
   assert_reject_value command 'npx -y' 'a command with a space' stdio_lines
   assert_reject_value command '$HOME/bin/serve' 'a command with a variable' stdio_lines
+}
+
+test_rejects_a_relative_command_path() {
+  # The contract has always said "absolute path, or a bare name on the child's
+  # PATH", and the charset used to accept a third shape the contract never
+  # promised. A relative path resolves against the CHILD's cwd, which is the
+  # working directory under review, so a `bin/mcp-server` committed into a repo
+  # handed to `delegate` would run as the delegated process — outside the tool
+  # allowlist entirely.
+  assert_reject_value command './serve' 'a command starting with ./' stdio_lines
+  assert_reject_value command 'bin/serve' 'a one-segment relative path' stdio_lines
+  assert_reject_value command 'node_modules/.bin/serve' 'a deeper relative path' stdio_lines
+}
+
+test_accepts_an_absolute_command_and_a_bare_name() {
+  assert_accept_value command '/usr/bin/node' 'an absolute path' stdio_lines
+  assert_accept_value command 'npx' 'a bare name' stdio_lines
+  assert_accept_value command 'mcp-server.js' 'a bare name with a dot and a hyphen' stdio_lines
 }
 
 test_rejects_an_args_element_outside_its_charset() {

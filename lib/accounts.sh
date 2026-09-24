@@ -22,10 +22,14 @@
 #   actually present, matched against key_pattern with `%s` standing for the
 #   name. Nothing on stdout and exit 0 when there are none.
 #
-# dg_account_active <key_dir>
+# dg_account_active <key_dir> [key_pattern]
 #   Prints the name of the active account by resolving the `api_key` symlink.
 #   Returns 1 and prints nothing when `api_key` is missing, is not a symlink, or
 #   points somewhere that is not a recognisable account file.
+#   key_pattern defaults to `api_key.%s`. It is a parameter because a provider
+#   file may set its own, and a hardcoded `api_key.*` here would report "no
+#   active account" for a provider whose files are named anything else — while
+#   `account list` listed them fine.
 #
 # dg_account_fingerprint <path>
 #   Prints the first 8 hex characters of the file's sha256. This is the ONLY
@@ -43,11 +47,17 @@
 #     - it is non-empty
 #   Called immediately before a key is read. The containment check is what stops
 #   a hand-edited symlink from turning `delegate` into a file-exfiltration tool.
+#   On success it PRINTS the fully resolved path, and that is the path the caller
+#   must open: every check above is made against the resolved file, so opening
+#   the original argument again would re-follow the symlink and could land on a
+#   different file than the one that was checked. A caller that only wants the
+#   verdict discards stdout.
 #
 # dg_account_read <path>
 #   Prints the key with surrounding whitespace, CR and LF stripped. The caller
 #   captures it into a variable and passes it through the child's environment.
-#   Assumes dg_account_validate already passed; call it first.
+#   Assumes dg_account_validate already passed, and expects the path IT printed;
+#   call it first.
 #
 # dg_account_activate <key_dir> <target>
 #   Points `<key_dir>/api_key` at <target> ATOMICALLY: create a uniquely named
@@ -205,9 +215,16 @@ dg_account_list() {
 }
 
 dg_account_active() {
-  local key_dir="${1:-}" link target candidate rdir rbase name
+  local key_dir="${1:-}" pattern="${2:-api_key.%s}"
+  local link target candidate rdir rbase name prefix suffix
 
   [[ -n $key_dir ]] || return 1
+  # Same decomposition dg_account_list uses. Hardcoding `api_key.` here made
+  # this function disagree with `list` for any provider that sets its own
+  # key_pattern: the files were there, `list` showed them, and `active` said
+  # nothing was active.
+  prefix="${pattern%%%s*}"
+  suffix="${pattern#*%s}"
   key_dir=$(_dg_account_dir "$key_dir") || return 1
   link="$key_dir/api_key"
 
@@ -228,8 +245,10 @@ dg_account_active() {
   _dg_account_inside "$rdir" "$candidate" || return 1
 
   rbase="${candidate##*/}"
-  [[ $rbase == api_key.* ]] || return 1
-  name="${rbase#api_key.}"
+  [[ $rbase == "$prefix"*"$suffix" ]] || return 1
+  name="$rbase"
+  [[ -n $prefix ]] && name="${name#"$prefix"}"
+  [[ -n $suffix ]] && name="${name%"$suffix"}"
   _dg_account_name_ok "$name" || return 1
   printf '%s\n' "$name"
 }
@@ -308,6 +327,9 @@ dg_account_validate() {
     return 1
   fi
 
+  # The resolved path, for the caller to open. Handing back the argument would
+  # leave a window where the symlink is re-followed after every check passed.
+  printf '%s\n' "$rpath"
   return 0
 }
 
@@ -430,7 +452,7 @@ dg_account_remove() {
     return 1
   fi
 
-  active=$(dg_account_active "$key_dir" 2>/dev/null) || active=''
+  active=$(dg_account_active "$key_dir" "$pattern" 2>/dev/null) || active=''
 
   rm -f -- "$path" || {
     _dg_account_err "cannot remove key file '$path'"

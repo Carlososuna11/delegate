@@ -87,7 +87,8 @@
 #     rules            Guidance for the delegated run, appended to its system
 #                      prompt when this entry is enabled. Letters with accents,
 #                      digits, space and , . ; : ( ) ? ! / _ @ # % & + * = -,
-#                      600 characters max. Spanish, `tú`, no voseo, like every
+#                      600 bytes max, so an accented character costs two.
+#                      Spanish, `tú`, no voseo, like every
 #                      other rule the run is given. Reached only when the entry
 #                      is, so a declared-but-unrequested server says nothing.
 #     env_passthrough  Comma-separated variable NAMES, each ^[A-Z][A-Z0-9_]*$,
@@ -176,7 +177,14 @@ _DG_MCP_ONLY_HTTP=(url)
 _DG_MCP_RE_TOOL='^[a-z][a-z0-9_-]*$'
 _DG_MCP_RE_ENVNAME='^[A-Z][A-Z0-9_]*$'
 _DG_MCP_RE_URL='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
-_DG_MCP_RE_COMMAND='^[A-Za-z0-9._/-]+$'
+# Either an absolute path or a bare name, and nothing in between. The old
+# charset also accepted `./x`, `bin/x` and `sub/dir/x`, which the header
+# contract never promised and which are read relative to the CHILD's cwd — and
+# that cwd is the working directory under review. A `bin/mcp-server` committed
+# into a repo that gets handed to `delegate` would then run as the delegated
+# process, outside the tool allowlist entirely. A bare name resolves on the
+# child's PATH, whose first entry is the stub directory this tool controls.
+_DG_MCP_RE_COMMAND='^(/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*|[A-Za-z0-9][A-Za-z0-9._-]*)$'
 _DG_MCP_RE_ARG='^[A-Za-z0-9._@:/=+-]+$'
 _DG_MCP_RE_DESCRIPTION='^[A-Za-z0-9 ,.()/_-]+$'
 # `rules` is the only value that reaches the child as prose rather than as
@@ -276,7 +284,7 @@ _dg_mcp_validate() {
       ;;
     command)
       [[ "$value" =~ $_DG_MCP_RE_COMMAND ]] ||
-        { _dg_mcp_reason="line $lineno: command allows only A-Za-z0-9 and . _ / -"; return 1; }
+        { _dg_mcp_reason="line $lineno: command must be an absolute path or a bare name (A-Za-z0-9 and . _ -), not a relative path"; return 1; }
       [[ "$value" != *'..'* ]] ||
         { _dg_mcp_reason="line $lineno: command must not contain '..'"; return 1; }
       ;;
@@ -332,8 +340,13 @@ _dg_mcp_validate() {
       # prompt: guidance that does not fit belongs in a file the run reads.
       [[ "$value" =~ $_DG_MCP_RE_RULES ]] ||
         { _dg_mcp_reason="line $lineno: rules allows only letters (with accents), digits, space and , . ; : ( ) ? ! / _ @ # % & + * = -"; return 1; }
-      (( ${#value} <= 600 )) ||
-        { _dg_mcp_reason="line $lineno: rules must be at most 600 characters"; return 1; }
+      # Bytes, and said so. `${#value}` counts characters in a UTF-8 locale and
+      # bytes under LC_ALL=C, so the same file was accepted or rejected
+      # depending on the caller's locale. Fixing the unit to bytes is the choice
+      # that does not move: an accented character costs two, which still leaves
+      # room for several sentences.
+      (( $(LC_ALL=C printf '%s' "$value" | wc -c) <= 600 )) ||
+        { _dg_mcp_reason="line $lineno: rules must be at most 600 bytes (an accented character counts as two)"; return 1; }
       ;;
   esac
   return 0

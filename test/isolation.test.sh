@@ -686,6 +686,83 @@ test_no_oauth_token_or_parent_key_reaches_the_child() {
   assert_eq "$SENTINEL" "$(env_value ANTHROPIC_API_KEY)" "the provider's key is the one that travels"
 }
 
+test_the_childs_environment_is_built_not_inherited() {
+  setup
+  # The three names above were exactly the ones the old `env -u A -u B -u C`
+  # removed, so that test passed against an implementation that let EVERYTHING
+  # else through. These are the everything else. Without this case, reverting to
+  # `env -u` leaves the whole suite green.
+  DG_ENV=(
+    GITHUB_TOKEN=ghp-not-a-real-token-51ab
+    AWS_SECRET_ACCESS_KEY=aws-not-a-real-secret-7c2d
+    AWS_SESSION_TOKEN=aws-session-not-real-0e94
+    NODE_OPTIONS=--require=/tmp/should-not-load.js
+    LD_PRELOAD=/tmp/should-not-load.so
+    SSH_AUTH_SOCK=/tmp/agent.sock
+    PGPASSWORD=pg-not-a-real-password-33fe
+  )
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+
+  local child name
+  child="$(child_env)"
+  for name in GITHUB_TOKEN AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN NODE_OPTIONS \
+              LD_PRELOAD SSH_AUTH_SOCK PGPASSWORD; do
+    assert_not_contains "$child" "$name" "$name does not reach the delegated run"
+  done
+  # The values, not just the names. The marker deliberately differs from the
+  # one in $SENTINEL, which is the key that IS supposed to travel.
+  assert_not_contains "$child" "should-not-load" "no value of the parent's survives either"
+  assert_not_contains "$child" "ghp-not-a-real-token-51ab" "nor a token by its value"
+}
+
+test_an_exported_function_does_not_reach_the_child() {
+  setup
+  clear_dump
+  # A function in the environ (`BASH_FUNC_grep%%`) is imported by bash and WINS
+  # over the binary of the same name. `Bash(grep:*)` is allowed on the read-only
+  # floor, so a surviving `grep` function is arbitrary code execution inside the
+  # delegated run. `compgen -e` lists variables only, which is why removing the
+  # exported variables was not enough.
+  (
+    export PATH="$TMP/bin:$PATH"
+    export XDG_CACHE_HOME="$TMP/cache"
+    export DELEGATE_PROVIDERS_DIR="$TMP/providers"
+    export DELEGATE_MCP_DIR="$TMP/mcp.d"
+    grep() { printf 'PWNED\n'; }
+    export -f grep
+    bash "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea" >/dev/null 2>&1
+  )
+  require_child_ran || return 0
+  assert_not_contains "$(child_env)" "BASH_FUNC" "no exported function crosses into the child"
+  assert_not_contains "$(child_env)" "PWNED" "nor its body"
+}
+
+test_a_parent_export_cannot_shadow_the_clis_own_variables() {
+  setup
+  # `unset -v NAME` inside a function removes the LOCAL binding and leaves it
+  # masking the caller's, so an exported name that collides with one of the
+  # CLI's own locals both survived the wipe AND, on other names, killed the
+  # variable the run needed and died on `set -u`. Plain, likely names, which is
+  # what makes it a real collision rather than a curiosity.
+  local name
+  for name in key prompt model claude_bin timeout_s format mode workdir account \
+              passthrough keep_pairs pass_pairs path n v; do
+    DG_ENV=("$name=colision-$name-8f3b")
+    clear_dump
+    capture dg_ok "tarea"
+    assert_eq 0 "$RC" "a parent export called '$name' does not break the run"
+    child_ran || { assert_eq 'ran' 'missing' "the child ran with '$name' exported"; continue; }
+    assert_not_contains "$(child_env)" "colision-$name-8f3b" \
+      "an exported '$name' does not reach the child"
+    assert_eq "$SENTINEL" "$(env_value ANTHROPIC_API_KEY)" \
+      "the key still travels with '$name' exported"
+    assert_contains "$(child_env)" "PATH=" "the child still has a PATH with '$name' exported"
+  done
+  DG_ENV=()
+}
+
 # ─── invariant 4: permissions only widen, and they reach the child ───────────
 
 test_the_floor_reaches_the_child_without_unrestricted_bash() {

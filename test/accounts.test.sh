@@ -121,6 +121,23 @@ test_list_is_silent_when_empty() {
 
 # ── dg_account_active ────────────────────────────────────────────────────────
 
+test_active_honours_a_providers_own_key_pattern() {
+  # key_pattern is a provider setting, and this function used to hardcode
+  # `api_key.`, so for any provider naming its files differently `account list`
+  # showed them and `active` reported that nothing was active — which is also
+  # how `account add` decided a second key was the first one.
+  make_key "$TMP/keys/token-work" 'fake-key-a'
+  ln -s token-work "$TMP/keys/api_key"
+  capture dg_account_active "$TMP/keys" 'token-%s'
+  assert_eq 0 "$RC" "exit 0 with a custom pattern"
+  assert_eq 'work' "$OUT" "the name comes out of the custom pattern"
+
+  # The same file is not an account under the default pattern.
+  capture dg_account_active "$TMP/keys"
+  assert_eq 1 "$RC" "the default pattern does not match it"
+  assert_eq '' "$OUT" "and prints nothing"
+}
+
 test_active_resolves_the_symlink() {
   make_key "$TMP/keys/api_key.work" 'fake-key-a'
   ln -s api_key.work "$TMP/keys/api_key"

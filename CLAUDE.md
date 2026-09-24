@@ -27,6 +27,18 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    - El environment del hijo se **construye** desde una allowlist. `env -u A -u B` deja
      pasar todo lo demás, así que `GITHUB_TOKEN`, `AWS_*` y `NODE_OPTIONS` llegaban a una
      corrida sin flags.
+   - Las **funciones** exportadas se borran aparte, en la primera línea útil del script.
+     Viven en el environ como `BASH_FUNC_<nombre>%%`, que `compgen -e` no lista y
+     `unset -v` no toca, y una función importada **gana** sobre el binario del mismo
+     nombre: con `export -f grep` en el shell padre, el piso de solo lectura —donde
+     `Bash(grep:*)` está permitido— pasaba a ser ejecución arbitraria, y este script
+     mismo ya estaba corriendo código ajeno antes de llegar al exec.
+   - El wipe corre en una función **sin** los locals de `cmd_run` vivos. Dentro de una
+     función, `unset -v key` borra el binding **local** y lo deja tapando el del
+     llamador en vez de destaparlo (`export -n` se comporta igual), así que un
+     `export key=...`, `export prompt=...` o `export model=...` del padre sobrevivía al
+     wipe y llegaba al hijo. Por eso `cmd_run` publica en `_DG_X_*` y **retorna**, y el
+     exec vive en `dg_exec_child`.
 2. **La key se lee una sola vez**, justo después de validar argumentos y config. Una vez
    leída, un cambio de cuenta activa hecho por otro proceso no puede desviar la corrida
    en curso.
@@ -49,10 +61,21 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
 6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
    y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
    variables de entorno, ni reescribir lo que la corrida fija. Una entrada declara
-   **nombres** de variables a reenviar, nunca valores, y un nombre que la corrida misma
-   define (`ANTHROPIC_*`, `CLAUDE_CODE_*`) se **rechaza**: `env` deja ganar la última
-   asignación, así que reenviar `ANTHROPIC_API_KEY` mandaría la key del shell padre al
-   endpoint del proveedor.
+   **nombres** de variables a reenviar, nunca valores. Dos familias de nombres se
+   **rechazan**:
+   - Los que la corrida define (`ANTHROPIC_*`, `CLAUDE_CODE_*`). Hoy los `export` de la
+     corrida se aplican después del passthrough, así que uno de estos perdería en vez de
+     ganar; el rechazo no es por el orden sino porque un servidor que pide un nombre que
+     la corrida posee está pidiendo algo que no puede tener.
+   - Los que se interpretan como **código** dentro del hijo: `LD_*`, `NODE_OPTIONS`,
+     `BASH_ENV`, `ENV`, `PATH`, `HOME`, `PYTHONPATH`, `GIT_SSH_COMMAND`,
+     `GIT_EXTERNAL_DIFF`, `PAGER`, `EDITOR` y compañía. Como el environment del hijo se
+     construye desde una allowlist, el passthrough es el **único** canal por el que algo
+     de este shell cruza, y un nombre de estos lo convierte en ejecución de código.
+     Las credenciales **no** están en esa lista a propósito: reenviar un token es para lo
+     que existe la función, así que ahí la respuesta es visibilidad, no rechazo — cada
+     corrida imprime en stderr los nombres que reenvía (nombres, nunca valores), y
+     `delegate mcp list` los muestra junto con el `rules` completo de la entrada.
 
 ## Lo que el piso de solo lectura NO promete
 
@@ -60,7 +83,9 @@ Dicho explícito porque dos reviews independientes lo encontraron y porque un
 invariante que se cree más fuerte de lo que es, es peor que no tenerlo.
 
 La allowlist de Claude Code calza el **nombre** de un comando, nunca sus opciones.
-De ahí salen tres consecuencias:
+Sí considera la **redirección**: `ls /tmp > archivo` y `head -c 4 x > archivo` fueron
+denegados los dos contra el harness real, con el comando de la izquierda permitido, así
+que un `>` no es una vía de escritura. De ahí salen tres consecuencias:
 
 - `find` y `rg` quedaron **fuera** del piso: `-delete`/`-exec` escriben, y
   `rg --pre=/usr/bin/rm` hace que ripgrep lance ese programa. `grep` cubre la
@@ -203,6 +228,25 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
 - `caps` del proveedor gana sobre los flags pedidos.
 - El inventario de herramientas del system prompt se **deriva** del grant: nunca anuncia
   una herramienta que la corrida no tiene.
+- El environment del hijo se construye, no se hereda: `GITHUB_TOKEN`, `AWS_*`,
+  `NODE_OPTIONS`, `LD_PRELOAD`, `SSH_AUTH_SOCK` y `PGPASSWORD` no llegan, ni por nombre
+  ni por valor. Probar con nombres de secretos **distintos** de los tres que el viejo
+  `env -u A -u B -u C` ya quitaba: ese test pasaba contra una implementación que dejaba
+  cruzar todo lo demás.
+- Una función exportada (`export -f grep`) no cruza al hijo, ni su nombre ni su cuerpo.
+- Un `export` del padre que choque con un local del CLI (`key`, `prompt`, `model`,
+  `claude_bin`, `path`, `n`, `v`…) ni llega al hijo ni rompe la corrida, y la key sigue
+  viajando.
+- Un `env_passthrough` con un nombre que se interpreta como código se rechaza con 2, y
+  los nombres que sí se reenvían salen en stderr.
+- `delegate mcp list` imprime el `rules` completo de una entrada, no un conteo.
+- `command` acepta ruta absoluta o nombre pelado, y rechaza `./x`, `bin/x` y
+  `a/b/c`: una ruta relativa se resuelve contra el cwd del hijo, que es el árbol bajo
+  revisión.
+- `dg_account_active` respeta el `key_pattern` del proveedor; con un patrón propio, `list`
+  y `active` tienen que coincidir.
+- Borrar la única cuenta sale con 0. Ese camino terminaba en un `[[ ]] &&` que era el
+  último comando de la función, así que devolvía 1 después de haber borrado la key.
 
 ## Lo que NO se construye
 

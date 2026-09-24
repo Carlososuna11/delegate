@@ -26,6 +26,37 @@ set -euo pipefail
 set +x +v
 unset -v SHELLOPTS BASH_ENV ENV CDPATH 2>/dev/null || true
 
+# Exported FUNCTIONS, and here rather than next to the environment wipe further
+# down, because this script itself runs grep, ls and git long before it gets
+# there. A function arriving in the environ as `BASH_FUNC_<name>%%` is imported
+# by bash and WINS over the binary of the same name, so a parent with
+# `export -f grep` was already executing its own code inside this script —
+# verified, it printed instead of grepping — and the same function then crossed
+# into the delegated run, where `Bash(grep:*)` is allowed on the read-only
+# floor. `compgen -e` lists variables only and `unset -v` does not touch these,
+# which is why the wipe below is not enough on its own.
+_dg_fn=''
+while read -r _dg_fn _dg_fn _dg_fn; do
+  [[ -n $_dg_fn ]] && { unset -f "$_dg_fn" 2>/dev/null || true; }
+done < <(declare -Fx)
+unset -v _dg_fn
+
+# This script's own namespace, cleared of anything the parent exported into it.
+# `_DG_X_KEY` holds the account key and `_DG_X_*` the exec's argv; assigning to a
+# name the parent had already EXPORTED would put those values in the child's
+# environment under that name, which is the one leak the build-from-allowlist
+# rule exists to prevent. The `DG_` names are listed one by one rather than
+# taken as a prefix: `DG_` is not reserved, and an MCP entry may perfectly well
+# ask to forward something called DG_SOMETHING.
+for _dg_fn in $(compgen -e); do
+  case "$_dg_fn" in
+    _DG_*|_dg_*) unset -v "$_dg_fn" 2>/dev/null || true ;;
+    DG_ROOT|DG_BIN|DG_LINK|DG_TOOLS|DG_ALLOWED|DG_RULES|DG_MCP_JSON|DG_MCP_TOOLS|DG_MCP_ENV|DG_MCP_RULES)
+      unset -v "$_dg_fn" 2>/dev/null || true ;;
+  esac
+done
+unset -v _dg_fn
+
 # Resolve the real script location so the `dg` symlink finds lib/ too.
 DG_BIN="${BASH_SOURCE[0]}"
 while [[ -L "$DG_BIN" ]]; do
@@ -146,7 +177,7 @@ resolve_account_path() {
     :
   elif [[ -n "${CFG[default_account]:-}" ]]; then
     name="${CFG[default_account]}"
-  elif name="$(dg_account_active "${CFG[key_dir]}" 2>/dev/null)" && [[ -n "$name" ]]; then
+  elif name="$(dg_account_active "${CFG[key_dir]}" "${CFG[key_pattern]}" 2>/dev/null)" && [[ -n "$name" ]]; then
     :
   else
     local avail
@@ -168,7 +199,7 @@ cmd_account() {
   case "$action" in
     list|ls)
       local active current path fp
-      active="$(dg_account_active "$kd" 2>/dev/null || true)"
+      active="$(dg_account_active "$kd" "$kp" 2>/dev/null || true)"
       current="$(dg_account_default_get "$kd" 2>/dev/null || true)"
       local found=0
       while read -r n; do
@@ -193,7 +224,7 @@ cmd_account() {
       local path; path="$(dg_account_path "$kd" "$kp" "$name")"
       ok "guardada como ${B}${name}${R} ${D}(huella $(dg_account_fingerprint "$path"), permisos 600)${R}"
       # First key configured becomes active: there is nothing to disambiguate.
-      if ! dg_account_active "$kd" >/dev/null 2>&1; then
+      if ! dg_account_active "$kd" "$kp" >/dev/null 2>&1; then
         dg_account_activate "$kd" "$path"
         ok "quedó activa por ser la primera"
       else
@@ -203,7 +234,10 @@ cmd_account() {
     use)
       [[ -n "$name" ]] || die "falta el nombre. Uso: delegate account $provider use <cuenta>"
       local path; path="$(dg_account_path "$kd" "$kp" "$name")" || exit 2
-      dg_account_validate "$kd" "$path" || die "no puedo usar la cuenta '$name'"
+      # stdout discarded: validate prints the RESOLVED path, and `use` has to
+      # point `api_key` at the account file by its own name, not at whatever
+      # that file happens to resolve to.
+      dg_account_validate "$kd" "$path" >/dev/null || die "no puedo usar la cuenta '$name'"
       dg_account_activate "$kd" "$path"
       ok "cuenta activa: ${B}${name}${R}"
       ;;
@@ -219,9 +253,18 @@ cmd_account() {
       dg_account_remove "$kd" "$kp" "$name" || rc=$?
       if (( rc == 10 )); then
         ok "borrada la cuenta ${B}${name}${R}"
-        warn "era la activa: no queda ninguna, y las corridas sin --account van a fallar"
         local resto; resto="$(dg_account_list "$kd" "$kp" | join_lines)"
-        [[ -n "$resto" ]] && printf '    %sdisponibles:%s %s\n' "$D" "$R" "$resto" >&2
+        if [[ -n "$resto" ]]; then
+          warn "era la activa: no hay ninguna activa, y las corridas sin --account van a fallar hasta que elijas otra"
+          printf '    %sdisponibles:%s %s\n' "$D" "$R" "$resto" >&2
+        else
+          # `|| true` no alcanzaba: esto era el ÚLTIMO comando de la función en
+          # el camino de éxito, así que un `[[ -n "$resto" ]] &&` que fallara se
+          # propagaba como return 1 y `set -e` mataba el script después de haber
+          # borrado la key. El exit code mentía sobre una operación que salió
+          # bien.
+          warn "era la activa y no queda ninguna: agrega otra con ${B}delegate account ${provider} add <cuenta>${R}"
+        fi
       elif (( rc != 0 )); then
         exit "$rc"
       else
@@ -233,7 +276,7 @@ cmd_account() {
         dg_account_default_get "$kd" || die "no hay cuenta default para $provider"
       else
         local path; path="$(dg_account_path "$kd" "$kp" "$name")" || exit 2
-        dg_account_validate "$kd" "$path" || die "no puedo usar la cuenta '$name'"
+        dg_account_validate "$kd" "$path" >/dev/null || die "no puedo usar la cuenta '$name'"
         dg_account_default_set "$kd" "$name"
         ok "cuenta default de ${B}${provider}${R}: ${B}${name}${R}"
       fi
@@ -298,6 +341,14 @@ cmd_mcp() {
       printf '\n'
       [[ -n "${M[env_passthrough]:-}" ]] &&
         printf '      %sreenvía del shell:%s %s\n' "$D" "$R" "${M[env_passthrough]}"
+      # `rules` in full, not a count. It is the one value in an entry that
+      # changes what the delegated model is TOLD, and it is appended after the
+      # run's own rules, which is the strongest position in the prompt. An
+      # entry that says "ignora las reglas anteriores" is a legitimate thing to
+      # write in this format and an illegitimate thing to keep out of sight, so
+      # the only defence is that whoever runs `mcp list` can read it.
+      [[ -n "${M[rules]:-}" ]] &&
+        printf '      %sle dice al modelo:%s %s\n' "$D" "$R" "${M[rules]}"
     else
       # The reason went to /dev/null on purpose: a listing that prints one
       # entry's parse error in the middle of the others is unreadable. The
@@ -386,20 +437,37 @@ cmd_run() {
       dg_mcp_resolve "$(dg_mcp_dir)" "$mcp_read" "$mcp_write" || exit 2
       want_mcp=1
       [[ -n "$mcp_write" ]] && want_mcp_write=1
-      # `env` lets the LAST assignment win, and the passthrough is appended
-      # after the run's own. An entry naming ANTHROPIC_API_KEY would send this
-      # shell's key — the very one `-u ANTHROPIC_API_KEY` exists to keep out —
-      # to the provider's endpoint, and one naming ANTHROPIC_BASE_URL would
-      # redirect the run somewhere else with the account key in hand. This is
-      # refused rather than reordered: a server that wants one of these names
-      # is asking for something the run itself owns, and silently handing it a
-      # different value would be its own surprise.
+      # Two families are refused outright.
+      #
+      # ANTHROPIC_* and CLAUDE_CODE_* are what this run itself defines. The
+      # exports that pin the endpoint, the model and the key are applied after
+      # the passthrough, so today an entry naming one of them would be
+      # overwritten rather than win — but the refusal is not about ordering: a
+      # server asking for a name the run owns is asking for something it cannot
+      # have, and quietly handing it a different value would be its own
+      # surprise.
+      #
+      # The second family is the one that matters more now that the child's
+      # environment is built from an allowlist: the passthrough is the ONLY
+      # channel through which anything from this shell crosses. A name whose
+      # value the harness treats as CODE turns that channel into code execution
+      # inside the delegated process — NODE_OPTIONS=--require=... loads a file
+      # of the entry author's choosing, LD_PRELOAD the same for any binary the
+      # run spawns, GIT_EXTERNAL_DIFF and GIT_SSH_COMMAND are commands, and
+      # BASH_ENV is sourced by every non-interactive bash. No MCP server needs
+      # any of them forwarded. Credentials are NOT on this list on purpose:
+      # forwarding a token is what the feature is for, so the answer there is
+      # visibility, not refusal — see the line printed below.
       local rn
       for rn in ${DG_MCP_ENV[@]+"${DG_MCP_ENV[@]}"}; do
         case "$rn" in
           ANTHROPIC_*|CLAUDE_CODE_*)
             printf '%s✗%s %s\n' "$RED" "$R" \
               "un servidor MCP pidió reenviar ${B}${rn}${R}, que esta corrida define; quita ese nombre de env_passthrough" >&2
+            exit 2 ;;
+          LD_*|NODE_OPTIONS|NODE_REPL_EXTERNAL_MODULE|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|IFS|PATH|HOME|PYTHONPATH|PYTHONSTARTUP|PERL5LIB|PERL5OPT|RUBYOPT|GIT_SSH_COMMAND|GIT_EXTERNAL_DIFF|GIT_PAGER|GIT_EDITOR|PAGER|EDITOR|VISUAL)
+            printf '%s✗%s %s\n' "$RED" "$R" \
+              "un servidor MCP pidió reenviar ${B}${rn}${R}: su valor se interpreta como código dentro de la corrida delegada, así que no se reenvía nunca" >&2
             exit 2 ;;
         esac
       done
@@ -427,7 +495,10 @@ cmd_run() {
   # substitution, which is not the child. Verified on Bash 5.2.
   local +x key_path key
   key_path="$(resolve_account_path "$account")"
-  dg_account_validate "${CFG[key_dir]}" "$key_path" || exit 1
+  # The path validate PRINTS, not the one it was given: the mode, owner, type
+  # and size checks were all made against the resolved file, and reopening the
+  # argument would follow the symlink a second time.
+  key_path="$(dg_account_validate "${CFG[key_dir]}" "$key_path")" || exit 1
   key="$(dg_account_read "$key_path")"
   [[ -n "$key" ]] || die "la key en $key_path está vacía"
 
@@ -438,7 +509,15 @@ cmd_run() {
   local claude_bin stub_dir tool
   claude_bin="$(command -v claude)" || die "no encuentro el binario de claude en el PATH"
   stub_dir="${XDG_CACHE_HOME:-$HOME/.cache}/delegate/stubs"
-  mkdir -p "$stub_dir"
+  # 700 and owner-checked. This directory goes FIRST in the child's PATH, and
+  # its location comes from XDG_CACHE_HOME, an inherited variable. Pointed at a
+  # shared writable directory, anything a third party precreated there as
+  # `git`, `grep` or `node` would run ahead of the real binary inside the
+  # delegated process. Refused rather than repaired: silently relocating the
+  # stubs would hide the fact that the cache path is not the caller's.
+  mkdir -p -m 700 "$stub_dir"
+  [[ -O "$stub_dir" ]] || die "el directorio de stubs $stub_dir no es tuyo; revisa XDG_CACHE_HOME"
+  chmod 700 "$stub_dir"
   for tool in codex claude delegate dg; do
     printf '#!/bin/sh\necho "delegate: %s está bloqueado en tareas delegadas" >&2\nexit 126\n' \
       "$tool" > "$stub_dir/$tool"
@@ -500,14 +579,24 @@ cmd_run() {
   # Names the entries asked to forward. Values are never in the config: the
   # child inherits whatever this shell has under that name, and a name that is
   # unset here is simply not forwarded — the server will say what it needs.
-  local passthrough=() n
+  local passthrough=() n fwd=()
   for n in ${DG_MCP_ENV[@]+"${DG_MCP_ENV[@]}"}; do
     if [[ -n "${!n+set}" ]]; then
       passthrough+=("$n=${!n}")
+      fwd+=("$n")
     else
       warn "el servidor MCP pidió reenviar ${B}${n}${R}, que no está definida en este shell"
     fi
   done
+  # Said out loud, every time. The tool used to warn about a name it could NOT
+  # forward and stay silent about the ones it did, which is backwards: since the
+  # child's environment is built from an allowlist, this list is the complete
+  # set of things from this shell that cross into the delegated run. A token
+  # leaving for the cheap provider's endpoint should not be the quiet case.
+  # Names only — a value never appears in this output.
+  if (( ${#fwd[@]} )); then
+    warn "se reenvían al hijo, por pedido de un servidor MCP: ${B}$(printf '%s\n' "${fwd[@]}" | join_lines)${R}"
+  fi
 
   cd "$workdir"
   # Harmless notice from Claude Code when it titles a session with a model it
@@ -520,46 +609,75 @@ cmd_run() {
   # which is the opposite of what invariant 3 claims. `env -i` starts from
   # nothing and only what is named below gets through.
   #
-  # The names here are what the harness needs to run at all, and none of them
-  # is a credential: HOME (where node and claude keep state), PATH (already
-  # rewritten above so the stubs come first), the identity and locale that
-  # tooling reads, TMPDIR, and the CA overrides, which matter behind a
-  # corporate proxy and carry a path, not a secret.
   # Keep the values worth carrying over, then drop every exported name and put
   # only these back. These are what the harness needs to run at all, and none is
   # a credential: HOME (where node and claude keep state), PATH (already
   # rewritten above so the stubs come first), the identity and locale that
   # tooling reads, TMPDIR, and the CA overrides, which matter behind a corporate
   # proxy and carry a path, not a secret.
-  local -a keep_names=(HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TZ TMPDIR
-                       SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS)
-  local -a keep_pairs=() pass_pairs=()
-  local v n
-  for v in "${keep_names[@]}"; do
-    [[ -n "${!v+set}" ]] && keep_pairs+=("$v=${!v}")
+  #
+  # Everything the exec needs is published in `_DG_X_*` globals and this
+  # function RETURNS, so that the wipe below runs in a scope where none of these
+  # names is local any more. That is not style: inside a function `unset -v key`
+  # removes the LOCAL binding and leaves it in an "unset local" state that masks
+  # the caller's variable instead of exposing it, so a parent that exported
+  # `key`, `prompt`, `model` or `claude_bin` — every one of them a plain name
+  # this function declares — survived the wipe and reached the child. Verified,
+  # `export -n` behaves the same way. With cmd_run returned, its locals are gone
+  # and the unset reaches the real thing.
+  _DG_X_BIN="$claude_bin"
+  _DG_X_PROMPT="$prompt"
+  _DG_X_TIMEOUT="$timeout_s"
+  _DG_X_ENDPOINT="${CFG[endpoint]}"
+  _DG_X_MODEL="$model"
+  _DG_X_SMALL="${CFG[small_model]}"
+  _DG_X_AUTHENV="${CFG[auth_env]}"
+  _DG_X_KEY="$key"
+  _DG_X_ARGS=("${claude_args[@]}")
+
+  # Resolved here, while the parent's values are still readable: the wipe is
+  # about to remove them.
+  _DG_X_KEEP=()
+  local kn
+  for kn in HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TZ TMPDIR \
+            SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS; do
+    [[ -n "${!kn+set}" ]] && _DG_X_KEEP+=("$kn=${!kn}")
   done
-  # The passthrough is resolved here too, while the parent's values are still
-  # readable, because the wipe below is about to remove them.
-  for n in ${passthrough[@]+"${passthrough[@]}"}; do pass_pairs+=("$n"); done
+  _DG_X_PASS=(${passthrough[@]+"${passthrough[@]}"})
+  return 0
+}
+
+# ─── el exec del hijo ────────────────────────────────────────────────────────
+#
+# Se llama desde el despacho, DESPUÉS de que cmd_run retornó. Todos sus locals
+# llevan el prefijo `_dg_` y el wipe lo excluye, así que ningún nombre que el
+# padre pueda exportar queda tapado por un local de aquí.
+dg_exec_child() {
+  local _dg_n _dg_pair
 
   # The wipe. `env -u A -u B VAR=x cmd` keeps everything else the parent had, so
   # GITHUB_TOKEN, AWS_*, NODE_OPTIONS and any exported function reached the
   # delegated run even with no flags at all — the opposite of what invariant 3
   # claims. Clearing the export list here, rather than passing `env -i` a list
   # of assignments, is what keeps the key out of an argv (see below).
-  for n in $(compgen -e); do unset -v "$n" 2>/dev/null || true; done
-
-  local pair
-  for pair in ${keep_pairs[@]+"${keep_pairs[@]}"} ${pass_pairs[@]+"${pass_pairs[@]}"}; do
-    export "${pair?}"
+  for _dg_n in $(compgen -e); do
+    [[ $_dg_n == _dg_* || $_dg_n == _DG_* || $_dg_n == CFG ]] && continue
+    unset -v "$_dg_n" 2>/dev/null || true
   done
 
-  export ANTHROPIC_BASE_URL="${CFG[endpoint]}"
-  export ANTHROPIC_MODEL="$model"
-  export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
-  export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
-  export ANTHROPIC_DEFAULT_HAIKU_MODEL="${CFG[small_model]}"
-  export CLAUDE_CODE_SUBAGENT_MODEL="${CFG[small_model]}"
+  # Exported functions were already dropped at the top of the script, before
+  # anything ran a single external command; see the note there.
+
+  for _dg_pair in ${_DG_X_KEEP[@]+"${_DG_X_KEEP[@]}"} ${_DG_X_PASS[@]+"${_DG_X_PASS[@]}"}; do
+    export "${_dg_pair?}"
+  done
+
+  export ANTHROPIC_BASE_URL="$_DG_X_ENDPOINT"
+  export ANTHROPIC_MODEL="$_DG_X_MODEL"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$_DG_X_MODEL"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$_DG_X_MODEL"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$_DG_X_SMALL"
+  export CLAUDE_CODE_SUBAGENT_MODEL="$_DG_X_SMALL"
 
   # The key enters THIS shell's environment and the exec inherits it. It is
   # never an argument, not even to `env`: `env ANTHROPIC_API_KEY=<key> ...` puts
@@ -567,10 +685,10 @@ cmd_run() {
   # Linux, so until env replaced itself any user on the machine could read it.
   # `export` with a computed name has no such window, and dropping `env`
   # altogether means one less process that ever saw it.
-  export "${CFG[auth_env]}=$key"
+  export "${_DG_X_AUTHENV}=$_DG_X_KEY"
 
-  exec timeout "$timeout_s" \
-    "$claude_bin" "${claude_args[@]}" "$prompt" \
+  exec timeout "$_DG_X_TIMEOUT" \
+    "$_DG_X_BIN" "${_DG_X_ARGS[@]}" "$_DG_X_PROMPT" \
     < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
 }
 
@@ -585,6 +703,9 @@ case "${1:-help}" in
   *)
     PROVIDER="$1"; shift
     load_provider "$PROVIDER"
+    # Dos pasos a propósito: cmd_run publica en `_DG_X_*` y retorna, para que el
+    # wipe del environment corra sin sus locals vivos. Ver la nota en cmd_run.
     cmd_run "$@"
+    dg_exec_child
     ;;
 esac
