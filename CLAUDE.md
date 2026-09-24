@@ -143,6 +143,14 @@ la limpieza del environment, timeout y stdin, el bloqueo de otras CLIs, el chequ
 permisos de la key y su inyección por environment, y el guardián de nombres reservados
 del passthrough.
 
+`auth_env` es una allowlist de dos nombres, no un patrón: `ANTHROPIC_API_KEY`, que el
+harness manda como `x-api-key`, o `ANTHROPIC_AUTH_TOKEN`, que manda como
+`Authorization: Bearer`. Cuál acepta el endpoint no se deduce: DeepSeek toma el primero
+y Qwen Cloud el segundo. Los dos, y no uno solo, porque fijarlo en `ANTHROPIC_API_KEY`
+dejó a qwen inservible con un mensaje que culpaba al archivo de config. Sigue siendo
+allowlist para que un archivo de config no pueda apuntar la key a una variable
+arbitraria.
+
 El parser rechaza claves desconocidas, claves duplicadas, tabs o newlines en los valores,
 IDs de proveedor inválidos y variables de auth no soportadas. Sin `source`, sin `eval`,
 sin JSON/YAML/TOML: sumarían parser y dependencia para un esquema plano de diez líneas.

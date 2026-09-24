@@ -43,10 +43,12 @@
 #     endpoint         Anthropic-compatible base URL. Must match
 #                      ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$
 #                      Plain http is refused: the key travels on this connection.
-#     auth_env         Name of the env var the key is passed in. Must be exactly
-#                      ANTHROPIC_API_KEY — the only one supported today. An
-#                      allowlist, not a pattern: a config file must not be able
-#                      to aim the key at an arbitrary variable name.
+#     auth_env         Name of the env var the key is passed in. Either
+#                      ANTHROPIC_API_KEY (sent as `x-api-key`) or
+#                      ANTHROPIC_AUTH_TOKEN (sent as `Authorization: Bearer`),
+#                      whichever the endpoint accepts. An allowlist of those two
+#                      names, not a pattern: a config file must not be able to
+#                      aim the key at an arbitrary variable name.
 #     key_dir          Directory holding the key files. Absolute, or starting
 #                      with `~/`. Must not contain `..` or a newline.
 #     model            Main model id. ^[A-Za-z0-9._\[\]:@-]+$ (brackets matter:
@@ -147,10 +149,18 @@ _dg_config_validate() {
         { _dg_config_reason="line $lineno: endpoint must be an https:// URL"; return 1; }
       ;;
     auth_env)
-      # An allowlist, not a pattern: a config file must not be able to aim the
-      # key at an arbitrary environment variable.
-      [[ "$value" == ANTHROPIC_API_KEY ]] ||
-        { _dg_config_reason="line $lineno: auth_env must be ANTHROPIC_API_KEY"; return 1; }
+      # An allowlist of exactly two names, not a pattern: a config file must not
+      # be able to aim the key at an arbitrary environment variable. Two rather
+      # than one because the harness sends them differently and the endpoint
+      # decides which it accepts — ANTHROPIC_API_KEY goes out as `x-api-key`,
+      # ANTHROPIC_AUTH_TOKEN as `Authorization: Bearer`. DeepSeek takes the
+      # first, Qwen Cloud the second; pinning this to one name left qwen
+      # unusable with a message that blamed the config file.
+      case "$value" in
+        ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN) ;;
+        *) _dg_config_reason="line $lineno: auth_env must be ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN"
+           return 1 ;;
+      esac
       ;;
     key_dir)
       [[ "$value" == /* || "$value" == '~/'* ]] ||

@@ -93,6 +93,16 @@ assert_reject_value() {
   assert_reject "$path" "$msg"
 }
 
+# The mirror image: one value substituted into an otherwise valid config, and
+# the parse has to succeed. Without this, widening an allowlist is untested in
+# the direction that matters.
+assert_accept_value() {
+  local key="$1" value="$2" msg="$3" path="$TMP/value"
+  write_config_with "$path" "$key" "$value"
+  capture dg_config_parse "$path" deepseek
+  assert_eq 0 "$RC" "$msg is accepted"
+}
+
 # A rejection coming from one raw line added to an otherwise valid config.
 assert_reject_raw() {
   local line="$1" msg="$2" path="$TMP/raw"
@@ -346,11 +356,20 @@ test_rejects_a_non_https_endpoint() {
   assert_eq 0 "$RC" "the https endpoint the providers.d files use is accepted"
 }
 
-test_rejects_an_auth_env_other_than_anthropic_api_key() {
+test_rejects_an_auth_env_outside_the_two_name_allowlist() {
   local v
-  for v in ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY anthropic_api_key \
-           ANTHROPIC_API_KEY_2 ' ANTHROPIC_API_KEY' '$ANTHROPIC_API_KEY' '*'; do
+  for v in OPENAI_API_KEY anthropic_api_key ANTHROPIC_API_KEY_2 \
+           ANTHROPIC_AUTH_TOKEN_2 ' ANTHROPIC_API_KEY' '$ANTHROPIC_API_KEY' '*'; do
     assert_reject_value auth_env "$v" "auth_env '$v'"
+  done
+}
+
+# Both names are real: the endpoint decides which header the key travels in, and
+# pinning the allowlist to one of them left the qwen provider unusable.
+test_accepts_either_supported_auth_env() {
+  local v
+  for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; do
+    assert_accept_value auth_env "$v" "auth_env '$v'"
   done
 }
 
@@ -509,9 +528,17 @@ test_reads_the_provider_files_that_ship_with_the_tool() {
   for path in deepseek qwen; do
     capture dg_config_parse "$root/providers.d/$path" "$path"
     assert_eq 0 "$RC" "providers.d/$path parses"
-    assert_contains "$OUT" $'auth_env\tANTHROPIC_API_KEY' "providers.d/$path sets auth_env"
     assert_contains "$OUT" $'key_dir\t~/.' "providers.d/$path points key_dir at ~/"
   done
+
+  # Each shipped provider names the variable its own endpoint accepts, and they
+  # do not agree: DeepSeek authenticates with `x-api-key`, Qwen Cloud with a
+  # bearer token. Asserted per file rather than as one shared value, because
+  # assuming they matched is what shipped qwen with the wrong one.
+  capture dg_config_parse "$root/providers.d/deepseek" deepseek
+  assert_contains "$OUT" $'auth_env\tANTHROPIC_API_KEY' "deepseek sends x-api-key"
+  capture dg_config_parse "$root/providers.d/qwen" qwen
+  assert_contains "$OUT" $'auth_env\tANTHROPIC_AUTH_TOKEN' "qwen sends a bearer token"
 }
 
 run_tests
