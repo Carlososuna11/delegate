@@ -692,6 +692,60 @@ test_forwarded_names_are_announced_on_stderr() {
   unset DG_TEST_TOKEN
 }
 
+test_a_missing_requires_file_refuses_the_run_before_reading_the_key() {
+  setup_runnable
+  write_mcp_http_entry docs 'get_thing' requires_file 'skills/docs-use/SKILL.md'
+  dg_run alpha --dir "$TMP/work" --mcp docs "haz algo"
+  # An entry whose `rules` say "read X first" is broken in a tree with no X, and
+  # a delegated run told to read a missing file does not stop — it improvises.
+  assert_eq 2 "$RC" "a missing precondition exits 2"
+  assert_contains "$ERR" "skills/docs-use/SKILL.md" "names the file that is missing"
+  assert_contains "$ERR" "docs" "and the server that needs it"
+  assert_fails "nothing reached the child" test -f "$FAKE_CLAUDE_LOG"
+  assert_no_key_leak "missing requires_file"
+}
+
+test_a_present_requires_file_lets_the_run_through() {
+  setup_runnable
+  mkdir -p "$TMP/work/skills/docs-use"
+  printf 'contenido\n' > "$TMP/work/skills/docs-use/SKILL.md"
+  write_mcp_http_entry docs 'get_thing' requires_file 'skills/docs-use/SKILL.md'
+  dg_run alpha --dir "$TMP/work" --mcp docs "haz algo"
+  assert_eq 0 "$RC" "the run proceeds when the file is there"
+  assert_ok "the child ran" test -f "$FAKE_CLAUDE_LOG"
+}
+
+test_requires_file_is_resolved_against_the_run_directory() {
+  setup_runnable
+  # Present next to the CLI but NOT in --dir: the path has to be read from the
+  # working directory, which is where the child will look for it too.
+  mkdir -p "$TMP/elsewhere/skills"
+  printf 'x\n' > "$TMP/elsewhere/skills/GUIDE.md"
+  write_mcp_http_entry docs 'get_thing' requires_file 'skills/GUIDE.md'
+  dg_run alpha --dir "$TMP/work" --mcp docs "haz algo"
+  assert_eq 2 "$RC" "a file outside --dir does not satisfy the precondition"
+  assert_contains "$ERR" "skills/GUIDE.md" "names the path it looked for"
+}
+
+test_requires_file_is_ignored_when_the_server_is_not_requested() {
+  setup_runnable
+  # Declared on the machine, never asked for: a precondition of a server that
+  # is not reached is not a precondition of the run.
+  write_mcp_http_entry docs 'get_thing' requires_file 'no/existe.md'
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  assert_eq 0 "$RC" "a declared-but-unrequested entry does not block anything"
+  assert_ok "the child ran" test -f "$FAKE_CLAUDE_LOG"
+}
+
+test_mcp_list_shows_what_an_entry_requires() {
+  setup_env
+  write_mcp_http_entry alpha 'read_a' requires_file 'skills/alpha/SKILL.md'
+  dg_run mcp list
+  assert_eq 0 "$RC" "mcp list exits 0"
+  assert_contains "$OUT" "necesita" "the listing has a line for the precondition"
+  assert_contains "$OUT" "skills/alpha/SKILL.md" "and names the file"
+}
+
 test_account_rm_of_the_last_account_still_exits_zero() {
   setup_env
   write_provider alpha

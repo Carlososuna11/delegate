@@ -48,6 +48,13 @@
 #     DG_MCP_ENV    array of environment variable NAMES to forward to the child,
 #                   collected from every requested server's env_passthrough;
 #                   deduplicated; empty array when there are none
+#     DG_MCP_NEED   array of `<id>\t<path>` entries, one per path in every
+#                   requested server's requires_file, in the requested order and
+#                   NOT deduplicated: the id travels with the path so the error
+#                   can say which server needs it. Empty array when there are
+#                   none. Whether a path exists is not decided here — this
+#                   library never touches the filesystem outside the entry
+#                   directory, and the working directory belongs to bin/delegate.
 #
 #   On an unknown id, an id that appears twice in the same list, an entry that
 #   fails to parse, or a write request against an entry with no tools_write,
@@ -96,6 +103,17 @@
 #                      token must never be written into this file. A name whose
 #                      variable is unset at resolve time is not an error here —
 #                      bin/delegate decides what to do about that.
+#     requires_file    Comma-separated paths that must EXIST for this entry to
+#                      be usable. A relative path is read from the run's working
+#                      directory (`--dir`); an absolute one is a precondition of
+#                      the machine. Each ^[A-Za-z0-9._/-]+$, no '..', 4 paths
+#                      max. This generalises what used to be a hard-coded check
+#                      for the Figma skill file: an entry whose `rules` say "read
+#                      X first" is broken in a tree that has no X, and failing
+#                      with the name of the missing file beats a delegated run
+#                      inventing its way around it. The check lives in
+#                      bin/delegate, which is what knows the working directory;
+#                      this library only carries the list.
 #     tools_write      Same shape as tools_read. Tools that change something in
 #                      the server. Reached only via write_ids.
 #     description      Free text for `delegate mcp list`. ^[A-Za-z0-9 ,.()/_-]+$,
@@ -154,7 +172,7 @@
 
 # The complete key set. Anything else is a typo, and in a file that decides what
 # a delegated run can reach a typo is a rejection, not a warning.
-_DG_MCP_KEYS=(transport url command args trust tools_read tools_write env_passthrough description rules)
+_DG_MCP_KEYS=(transport url command args trust tools_read tools_write env_passthrough description rules requires_file)
 
 # What each transport requires, and what it refuses. A stdio entry is a binary
 # running on this machine with the child's privileges; an http entry is a URL.
@@ -187,6 +205,12 @@ _DG_MCP_RE_URL='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
 _DG_MCP_RE_COMMAND='^(/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*|[A-Za-z0-9][A-Za-z0-9._-]*)$'
 _DG_MCP_RE_ARG='^[A-Za-z0-9._@:/=+-]+$'
 _DG_MCP_RE_DESCRIPTION='^[A-Za-z0-9 ,.()/_-]+$'
+# A path this entry needs to exist. Relative paths ARE allowed here, unlike in
+# `command`: this one is only ever stat'ed, never executed, and the useful case
+# is exactly a file inside the tree under review (`skills/figma-use/SKILL.md`).
+# No `..` — see the check next to the charset — and no leading `~`, which
+# nothing expands at this layer and would be stat'ed as a literal directory name.
+_DG_MCP_RE_REQFILE='^[A-Za-z0-9._/-]+$'
 # `rules` is the only value that reaches the child as prose rather than as
 # config, so it needs the accents and the punctuation a Spanish sentence uses.
 # It still excludes the quote, the backslash and control characters: it travels
@@ -348,6 +372,25 @@ _dg_mcp_validate() {
       (( $(LC_ALL=C printf '%s' "$value" | wc -c) <= 600 )) ||
         { _dg_mcp_reason="line $lineno: rules must be at most 600 bytes (an accented character counts as two)"; return 1; }
       ;;
+    requires_file)
+      # Paths that must exist for this entry to be usable. Duplicates are
+      # allowed for the same reason env_passthrough allows them: two entries
+      # needing the same file is the normal case.
+      _dg_mcp_validate_list "$lineno" "$key" "$value" "$_DG_MCP_RE_REQFILE" \
+        'letters, digits and . _ / -' allow-dup ||
+        return 1
+      # `..` on any element. The path is resolved against the run's working
+      # directory, and a precondition that reaches outside the tree under review
+      # is not a precondition of that tree.
+      [[ ",$value," != *'..'* ]] ||
+        { _dg_mcp_reason="line $lineno: requires_file must not contain '..'"; return 1; }
+      # The cap is small on purpose: this is a precondition, not a manifest. An
+      # entry that needs five files needs a setup step instead.
+      local nreq
+      nreq=$(printf '%s' "$value" | tr ',' '\n' | grep -c .)
+      (( nreq <= 4 )) ||
+        { _dg_mcp_reason="line $lineno: requires_file allows at most 4 paths, found $nreq"; return 1; }
+      ;;
   esac
   return 0
 }
@@ -497,7 +540,7 @@ dg_mcp_parse() {
     fi
 
     case "$key" in
-      transport|url|command|args|trust|tools_read|tools_write|env_passthrough|description|rules) ;;
+      transport|url|command|args|trust|tools_read|tools_write|env_passthrough|description|rules|requires_file) ;;
       *) _dg_mcp_err "$id" "line $lineno: unknown key '$key'"; return 2 ;;
     esac
 
@@ -576,9 +619,9 @@ dg_mcp_resolve() {
 
   local dir="$1" read_ids="$2" write_ids="$3"
   local -a reads=() writes=() ids=()
-  local -a env_names=() tools=() json_parts=()
+  local -a env_names=() tools=() json_parts=() needs=()
   local id='' srv='' file='' parsed='' line='' key='' value='' fragment=''
-  local in_write='' transport='' url='' command='' args='' entry_env=''
+  local in_write='' transport='' url='' command='' args='' entry_env='' entry_req=''
   local t_read='' t_write='' tool='' name='' list='' rest='' seen_tools=' '
   # Everything is accumulated in locals and assigned to the DG_MCP_* globals at
   # the very end, so a refusal cannot leave half a run readable in them. The exit
@@ -610,6 +653,7 @@ dg_mcp_resolve() {
     DG_MCP_TOOLS=''
     DG_MCP_RULES=''
     DG_MCP_ENV=()
+    DG_MCP_NEED=()
     return 0
   fi
 
@@ -631,7 +675,7 @@ dg_mcp_resolve() {
       return 2
     fi
 
-    transport='' url='' command='' args='' entry_env='' t_read='' t_write=''
+    transport='' url='' command='' args='' entry_env='' entry_req='' t_read='' t_write=''
     entry_rules=''
     while IFS= read -r line; do
       key="${line%%$'\t'*}"
@@ -642,6 +686,7 @@ dg_mcp_resolve() {
         command) command="$value" ;;
         args) args="$value" ;;
         env_passthrough) entry_env="$value" ;;
+        requires_file) entry_req="$value" ;;
         tools_read) t_read="$value" ;;
         tools_write) t_write="$value" ;;
         rules) entry_rules="$value" ;;
@@ -697,6 +742,21 @@ dg_mcp_resolve() {
       done
     fi
 
+    # Preconditions, paired with the id that needs them. Not deduplicated: if
+    # two servers need the same file, the run is missing it for both, and
+    # whichever message the user reads should name a server they actually asked
+    # for. Whether the path exists is bin/delegate's question — it owns the
+    # working directory, and this library does not stat outside the entry dir.
+    if [[ -n "$entry_req" ]]; then
+      rest="$entry_req"
+      while :; do
+        name="${rest%%,*}"
+        [[ -n "$name" ]] && needs+=("$id"$'\t'"$name")
+        [[ "$rest" == *,* ]] || break
+        rest="${rest#*,}"
+      done
+    fi
+
     # The id is the KEY the server object hangs off inside "mcpServers", so it
     # belongs to the assembly, not to the fragment: a bare object with no key
     # produces `{"mcpServers":{{...}}}`, which is not JSON at all. The id passed
@@ -719,5 +779,7 @@ dg_mcp_resolve() {
   DG_MCP_RULES="${rules_acc# }"
   DG_MCP_ENV=()
   if (( ${#env_names[@]} )); then DG_MCP_ENV=("${env_names[@]}"); fi
+  DG_MCP_NEED=()
+  if (( ${#needs[@]} )); then DG_MCP_NEED=("${needs[@]}"); fi
   return 0
 }

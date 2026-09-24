@@ -347,6 +347,8 @@ cmd_mcp() {
       # entry that says "ignora las reglas anteriores" is a legitimate thing to
       # write in this format and an illegitimate thing to keep out of sight, so
       # the only defence is that whoever runs `mcp list` can read it.
+      [[ -n "${M[requires_file]:-}" ]] &&
+        printf '      %snecesita:%s %s\n' "$D" "$R" "${M[requires_file]}"
       [[ -n "${M[rules]:-}" ]] &&
         printf '      %sle dice al modelo:%s %s\n' "$D" "$R" "${M[rules]}"
     else
@@ -427,6 +429,7 @@ cmd_run() {
   DG_MCP_TOOLS=''
   DG_MCP_RULES=''
   DG_MCP_ENV=()
+  DG_MCP_NEED=()
   if [[ "$mode" == 'agent' ]]; then
     # Which servers exist is the machine owner's declaration; which ones this run
     # reaches is the invocation's. Resolving the entries first means an unknown
@@ -470,6 +473,43 @@ cmd_run() {
               "un servidor MCP pidió reenviar ${B}${rn}${R}: su valor se interpreta como código dentro de la corrida delegada, así que no se reenvía nunca" >&2
             exit 2 ;;
         esac
+      done
+
+      # Preconditions of the entries that were asked for. An entry whose `rules`
+      # say "read X first" is broken in a tree that has no X, and a delegated
+      # run told to read a file that is not there does not stop — it improvises,
+      # which is the expensive failure. Checked here, before the key is read,
+      # like every other refusal.
+      #
+      # A relative path resolves against the working directory of the run, which
+      # is `--dir` and is where the child will look for it too. Resolved with
+      # the same containment rule the key files use, so a precondition cannot
+      # point outside the tree under review; an absolute path is allowed and is
+      # a precondition of the machine, not of the tree.
+      local need nid npath nfull nreal nroot
+      nroot="$(readlink -f -- "$workdir")" || die "no puedo resolver el directorio de trabajo $workdir"
+      for need in ${DG_MCP_NEED[@]+"${DG_MCP_NEED[@]}"}; do
+        nid="${need%%$'\t'*}"
+        npath="${need#*$'\t'}"
+        if [[ "$npath" == /* ]]; then
+          nfull="$npath"
+        else
+          nfull="$nroot/$npath"
+        fi
+        if [[ ! -e "$nfull" ]]; then
+          printf '%s✗%s %s\n' "$RED" "$R" \
+            "el servidor MCP ${B}${nid}${R} necesita ${B}${npath}${R}, que no existe en $([[ "$npath" == /* ]] && printf 'esta máquina' || printf '%s' "$nroot")" >&2
+          printf '    %sestá declarado en su requires_file; quita --mcp %s o corre desde un árbol que lo tenga%s\n' \
+            "$D" "$nid" "$R" >&2
+          exit 2
+        fi
+        # Relative paths only: an absolute one was already a deliberate choice
+        # about a path outside the tree.
+        if [[ "$npath" != /* ]]; then
+          nreal="$(readlink -f -- "$nfull")" || die "no puedo resolver $npath"
+          [[ "$nreal" == "$nroot" || "$nreal" == "$nroot"/* ]] ||
+            die "el requires_file '$npath' del servidor $nid sale del directorio de trabajo"
+        fi
       done
     fi
     dg_perm_resolve "${CFG[caps]}" "$want_edit" "$want_bash" \

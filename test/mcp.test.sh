@@ -135,6 +135,7 @@ dg_global() {
 reset_globals() {
   unset DG_MCP_JSON DG_MCP_TOOLS DG_MCP_RULES
   DG_MCP_ENV=()
+  DG_MCP_NEED=()
 }
 
 # A refusal must leave nothing behind. `''` when unset, so this reads as "no
@@ -145,6 +146,7 @@ assert_globals_unset() {
   assert_eq '' "${DG_MCP_TOOLS+set}" "$msg: DG_MCP_TOOLS is not set"
   assert_eq '' "${DG_MCP_RULES+set}" "$msg: DG_MCP_RULES is not set"
   assert_eq '' "${DG_MCP_ENV+set}" "$msg: DG_MCP_ENV is not set"
+  assert_eq '' "${DG_MCP_NEED+set}" "$msg: DG_MCP_NEED is not set"
 }
 
 # ── dg_mcp_dir ──────────────────────────────────────────────────────────────
@@ -647,6 +649,7 @@ test_no_server_requested_grants_nothing() {
   assert_eq 'set' "${DG_MCP_RULES+set}" "DG_MCP_RULES is SET to empty, not unset"
   assert_eq '' "$(dg_global DG_MCP_RULES)" "and it is empty"
   assert_eq 0 "${#DG_MCP_ENV[@]}" "DG_MCP_ENV is an empty array"
+  assert_eq 0 "${#DG_MCP_NEED[@]}" "DG_MCP_NEED is an empty array"
 }
 
 test_read_only_server_builds_the_json_and_the_allowlist() {
@@ -764,6 +767,57 @@ test_env_passthrough_is_collected_and_deduplicated() {
     "the names come in first-seen order, each one once"
   # A name that is unset right now is not this function's business.
   assert_eq '' "${DG_TEST_UNSET+set}" "the variable really is unset and it was not an error"
+}
+
+test_requires_file_is_collected_with_its_server_id() {
+  local dir="$TMP/reqdir"
+  mkdir -p "$dir"
+  write_kv "$dir/alpha" transport http url 'https://a.example.com/mcp' tools_read 'get_thing' \
+    requires_file 'skills/alpha/SKILL.md,docs/alpha.md'
+  write_kv "$dir/beta" transport http url 'https://b.example.com/mcp' tools_read 'get_thing' \
+    requires_file 'skills/alpha/SKILL.md'
+  reset_globals
+  capture dg_mcp_resolve "$dir" alpha,beta ''
+  assert_eq 0 "$RC" "entries with requires_file resolve"
+  # Tab-separated, id first, in requested order, NOT deduplicated: the run is
+  # missing the shared file for both servers, and the message has to be able to
+  # name one the user actually asked for.
+  assert_eq 3 "${#DG_MCP_NEED[@]}" "one element per path, duplicates kept"
+  assert_eq "alpha"$'\t'"skills/alpha/SKILL.md" "${DG_MCP_NEED[0]}" "first path carries its id"
+  assert_eq "alpha"$'\t'"docs/alpha.md" "${DG_MCP_NEED[1]}" "second path of the same entry"
+  assert_eq "beta"$'\t'"skills/alpha/SKILL.md" "${DG_MCP_NEED[2]}" "the other server's copy is kept"
+  # This library does not touch the filesystem for these: existence is decided
+  # by bin/delegate, which is what knows the working directory.
+  assert_fails "the path really does not exist and that was not an error here" \
+    test -e "skills/alpha/SKILL.md"
+}
+
+test_requires_file_is_absent_when_no_entry_declares_one() {
+  local dir="$TMP/noreq"
+  mkdir -p "$dir"
+  write_kv "$dir/alpha" transport http url 'https://a.example.com/mcp' tools_read 'get_thing'
+  reset_globals
+  capture dg_mcp_resolve "$dir" alpha ''
+  assert_eq 0 "$RC" "an entry without requires_file resolves"
+  assert_eq 0 "${#DG_MCP_NEED[@]}" "DG_MCP_NEED is an empty array, not unset"
+}
+
+test_rejects_a_requires_file_outside_its_charset() {
+  assert_reject_value requires_file '../../etc/passwd' 'a path with ..' http_lines
+  assert_reject_value requires_file 'a/../b' 'a path with .. in the middle' http_lines
+  assert_reject_value requires_file '~/secrets' 'a path with a tilde' http_lines
+  assert_reject_value requires_file 'a b/c' 'a path with a space' http_lines
+  assert_reject_value requires_file '$HOME/x' 'a path with a variable' http_lines
+  assert_reject_value requires_file 'a,,b' 'an empty element' http_lines
+  assert_reject_value requires_file 'a,b,c,d,e' 'five paths' http_lines
+}
+
+test_accepts_a_relative_and_an_absolute_requires_file() {
+  # Relative is the useful case and the reason the charset differs from
+  # `command`: this value is only ever stat'ed, never executed.
+  assert_accept_value requires_file 'skills/figma-use/SKILL.md' 'a relative path' http_lines
+  assert_accept_value requires_file '/etc/hostname' 'an absolute path' http_lines
+  assert_accept_value requires_file 'a.md,b/c.md,d,e/f/g.json' 'four paths' http_lines
 }
 
 # ── dg_mcp_resolve: DG_MCP_RULES ────────────────────────────────────────────
@@ -956,6 +1010,16 @@ test_the_shipped_examples_parse_and_figma_carries_its_rules() {
   mkdir -p "$dir"
   cp "$repo/examples/mcp.d/figma" "$dir/figma"
   cp "$repo/examples/mcp.d/context7" "$dir/context7"
+  cp "$repo/examples/mcp.d/repo-notes" "$dir/repo-notes"
+
+  capture dg_mcp_parse "$dir/repo-notes" repo-notes
+  assert_eq 0 "$RC" "the repo-notes example parses"
+  assert_eq '' "$ERR" "no stderr"
+  assert_contains "$OUT" $'requires_file\tdocs/NOTES.md' "and carries its precondition"
+  # figma deliberately does NOT, because its skill file is a precondition of
+  # writing and reading a design without it is a fine run.
+  capture dg_mcp_parse "$dir/figma" figma
+  assert_not_contains "$OUT" 'requires_file' "figma sets no precondition"
 
   capture dg_mcp_parse "$dir/context7" context7
   assert_eq 0 "$RC" "the context7 example parses"

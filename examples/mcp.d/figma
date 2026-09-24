@@ -12,6 +12,13 @@
 # saved login and no token passes through here. There is no secret to forward,
 # and listing a variable that held one would only push it into the child for
 # nothing.
+#
+# requires_file is deliberately NOT set here, even though `rules` below points at
+# skills/figma-use/SKILL.md and that file is exactly what the key was built for.
+# The precondition is per ENTRY, and this entry's precondition is really only a
+# precondition of WRITING: reading a design in a repo that has no skill file is
+# a perfectly good run, and requiring the file would refuse it. Setting it here
+# would make the strictness wrong in the common case. See the note in CLAUDE.md.
 transport	http
 url	https://mcp.figma.com/mcp
 tools_read	get_design_context,get_metadata,get_screenshot,get_variable_defs,get_libraries,search_design_system,get_figjam,get_code_connect_map,get_motion_context,download_assets

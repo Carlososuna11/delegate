@@ -157,12 +157,30 @@ existe; la invocación decide qué alcanza. Ejemplos en `examples/mcp.d/`.
 servidor sin herramienta de lectura no tiene nada que ofrecer), `url` (solo `https`, solo
 para http y sse), `command` más `trust local-exec` (solo stdio: es un binario corriendo
 con los privilegios del hijo, y eso merece una línea explícita), `args`, `tools_write`,
-`env_passthrough` (**nombres**, nunca valores), `description` y `rules`.
+`env_passthrough` (**nombres**, nunca valores), `description`, `rules` y `requires_file`.
 
 `rules` es la guía propia del servidor que se le agrega al system prompt de la corrida
 **solo cuando esa entrada está habilitada**. Ahí va lo que el modelo necesita saber para
 usarlo bien sin quemar turnos descubriéndolo: de dónde salen los identificadores, qué no
-debe tocar, qué tiene que reportar al terminar.
+debe tocar, qué tiene que reportar al terminar. Es el único valor de una entrada que
+cambia lo que se le **dice** al modelo, y se anexa después de las reglas de la corrida,
+que es la posición más fuerte del prompt: por eso `delegate mcp list` lo imprime
+completo, no un conteo. Que se pueda leer es toda la defensa que hay contra una entrada
+que diga "ignora las reglas anteriores".
+
+`requires_file` son rutas que tienen que **existir** para que la entrada sea usable
+(hasta 4, sin `..`). Una ruta relativa se lee desde el directorio de trabajo de la
+corrida (`--dir`), que es donde el hijo también la va a buscar; una absoluta es
+precondición de la máquina. Si falta, la corrida se rechaza con el nombre del archivo y
+del servidor que lo necesita, **antes** de leer la key. Existe porque `rules` puede
+decir "lee X primero", y una corrida delegada a la que le falta X no se detiene:
+improvisa, y pagarle a un proveedor para ver a un modelo razonar alrededor de un archivo
+de instrucciones ausente es la falla cara.
+
+El límite que hay que conocer: la precondición es por **entrada**, no por permiso. No hay
+forma de decir "solo si escribe", y por eso el ejemplo de figma **no** la usa: su archivo
+de skill es precondición de escribir, y leer un diseño sin él es una corrida
+perfectamente buena. El ejemplo donde sí calza es `examples/mcp.d/repo-notes`.
 
 El JSON de `--mcp-config` se arma por concatenación, sin paso de escape, y eso es seguro
 **solo** porque cada charset excluye la comilla, el backslash y los caracteres de
@@ -247,6 +265,10 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   y `active` tienen que coincidir.
 - Borrar la única cuenta sale con 0. Ese camino terminaba en un `[[ ]] &&` que era el
   último comando de la función, así que devolvía 1 después de haber borrado la key.
+- Un `requires_file` que falta rechaza la corrida con 2, nombrando el archivo y el
+  servidor, y **antes** de leer la key; presente, la deja pasar. Se resuelve contra
+  `--dir`, no contra el cwd del CLI. Y una entrada declarada pero **no pedida** no bloquea
+  nada: la precondición de un servidor que no se alcanza no es precondición de la corrida.
 
 ## Lo que NO se construye
 
