@@ -1,0 +1,20 @@
+# Figma, over its hosted MCP endpoint. This is the entry that used to be
+# hard-coded in the script; it is now just data, with no privilege no other
+# entry has. A run reaches it only when it asks for it by name (--mcp figma, or
+# --mcp-write figma), and gets only the tools listed below.
+#
+# The name and the URL are the pair that
+# `claude mcp add --transport http figma https://mcp.figma.com/mcp` writes, and
+# they have to stay that pair.
+#
+# env_passthrough is not set, on purpose. The OAuth login is saved by Claude Code
+# keyed to the server name and the server config above, so this entry reuses that
+# saved login and no token passes through here. There is no secret to forward,
+# and listing a variable that held one would only push it into the child for
+# nothing.
+transport	http
+url	https://mcp.figma.com/mcp
+tools_read	get_design_context,get_metadata,get_screenshot,get_variable_defs,get_libraries,search_design_system,get_figjam,get_code_connect_map,get_motion_context,download_assets
+tools_write	use_figma,generate_figma_design,create_new_file,upload_assets,generate_diagram
+description	Read and write Figma files (OAuth login saved by Claude Code)
+rules	antes de escribir lee el archivo skills/figma-use/SKILL.md del repo y sigue lo que diga. El fileKey y el nodeId salen de la URL del diseño: en /design/FILEKEY/... el fileKey es FILEKEY, y node-id=1-23 es el nodeId 1:23. Escribe solo en el archivo y la página que te nombraron; no borres ni renombres nodos que ya existían, y no reacomodes lo que no te pidieron. Al terminar, lista en tu respuesta los nodeId que tocaste.

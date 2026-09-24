@@ -1,0 +1,26 @@
+# Context7, over stdio: the same format, the other transport, so the shape of a
+# local server entry is on the record too.
+#
+# A stdio entry is a binary that runs on this machine with the delegated child's
+# privileges. That is why `trust local-exec` is a required line of its own and is
+# not implied by `transport`: an https endpoint and a local process are not the
+# same thing, and a file should not be able to describe one as the other by
+# leaving a line out.
+#
+# `command` is resolved on the child's PATH, so a bare `npx` is enough. args are
+# space-separated with no quoting, hence one element per line-value here.
+#
+# env_passthrough is not set: Context7 works without an API key, and the optional
+# key is read by the server itself from the child's environment, not from here.
+#
+# NOTE ON tools_read: these two are the server's real tool names, taken from its
+# own tools/list. Both carry a hyphen. Keeping the real names is what surfaced
+# that the tools_read charset refused them, and the charset was the thing that
+# was wrong: it now allows a hyphen. That is safe for the JSON assembly — a
+# hyphen cannot close a JSON string — and it is what real servers ship.
+transport	stdio
+trust	local-exec
+command	npx
+args	-y @upstash/context7-mcp
+tools_read	resolve-library-id,query-docs
+description	Fetch up-to-date library documentation through npx

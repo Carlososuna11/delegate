@@ -18,17 +18,29 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
 2. **La key se lee una sola vez**, justo después de validar argumentos y config. Una vez
    leída, un cambio de cuenta activa hecho por otro proceso no puede desviar la corrida
    en curso.
-3. **Aislamiento.** Sin servidores MCP (excepción: Figma, solo con `--figma` /
-   `--figma-write`), sin hooks, sin plugins, sin settings de usuario, sin memoria. El
-   delegado no alcanza bases de datos, Datadog, Sentry, Retool, Linear ni APIs de GitHub.
+3. **Aislamiento: ningún MCP por defecto.** Sin hooks, sin plugins, sin settings de
+   usuario, sin memoria y, sobre todo, sin servidores MCP: `--strict-mcp-config` sin
+   `--mcp-config` deja al hijo sin alcanzar ninguno. Cada servidor se habilita por
+   invocación y por nombre (`--mcp <id>`), con su propio allowlist de herramientas, y la
+   escritura es un permiso aparte (`--mcp-write <id>`). Que un servidor esté declarado en
+   la máquina no lo pone al alcance de nada. El delegado no alcanza bases de datos,
+   Datadog, Sentry, Retool, Linear ni APIs de GitHub, salvo que alguien declare una
+   entrada para eso y la pida explícitamente en esa corrida.
 4. **Permisos graduados, y solo hacia arriba.** Solo lectura por defecto; `--edit` agrega
-   escritura de archivos; `--bash` agrega shell sin restricción. El techo de capacidades
-   del proveedor (`caps`) gana sobre los flags: si no incluye `bash`, `--bash` se
-   **rechaza**, no se ignora en silencio.
-5. **Otras CLIs de IA bloqueadas en el PATH del hijo.** Un delegado no invoca `codex` ni
-   `claude` para gastar cuota cara.
-6. **La config se parsea, nunca se `source`a.** No puede inyectar MCPs arbitrarios,
-   fragmentos de shell ni variables de entorno.
+   escritura de archivos; `--bash` agrega shell sin restricción; `--mcp` y `--mcp-write`
+   agregan las herramientas de un servidor. El techo de capacidades del proveedor
+   (`caps`) gana sobre los flags: si no incluye `bash`, `--bash` se **rechaza**, no se
+   ignora en silencio, y un rechazo no deja ningún global seteado, para que una corrida
+   negada no pueda leerse como una más angosta.
+5. **Otras CLIs de IA bloqueadas en el PATH del hijo.** Un delegado no invoca `codex`,
+   `claude` ni `delegate` para gastar cuota cara ni para re-delegar.
+6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
+   y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
+   variables de entorno, ni reescribir lo que la corrida fija. Una entrada declara
+   **nombres** de variables a reenviar, nunca valores, y un nombre que la corrida misma
+   define (`ANTHROPIC_*`, `CLAUDE_CODE_*`) se **rechaza**: `env` deja ganar la última
+   asignación, así que reenviar `ANTHROPIC_API_KEY` mandaría la key del shell padre al
+   endpoint del proveedor.
 
 ## Superficie
 
@@ -38,13 +50,20 @@ Proveedor como subcomando; modo agente por defecto.
 ```
 delegate deepseek "revisa src/auth.ts y lista los error paths"
 delegate deepseek --edit --bash --account kontigo "arregla y corre los tests"
+delegate deepseek --mcp context7 "cómo se usa el hook nuevo de esta librería"
+delegate deepseek --edit --mcp-write figma "aplica estos cambios al frame Login"
 delegate qwen --timeout 2400 "segunda opinión de este PR"
 delegate deepseek chat "explica este regex"      # sin herramientas
 
 delegate account deepseek list|add|use
+delegate mcp list
 delegate providers
 delegate help
 ```
+
+`--mcp` y `--mcp-write` son repetibles y se acumulan; `--mcp-write <id>` implica las
+herramientas de lectura de ese mismo servidor. En modo `chat` los dos son un error, igual
+que `--edit` y `--bash`.
 
 ## Proveedor = data
 
@@ -54,14 +73,41 @@ Un archivo por proveedor en `providers.d/`, formato `clave<TAB>valor`.
 `model`, `small_model`, `timeout`, `caps`, `residency`.
 
 **En el script, no configurable:** validación de argumentos y config, el lattice de
-permisos, los allowlists exactos de herramientas y MCP, el enforcement de `caps`,
-`--bare`, la restricción de setting-sources, la limpieza del environment, timeout y
-stdin, el bloqueo de otras CLIs, el chequeo de permisos de la key y su inyección por
-environment, y las integraciones ya vetadas (Figma).
+permisos locales, el enforcement de `caps`, `--bare`, la restricción de setting-sources,
+la limpieza del environment, timeout y stdin, el bloqueo de otras CLIs, el chequeo de
+permisos de la key y su inyección por environment, y el guardián de nombres reservados
+del passthrough.
 
 El parser rechaza claves desconocidas, claves duplicadas, tabs o newlines en los valores,
 IDs de proveedor inválidos y variables de auth no soportadas. Sin `source`, sin `eval`,
 sin JSON/YAML/TOML: sumarían parser y dependencia para un esquema plano de diez líneas.
+
+## MCP = data
+
+Un archivo por servidor en `$DELEGATE_MCP_DIR` (por defecto `~/.config/delegate/mcp.d`),
+mismo formato `clave<TAB>valor` que un proveedor. El dueño de la máquina declara qué
+existe; la invocación decide qué alcanza. Ejemplos en `examples/mcp.d/`.
+
+**Claves:** `transport` (`http`, `sse` o `stdio`), `tools_read` (siempre obligatoria: un
+servidor sin herramienta de lectura no tiene nada que ofrecer), `url` (solo `https`, solo
+para http y sse), `command` más `trust local-exec` (solo stdio: es un binario corriendo
+con los privilegios del hijo, y eso merece una línea explícita), `args`, `tools_write`,
+`env_passthrough` (**nombres**, nunca valores), `description` y `rules`.
+
+`rules` es la guía propia del servidor que se le agrega al system prompt de la corrida
+**solo cuando esa entrada está habilitada**. Ahí va lo que el modelo necesita saber para
+usarlo bien sin quemar turnos descubriéndolo: de dónde salen los identificadores, qué no
+debe tocar, qué tiene que reportar al terminar.
+
+El JSON de `--mcp-config` se arma por concatenación, sin paso de escape, y eso es seguro
+**solo** porque cada charset excluye la comilla, el backslash y los caracteres de
+control. La validación es lo que hace sólido el armado: ampliar un charset obliga a
+revisar el armado.
+
+Figma dejó de estar cableada y es una entrada de ejemplo más, sin ningún privilegio que
+otra no tenga. Su login OAuth lo guarda Claude Code indexado por nombre y config del
+servidor, así que una entrada `figma` apuntando a `https://mcp.figma.com/mcp` reusa ese
+login y **ningún token pasa por acá** — por eso su `env_passthrough` está vacío.
 
 ## Cuentas
 
@@ -75,9 +121,11 @@ en un archivo de metadata no secreto, para no depender de estado global mutable.
 **Reglas duras:**
 
 - El symlink de la cuenta activa se reemplaza **atómicamente**: symlink temporal más
-  `rename(2)` (`mv -T`). **Nunca `ln -sfn`**: con `-f` desvincula el destino antes de
-  crear el nuevo, así que deja una ventana en la que la ruta no existe y un lector
-  concurrente falla.
+  `rename(2)` (`mv -T`). **Nunca `ln -sfn`**, por portabilidad: el coreutils de esta
+  máquina (9.4) resultó usar temporal más `renameat` por dentro, verificado con `strace`,
+  pero eso es detalle de implementación y no contrato. El patrón que sí está roto es
+  desvincular y después crear: dejó 28.382 observaciones de ruta inexistente contra 0 de
+  `mv -T`.
 - Antes de usar una key se valida que el target esté **dentro** de `key_dir` y tenga
   permisos 600.
 - Borrar la cuenta activa deja el setup **sin** cuenta activa, a propósito y con aviso
@@ -103,14 +151,25 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
 - Cambiar la cuenta activa a mitad de una corrida no afecta la corrida en curso.
 - El reemplazo del symlink nunca deja la ruta inexistente.
 - Una key con permisos distintos de 600, o fuera de `key_dir`, es rechazada.
-- Sin `--edit` no hay escritura; sin `--bash` no hay shell.
+- Sin `--edit` no hay escritura; sin `--bash` no hay shell; sin `--mcp` no llega ningún
+  `--mcp-config`, aunque el directorio tenga entradas.
+- Un servidor declarado pero no pedido no llega al hijo, ni siquiera su `rules`.
+- Habilitar un servidor no habilita sus herramientas de escritura.
+- Un `env_passthrough` reenvía el valor del shell padre, nunca uno del archivo, y un
+  nombre que la corrida define se rechaza.
+- Una entrada con `$(...)`, backticks o `;` en un valor no ejecuta nada.
+- Un servidor desconocido, o un `--mcp` por encima del techo, falla **antes** de leer la
+  key.
 - `caps` del proveedor gana sobre los flags pedidos.
+- El inventario de herramientas del system prompt se **deriva** del grant: nunca anuncia
+  una herramienta que la corrida no tiene.
 
 ## Lo que NO se construye
 
 Nombrado para que no reaparezca: daemon, locking de cuentas, keyring o Vault, base de
-datos de costos, DSL de políticas, sistema de plugins, registry generalizado de MCPs,
-fallback o enrutamiento automático entre proveedores (manda código a la jurisdicción o a
+datos de costos, DSL de políticas, sistema de plugins, descubrimiento o instalación
+automática de servidores MCP (el registro es declarativo y lo escribe el dueño de la
+máquina; nada se agrega solo), fallback o enrutamiento automático entre proveedores (manda código a la jurisdicción o a
 la cuenta equivocada), y enforcement automático a partir de `residency` — eso último es
 teatro de seguridad: la nota se muestra y la elección del proveedor queda explícita.
 

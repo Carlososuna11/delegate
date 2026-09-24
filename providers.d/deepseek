@@ -1,0 +1,7 @@
+endpoint	https://api.deepseek.com/anthropic
+auth_env	ANTHROPIC_API_KEY
+key_dir	~/.config/deepseek
+model	deepseek-flash[1m]
+small_model	deepseek-flash
+timeout	1800
+caps	read,edit,bash,mcp,mcp-write

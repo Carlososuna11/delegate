@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+# delegate — manda trabajo de código acotado a un modelo más barato.
+#
+# Corre el harness de Claude Code en headless contra el endpoint
+# Anthropic-compatible del proveedor, fijándolo SOLO en este proceso: la sesión
+# principal no se toca. Los invariantes que esto sostiene están en CLAUDE.md.
+#
+#   delegate deepseek "revisa src/auth.ts y lista los error paths"
+#   delegate deepseek --edit --bash "arregla y corre los tests"
+#   delegate qwen --timeout 2400 "segunda opinión de este PR"
+#   delegate deepseek chat "explica este regex"
+#
+#   delegate account deepseek list|add|use|rm|default
+#   delegate providers
+#   delegate help
+set -euo pipefail
+
+# Resolve the real script location so the `dg` symlink finds lib/ too.
+DG_BIN="${BASH_SOURCE[0]}"
+while [[ -L "$DG_BIN" ]]; do
+  DG_LINK="$(readlink "$DG_BIN")"
+  [[ "$DG_LINK" == /* ]] && DG_BIN="$DG_LINK" || DG_BIN="$(dirname "$DG_BIN")/$DG_LINK"
+done
+DG_ROOT="$(cd "$(dirname "$DG_BIN")/.." && pwd)"
+
+PROVIDERS_DIR="${DELEGATE_PROVIDERS_DIR:-$DG_ROOT/providers.d}"
+
+# shellcheck source=../lib/config.sh
+source "$DG_ROOT/lib/config.sh"
+# shellcheck source=../lib/accounts.sh
+source "$DG_ROOT/lib/accounts.sh"
+# shellcheck source=../lib/permissions.sh
+source "$DG_ROOT/lib/permissions.sh"
+# shellcheck source=../lib/mcp.sh
+source "$DG_ROOT/lib/mcp.sh"
+
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+  B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+  GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; CYAN=$'\033[36m'
+else
+  B=''; D=''; R=''; GREEN=''; YELLOW=''; RED=''; CYAN=''
+fi
+
+die()  { printf '%s✗%s %s\n' "$RED" "$R" "$*" >&2; exit 1; }
+
+# Joins stdin lines with ", ". Not `paste -sd', '`: paste CYCLES through the
+# delimiter list rather than repeating it, so two items join with a bare comma
+# and three alternate ", " and ",".
+join_lines() { paste -sd, - | sed 's/,/, /g'; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$R" "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$GREEN" "$R" "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${B}delegate${R} — manda trabajo de código acotado a un modelo más barato ${D}(alias: dg)${R}
+
+${B}USO${R}
+  ${CYAN}delegate${R} <proveedor> [opciones] "tarea"      agente con herramientas
+  ${CYAN}delegate${R} <proveedor> chat [opciones] "texto"  una pregunta, sin herramientas
+  ${CYAN}delegate account${R} <proveedor> <acción>         cuentas (API keys)
+  ${CYAN}delegate mcp list${R}                              servidores MCP declarados
+  ${CYAN}delegate providers${R}                            proveedores configurados
+  ${CYAN}delegate help${R}                                 esta ayuda
+
+${B}ACCESO${R} ${D}(el más angosto que alcance para la tarea)${R}
+  ${D}(sin flag)${R}      solo lectura: Read y shell de lectura
+  ${CYAN}--edit${R}          agrega escritura de archivos
+  ${CYAN}--bash${R}          agrega shell sin restricción
+  ${CYAN}--mcp${R} <srv>     agrega las herramientas de LECTURA de ese servidor MCP
+  ${CYAN}--mcp-write${R} <s> agrega también las de escritura
+                  ${D}Repetibles. Sin ellos, la corrida no alcanza ningún MCP.${R}
+
+${B}OPCIONES${R}
+  ${CYAN}--account${R} <n>   usa la key de esa cuenta, sin tocar la activa
+  ${CYAN}--dir${R} <ruta>    directorio de trabajo ${D}(default: el actual)${R}
+  ${CYAN}--model${R} <id>    pisa el modelo del proveedor
+  ${CYAN}--timeout${R} <s>   segundos ${D}(default: el del proveedor)${R}
+  ${CYAN}--json${R}          salida JSON: resultado, costo, sesión
+
+${B}CUENTAS${R}
+  delegate account <proveedor> list
+  delegate account <proveedor> add <cuenta>      ${D}pide la key sin eco${R}
+  delegate account <proveedor> use <cuenta>      ${D}cambia la activa (global)${R}
+  delegate account <proveedor> rm <cuenta>
+  delegate account <proveedor> default [cuenta]  ${D}default por invocación${R}
+
+  La cuenta activa es global: otra sesión puede cambiarla a mitad de tu corrida.
+  Un pipeline que dependa de una cuenta específica pasa ${CYAN}--account${R}.
+
+${B}QUÉ NO DELEGAR${R}
+  Secrets, PII de clientes, datos o consultas de producción, y decisiones de
+  dinero, seguridad o compliance. Lo que sale hacia el proveedor es el prompt y
+  todo archivo que el agente lea en el directorio de trabajo.
+EOF
+}
+
+# ─── configuración del proveedor ─────────────────────────────────────────────
+
+declare -A CFG=()
+
+load_provider() {
+  # Two statements on purpose: in a single `local`, every word is expanded before
+  # any of them is assigned, so `file="$PROVIDERS_DIR/$id"` would read an `id`
+  # that does not exist yet — fatal under `set -u`.
+  local id="$1" parsed k v
+  local file="$PROVIDERS_DIR/$id"
+  if [[ ! -f "$file" ]]; then
+    local known
+    known="$(dg_config_providers "$PROVIDERS_DIR" | join_lines)"
+    die "proveedor desconocido: ${B}${id}${R}. Configurados: ${known:-ninguno}"
+  fi
+  parsed="$(dg_config_parse "$file" "$id")" || exit 2
+  while IFS=$'\t' read -r k v; do
+    [[ -n "$k" ]] && CFG["$k"]="$v"
+  done <<< "$parsed"
+  # Defaults. The parser deliberately omits unset keys instead of inventing
+  # them, so this is the one place a default exists.
+  CFG[key_pattern]="${CFG[key_pattern]:-api_key.%s}"
+  CFG[timeout]="${CFG[timeout]:-1800}"
+  CFG[caps]="${CFG[caps]:-$(dg_perm_caps_default)}"
+  CFG[small_model]="${CFG[small_model]:-${CFG[model]}}"
+}
+
+# ─── cuentas ─────────────────────────────────────────────────────────────────
+
+# Resolution order, most explicit first. A concrete account always beats the
+# global active symlink, which another session can change under us.
+resolve_account_path() {
+  local requested="$1" name
+  if [[ -n "$requested" ]]; then
+    name="$requested"
+  elif [[ -n "${DELEGATE_ACCOUNT:-}" ]]; then
+    name="$DELEGATE_ACCOUNT"
+  elif name="$(dg_account_default_get "${CFG[key_dir]}" 2>/dev/null)" && [[ -n "$name" ]]; then
+    :
+  elif [[ -n "${CFG[default_account]:-}" ]]; then
+    name="${CFG[default_account]}"
+  elif name="$(dg_account_active "${CFG[key_dir]}" 2>/dev/null)" && [[ -n "$name" ]]; then
+    :
+  else
+    local avail
+    avail="$(dg_account_list "${CFG[key_dir]}" "${CFG[key_pattern]}" | join_lines)"
+    if [[ -n "$avail" ]]; then
+      die "no hay cuenta activa. Elige una con ${B}delegate account $PROVIDER use <cuenta>${R} o pasa ${B}--account${R}. Configuradas: $avail"
+    fi
+    die "no hay ninguna key configurada para ${B}${PROVIDER}${R}. Agrega una: ${B}delegate account $PROVIDER add <cuenta>${R}"
+  fi
+  dg_account_path "${CFG[key_dir]}" "${CFG[key_pattern]}" "$name" || exit 2
+}
+
+cmd_account() {
+  local provider="${1:-}" action="${2:-list}" name="${3:-}"
+  [[ -n "$provider" ]] || die "falta el proveedor. Uso: delegate account <proveedor> <acción>"
+  load_provider "$provider"
+  local kd="${CFG[key_dir]}" kp="${CFG[key_pattern]}"
+
+  case "$action" in
+    list|ls)
+      local active current path fp
+      active="$(dg_account_active "$kd" 2>/dev/null || true)"
+      current="$(dg_account_default_get "$kd" 2>/dev/null || true)"
+      local found=0
+      while read -r n; do
+        [[ -n "$n" ]] || continue
+        found=1
+        path="$(dg_account_path "$kd" "$kp" "$n")"
+        fp="$(dg_account_fingerprint "$path" 2>/dev/null || echo '????????')"
+        local marks=''
+        [[ "$n" == "$active" ]] && marks+=" ${GREEN}activa${R}"
+        [[ "$n" == "$current" ]] && marks+=" ${CYAN}default${R}"
+        printf '  %s%-16s%s %s%s%s%s\n' "$B" "$n" "$R" "$D" "$fp" "$R" "$marks"
+      done < <(dg_account_list "$kd" "$kp")
+      if (( ! found )); then
+        warn "no hay cuentas configuradas para $provider"
+        printf '    %sagrega una:%s delegate account %s add <cuenta>\n' "$D" "$R" "$provider" >&2
+        return 1
+      fi
+      ;;
+    add)
+      [[ -n "$name" ]] || die "falta el nombre. Uso: delegate account $provider add <cuenta>"
+      dg_account_add "$kd" "$kp" "$name"
+      local path; path="$(dg_account_path "$kd" "$kp" "$name")"
+      ok "guardada como ${B}${name}${R} ${D}(huella $(dg_account_fingerprint "$path"), permisos 600)${R}"
+      # First key configured becomes active: there is nothing to disambiguate.
+      if ! dg_account_active "$kd" >/dev/null 2>&1; then
+        dg_account_activate "$kd" "$path"
+        ok "quedó activa por ser la primera"
+      else
+        printf '    %sactívala:%s delegate account %s use %s\n' "$D" "$R" "$provider" "$name" >&2
+      fi
+      ;;
+    use)
+      [[ -n "$name" ]] || die "falta el nombre. Uso: delegate account $provider use <cuenta>"
+      local path; path="$(dg_account_path "$kd" "$kp" "$name")" || exit 2
+      dg_account_validate "$kd" "$path" || die "no puedo usar la cuenta '$name'"
+      dg_account_activate "$kd" "$path"
+      ok "cuenta activa: ${B}${name}${R}"
+      ;;
+    rm|remove)
+      [[ -n "$name" ]] || die "falta el nombre. Uso: delegate account $provider rm <cuenta>"
+      local path; path="$(dg_account_path "$kd" "$kp" "$name")" || exit 2
+      [[ -e "$path" ]] || die "no existe la cuenta '$name'"
+      printf '%sBorrar la key de%s %s%s%s. Escribe el nombre para confirmar: ' \
+        "$YELLOW" "$R" "$B" "$name" "$R" >&2
+      local confirm; read -r confirm
+      [[ "$confirm" == "$name" ]] || die "no coincide, no borré nada"
+      local rc=0
+      dg_account_remove "$kd" "$kp" "$name" || rc=$?
+      if (( rc == 10 )); then
+        ok "borrada la cuenta ${B}${name}${R}"
+        warn "era la activa: no queda ninguna, y las corridas sin --account van a fallar"
+        local resto; resto="$(dg_account_list "$kd" "$kp" | join_lines)"
+        [[ -n "$resto" ]] && printf '    %sdisponibles:%s %s\n' "$D" "$R" "$resto" >&2
+      elif (( rc != 0 )); then
+        exit "$rc"
+      else
+        ok "borrada la cuenta ${B}${name}${R}"
+      fi
+      ;;
+    default)
+      if [[ -z "$name" ]]; then
+        dg_account_default_get "$kd" || die "no hay cuenta default para $provider"
+      else
+        local path; path="$(dg_account_path "$kd" "$kp" "$name")" || exit 2
+        dg_account_validate "$kd" "$path" || die "no puedo usar la cuenta '$name'"
+        dg_account_default_set "$kd" "$name"
+        ok "cuenta default de ${B}${provider}${R}: ${B}${name}${R}"
+      fi
+      ;;
+    *)
+      die "acción desconocida: $action ${D}(list | add | use | rm | default)${R}"
+      ;;
+  esac
+}
+
+cmd_providers() {
+  local id parsed k v
+  local found=0
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    found=1
+    declare -A P=()
+    if parsed="$(dg_config_parse "$PROVIDERS_DIR/$id" "$id" 2>/dev/null)"; then
+      while IFS=$'\t' read -r k v; do [[ -n "$k" ]] && P["$k"]="$v"; done <<< "$parsed"
+      printf '  %s%-10s%s %s%s%s\n' "$B" "$id" "$R" "$D" "${P[model]:-?}" "$R"
+      printf '      %scaps:%s %s\n' "$D" "$R" "${P[caps]:-$(dg_perm_caps_default)}"
+      [[ -n "${P[residency]:-}" ]] && printf '      %sdatos:%s %s\n' "$D" "$R" "${P[residency]}"
+    else
+      printf '  %s%-10s%s %sconfig inválida%s\n' "$B" "$id" "$R" "$RED" "$R"
+    fi
+    unset P
+  done < <(dg_config_providers "$PROVIDERS_DIR")
+  (( found )) || { warn "no hay proveedores en $PROVIDERS_DIR"; return 1; }
+}
+
+cmd_mcp() {
+  # Read-only: this lists what the machine owner declared, and listing is the
+  # only thing it does. Nothing here enables a server — that happens per
+  # invocation, with --mcp, and only for a server named by hand.
+  local sub="${1:-list}"
+  [[ "$sub" == 'list' ]] || die "uso: delegate mcp list"
+
+  local dir id parsed k v found=0
+  dir="$(dg_mcp_dir)"
+  if [[ ! -d "$dir" ]]; then
+    warn "no hay directorio de servidores MCP en $dir"
+    printf '  %sun archivo por servidor, formato clave<TAB>valor; hay ejemplos en examples/mcp.d/%s\n' "$D" "$R"
+    return 1
+  fi
+
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    found=1
+    declare -A M=()
+    if parsed="$(dg_mcp_parse "$dir/$id" "$id" 2>/dev/null)"; then
+      while IFS=$'\t' read -r k v; do [[ -n "$k" ]] && M["$k"]="$v"; done <<< "$parsed"
+      printf '  %s%-12s%s %s%s%s\n' "$B" "$id" "$R" "$D" "${M[transport]:-?}" "$R"
+      [[ -n "${M[description]:-}" ]] && printf '      %s%s%s\n' "$D" "${M[description]}" "$R"
+      # Counts, not the lists: the point of this view is which servers exist and
+      # whether writing is even on offer, not to reproduce an allowlist that
+      # only matters at resolve time.
+      printf '      %slectura:%s %s' "$D" "$R" "$(printf '%s' "${M[tools_read]:-}" | tr ',' '\n' | grep -c .)"
+      if [[ -n "${M[tools_write]:-}" ]]; then
+        printf '   %sescritura:%s %s %s(--mcp-write)%s' "$D" "$R" \
+          "$(printf '%s' "${M[tools_write]}" | tr ',' '\n' | grep -c .)" "$D" "$R"
+      fi
+      printf '\n'
+      [[ -n "${M[env_passthrough]:-}" ]] &&
+        printf '      %sreenvía del shell:%s %s\n' "$D" "$R" "${M[env_passthrough]}"
+    else
+      # The reason went to /dev/null on purpose: a listing that prints one
+      # entry's parse error in the middle of the others is unreadable. The
+      # pointer is enough, and `--mcp <id>` prints the real reason.
+      printf '  %s%-12s%s %sentrada inválida%s %s(delegate <proveedor> --mcp %s dice por qué)%s\n' \
+        "$B" "$id" "$R" "$RED" "$R" "$D" "$id" "$R"
+    fi
+    unset M
+  done < <(dg_mcp_servers "$dir")
+
+  # dg_mcp_servers drops a file whose NAME is not a valid id, which is right —
+  # nobody could ask for it with --mcp anyway. But dropping it silently from
+  # this listing is how someone stares at a file they wrote and wonders why it
+  # does nothing. Named, not ignored.
+  local path base bad=()
+  for path in "$dir"/*; do
+    [[ -f "$path" ]] || continue
+    base="${path##*/}"
+    dg_mcp_servers "$dir" | grep -qxF -- "$base" || bad+=("$base")
+  done
+  if (( ${#bad[@]} )); then
+    warn "ignorados por tener un nombre que no es un id válido (^[a-z][a-z0-9-]{0,31}$): $(printf '%s\n' "${bad[@]}" | join_lines)"
+  fi
+
+  (( found )) || { warn "no hay servidores MCP declarados en $dir"; return 1; }
+}
+
+# ─── corrida delegada ────────────────────────────────────────────────────────
+
+cmd_run() {
+  local mode='agent'
+  if [[ "${1:-}" == 'chat' ]]; then mode='chat'; shift; fi
+
+  local want_edit=0 want_bash=0 account='' workdir="$PWD"
+  local format='text' timeout_s='' model=''
+  # Repeatable, so they accumulate as comma-separated lists for lib/mcp.sh.
+  local mcp_read='' mcp_write=''
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --edit)        want_edit=1; shift ;;
+      --bash)        want_bash=1; shift ;;
+      --mcp)         mcp_read="${mcp_read:+$mcp_read,}${2:?--mcp necesita un servidor}"; shift 2 ;;
+      --mcp-write)   mcp_write="${mcp_write:+$mcp_write,}${2:?--mcp-write necesita un servidor}"; shift 2 ;;
+      --json)        format='json'; shift ;;
+      --account)     account="${2:?--account necesita un nombre}"; shift 2 ;;
+      --dir)         workdir="${2:?--dir necesita una ruta}"; shift 2 ;;
+      --model)       model="${2:?--model necesita un id}"; shift 2 ;;
+      --timeout)     timeout_s="${2:?--timeout necesita segundos}"; shift 2 ;;
+      --)            shift; break ;;
+      -*)            die "opción desconocida: $1" ;;
+      *)             break ;;
+    esac
+  done
+
+  [[ $# -gt 0 ]] || die "falta la tarea. Uso: delegate $PROVIDER [opciones] \"tarea\""
+  local prompt="$*"
+
+  [[ -d "$workdir" ]] || die "no existe el directorio: $workdir"
+
+  if [[ "$mode" == 'chat' ]]; then
+    # chat is a mode, not a lesser agent: no tools at all, so a permission flag
+    # asked for here was a misunderstanding worth surfacing, not something to
+    # quietly ignore.
+    (( want_edit || want_bash )) && die "chat no tiene herramientas: quita --edit y --bash, o usa el modo agente"
+    [[ -n "$mcp_read$mcp_write" ]] && die "chat no tiene herramientas: quita --mcp y --mcp-write, o usa el modo agente"
+  fi
+
+  [[ -n "$timeout_s" ]] || timeout_s="${CFG[timeout]}"
+  [[ "$timeout_s" =~ ^[0-9]+$ && "$timeout_s" -ge 1 ]] || die "--timeout debe ser un entero de segundos"
+  [[ -n "$model" ]] || model="${CFG[model]}"
+
+  # Permissions before the key: a run that is going to be refused must be
+  # refused before anything reads a secret from disk.
+  DG_MCP_JSON=''
+  DG_MCP_TOOLS=''
+  DG_MCP_RULES=''
+  DG_MCP_ENV=()
+  if [[ "$mode" == 'agent' ]]; then
+    # Which servers exist is the machine owner's declaration; which ones this run
+    # reaches is the invocation's. Resolving the entries first means an unknown
+    # server name is refused before the ceiling is even consulted, and long
+    # before any key is read.
+    local want_mcp=0 want_mcp_write=0
+    if [[ -n "$mcp_read$mcp_write" ]]; then
+      dg_mcp_resolve "$(dg_mcp_dir)" "$mcp_read" "$mcp_write" || exit 2
+      want_mcp=1
+      [[ -n "$mcp_write" ]] && want_mcp_write=1
+      # `env` lets the LAST assignment win, and the passthrough is appended
+      # after the run's own. An entry naming ANTHROPIC_API_KEY would send this
+      # shell's key — the very one `-u ANTHROPIC_API_KEY` exists to keep out —
+      # to the provider's endpoint, and one naming ANTHROPIC_BASE_URL would
+      # redirect the run somewhere else with the account key in hand. This is
+      # refused rather than reordered: a server that wants one of these names
+      # is asking for something the run itself owns, and silently handing it a
+      # different value would be its own surprise.
+      local rn
+      for rn in ${DG_MCP_ENV[@]+"${DG_MCP_ENV[@]}"}; do
+        case "$rn" in
+          ANTHROPIC_*|CLAUDE_CODE_*)
+            printf '%s✗%s %s\n' "$RED" "$R" \
+              "un servidor MCP pidió reenviar ${B}${rn}${R}, que esta corrida define; quita ese nombre de env_passthrough" >&2
+            exit 2 ;;
+        esac
+      done
+    fi
+    dg_perm_resolve "${CFG[caps]}" "$want_edit" "$want_bash" \
+      "$want_mcp" "$want_mcp_write" "${DG_MCP_RULES:-}" || exit 2
+    # The MCP allowlist is appended here, not inside lib/permissions.sh: that
+    # file owns the local tool lattice and must stay ignorant of which servers
+    # exist.
+    [[ -n "$DG_MCP_TOOLS" ]] && DG_ALLOWED="$DG_ALLOWED,$DG_MCP_TOOLS"
+  else
+    DG_TOOLS=''
+    DG_ALLOWED=''
+    DG_RULES='Responde en español venezolano neutro (tú, nunca voseo). No tienes herramientas: no puedes leer archivos ni ejecutar nada. Responde solo con lo que te den en el mensaje. Si te falta información para responder, dilo en vez de suponerla.'
+  fi
+
+  # ── la key: se lee UNA sola vez, acá, después de validar todo lo demás ──
+  # Entre resolver la cuenta y abrir el archivo hay una carrera: otro proceso
+  # puede cambiar el symlink de la activa. Leerla una vez y en este punto acota
+  # esa ventana a lo mínimo, y deja la corrida inmune a un cambio posterior.
+  local key_path key
+  key_path="$(resolve_account_path "$account")"
+  dg_account_validate "${CFG[key_dir]}" "$key_path" || exit 1
+  key="$(dg_account_read "$key_path")"
+  [[ -n "$key" ]] || die "la key en $key_path está vacía"
+
+  # Other AI CLIs are unreachable from a delegated run. Invoking codex or claude
+  # from here spent the scarcest quota on reviews nobody asked for, and a rule in
+  # the prompt did not stop it. Stubs first in PATH make those calls fail; claude
+  # itself is resolved to an absolute path before PATH changes.
+  local claude_bin stub_dir tool
+  claude_bin="$(command -v claude)" || die "no encuentro el binario de claude en el PATH"
+  stub_dir="${XDG_CACHE_HOME:-$HOME/.cache}/delegate/stubs"
+  mkdir -p "$stub_dir"
+  for tool in codex claude delegate dg; do
+    printf '#!/bin/sh\necho "delegate: %s está bloqueado en tareas delegadas" >&2\nexit 126\n' \
+      "$tool" > "$stub_dir/$tool"
+    chmod +x "$stub_dir/$tool"
+  done
+  export PATH="$stub_dir:$PATH"
+
+  local claude_args=(
+    -p
+    --bare
+    --setting-sources "project,local"
+    --strict-mcp-config
+    --permission-mode "dontAsk"
+    --output-format "$format"
+  )
+  if [[ "$mode" == 'agent' ]]; then
+    claude_args+=(
+      --add-dir "$workdir"
+      --tools "$DG_TOOLS"
+      --allowedTools "$DG_ALLOWED"
+    )
+  else
+    claude_args+=(--tools '')
+  fi
+  # --strict-mcp-config is already above, so with no --mcp-config the child
+  # reaches no server at all. This adds one only when a server was requested.
+  [[ -n "$DG_MCP_JSON" ]] && claude_args+=(--mcp-config "$DG_MCP_JSON")
+
+  # LAST on purpose, and it must stay last. `--tools` and `--allowedTools` are
+  # variadic (`<tools...>`): they keep eating arguments until the next option,
+  # so a prompt sitting right after them was parsed as one more tool name and
+  # the child died with "Input must be provided either through stdin or as a
+  # prompt argument". Ending on an option that takes exactly one value is what
+  # makes the positional prompt reach the child. Anything appended after this
+  # has to take exactly one value too.
+  claude_args+=(--append-system-prompt "$DG_RULES")
+
+  # Names the entries asked to forward. Values are never in the config: the
+  # child inherits whatever this shell has under that name, and a name that is
+  # unset here is simply not forwarded — the server will say what it needs.
+  local passthrough=() n
+  for n in ${DG_MCP_ENV[@]+"${DG_MCP_ENV[@]}"}; do
+    if [[ -n "${!n+set}" ]]; then
+      passthrough+=("$n=${!n}")
+    else
+      warn "el servidor MCP pidió reenviar ${B}${n}${R}, que no está definida en este shell"
+    fi
+  done
+
+  cd "$workdir"
+  # Harmless notice from Claude Code when it titles a session with a model it
+  # does not know. It goes to stderr, but it dirties any `2>&1` over --json.
+  exec 2> >(grep --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
+
+  # The key goes in the child's environment, never as an argument: an argument
+  # is visible in `ps` to every user on the machine.
+  exec env \
+    -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
+    ANTHROPIC_BASE_URL="${CFG[endpoint]}" \
+    "${CFG[auth_env]}=$key" \
+    ANTHROPIC_MODEL="$model" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="${CFG[small_model]}" \
+    CLAUDE_CODE_SUBAGENT_MODEL="${CFG[small_model]}" \
+    ${passthrough[@]+"${passthrough[@]}"} \
+    timeout "$timeout_s" \
+    "$claude_bin" "${claude_args[@]}" "$prompt" \
+    < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
+}
+
+# ─── despacho ────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+  help|--help|-h) usage ;;
+  providers)      cmd_providers ;;
+  mcp)            shift; cmd_mcp "$@" ;;
+  account)        shift; cmd_account "$@" ;;
+  -*)             die "las opciones van después del proveedor: delegate <proveedor> $1 ..." ;;
+  *)
+    PROVIDER="$1"; shift
+    load_provider "$PROVIDER"
+    cmd_run "$@"
+    ;;
+esac

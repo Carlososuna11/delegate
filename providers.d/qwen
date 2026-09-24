@@ -1,0 +1,8 @@
+endpoint	https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic
+auth_env	ANTHROPIC_API_KEY
+key_dir	~/.config/qwen
+model	qwen3.8-max
+small_model	qwen3.8-flash
+timeout	1800
+caps	read,edit,bash,mcp,mcp-write
+residency	Singapore (Alibaba Cloud)
