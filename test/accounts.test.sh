@@ -82,6 +82,33 @@ test_path_rejects_names_that_could_escape() {
   assert_eq '' "$(ls -A "$TMP" 2>/dev/null)" "no path was constructed under the key dir root"
 }
 
+test_path_refuses_a_name_that_lands_on_the_metadata_files() {
+  # `%s` is a legal key_pattern, and `api_key` and `default_account` are legal
+  # account names. Together the account file WAS the compatibility symlink, or
+  # the default-account metadata: adding the first such account wrote the key
+  # there, and activating it then replaced it with a symlink to itself.
+  local combo pattern account
+  for combo in '%s|api_key' '%s|default_account' 'api_%s|key' 'default_%s|account' \
+               'api_k%s|ey' '.%s|hidden'; do
+    pattern="${combo%%|*}"; account="${combo#*|}"
+    capture dg_account_path "$TMP/keys" "$pattern" "$account"
+    assert_eq 2 "$RC" "refuses pattern $pattern with account $account"
+    assert_eq '' "$OUT" "prints no path for $pattern + $account"
+  done
+  # Control: the same patterns with an ordinary name are fine.
+  capture dg_account_path "$TMP/keys" '%s' 'trabajo'
+  assert_eq 0 "$RC" "a %s pattern with an ordinary name is accepted"
+}
+
+test_list_never_reports_the_metadata_files_as_accounts() {
+  mkdir -p "$TMP/keys"
+  printf 'k\n' >"$TMP/keys/trabajo"; chmod 600 "$TMP/keys/trabajo"
+  ln -s "$TMP/keys/trabajo" "$TMP/keys/api_key"
+  printf 'trabajo\n' >"$TMP/keys/default_account"
+  capture dg_account_list "$TMP/keys" '%s'
+  assert_eq 'trabajo' "$OUT" "only the real account is listed"
+}
+
 test_path_rejects_over_long_and_accepts_32_chars() {
   local name32='a2345678901234567890123456789012'  # 32 chars, the maximum
   capture dg_account_path "$TMP/keys" 'api_key.%s' "$name32"

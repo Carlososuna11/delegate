@@ -163,6 +163,19 @@ _dg_account_inside() {
   return 0
 }
 
+# 0 when <basename> is one of the files this library keeps NEXT TO the keys:
+# the `api_key` compatibility symlink, the `default_account` metadata, and the
+# dot-prefixed temporaries both are published through. `%s` is a legal
+# key_pattern and `api_key` a legal account name, so without this the account
+# file could BE the symlink — adding it wrote the key there and activating it
+# replaced it with a symlink to itself — or the metadata file.
+_dg_account_reserved_base() {
+  case "$1" in
+    api_key|default_account|.*) return 0 ;;
+  esac
+  return 1
+}
+
 dg_account_path() {
   local key_dir="${1:-}" pattern="${2:-}" account="${3:-}" dir
   if [[ -z $key_dir || -z $pattern || -z $account ]]; then
@@ -179,7 +192,13 @@ dg_account_path() {
     _dg_account_err "dg_account_path: unusable key_dir"
     return 2
   }
-  printf '%s/%s\n' "$dir" "${pattern/\%s/$account}"
+  local base="${pattern/\%s/$account}"
+  if _dg_account_reserved_base "$base"; then
+    printf 'delegate: account %s with key_pattern %s lands on %s, a reserved file in key_dir\n' \
+      "$account" "$pattern" "$base" >&2
+    return 2
+  fi
+  printf '%s/%s\n' "$dir" "$base"
 }
 
 dg_account_list() {
@@ -200,6 +219,7 @@ dg_account_list() {
     [[ -f $f || -L $f ]] || continue
     base="${f##*/}"
     [[ $base == "$prefix"*"$suffix" ]] || continue
+    _dg_account_reserved_base "$base" && continue
     name="$base"
     [[ -n $prefix ]] && name="${name#"$prefix"}"
     [[ -n $suffix ]] && name="${name%"$suffix"}"

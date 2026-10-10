@@ -255,6 +255,9 @@ en un archivo de metadata no secreto, para no depender de estado global mutable.
   `mv -T`.
 - Antes de usar una key se valida que el target esté **dentro** de `key_dir` y tenga
   permisos 600.
+- La ruta de una cuenta nunca puede ser `api_key`, `default_account` ni un archivo con
+  punto: `%s` es un `key_pattern` válido y `api_key` un nombre de cuenta válido, y
+  juntos hacían que la key **fuera** el symlink de compatibilidad.
 - Borrar la cuenta activa deja el setup **sin** cuenta activa, a propósito y con aviso
   ruidoso. Cambiar en silencio qué key se factura es peor que quedarse sin activa.
 - Ningún comando imprime el contenido de una key. Lo más que muestra es una huella
@@ -344,6 +347,9 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   borrado al terminar, también si al CLI le llega un TERM; un symlink o un ejecutable
   dejados en el viejo directorio compartido no tienen efecto, un padre escribible por
   todos sin sticky bit se rechaza, y el código de salida del hijo es el de la corrida.
+- Una cuenta cuyo archivo caería sobre `api_key`, `default_account` o un temporal con
+  punto (por ejemplo `key_pattern` `%s` con la cuenta `api_key`) se rechaza con 2, y
+  `list` nunca muestra esos archivos como cuentas.
 
 ## Lo que NO se construye
 
