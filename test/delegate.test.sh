@@ -23,7 +23,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DELEGATE="$REPO_ROOT/bin/delegate"
-DG_ALIAS="$REPO_ROOT/bin/dg"
+DG_ALIAS="$REPO_ROOT/bin/dlg"
 
 FAKE_KEY='fake-key-para-tests'
 
@@ -314,12 +314,12 @@ test_zero_timeout_fails() {
   assert_contains "$ERR" "entero de segundos" "asks for an integer"
 }
 
-test_dg_alias_matches_delegate_help() {
+test_dlg_alias_matches_delegate_help() {
   setup_env
   capture "$DELEGATE" help
   local d_out="$OUT" d_err="$ERR" d_rc="$RC"
   capture "$DG_ALIAS" help
-  # Same output is the point: `dg` resolves the symlink back to bin/delegate and
+  # Same output is the point: `dlg` resolves the symlink back to bin/delegate and
   # therefore finds the same lib/. A copy, or a broken resolution, would differ.
   assert_eq "$d_rc" "$RC" "same exit code"
   assert_eq "$d_out" "$OUT" "same stdout"

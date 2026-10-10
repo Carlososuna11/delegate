@@ -6,7 +6,7 @@
 # command line of its parent, then exits 0 without calling a model.
 #
 # Nothing here writes outside $TMP: PATH, the providers dir, the key dir, the MCP
-# entry dir and XDG_CACHE_HOME (where the blocked-CLI stubs land) all point into
+# entry dir and XDG_CACHE_HOME (where the stubs used to land) all point into
 # the scratch directory, and the only key in the whole suite is the sentinel
 # below, written by the fixture.
 #
@@ -16,7 +16,8 @@
 #                asked for by name; of a server asked for, only the tools its
 #                entry lists; and none of the variables the run itself defines
 #   invariant 4  permissions only widen, and they reach the child
-#   invariant 5  codex, claude, delegate and dg are unreachable from the child
+#   invariant 5  codex, claude, delegate, dlg and the other AI CLIs are blocked
+#                by name in the child
 #   invariant 6  a provider file, and an MCP entry, are parsed, never sourced
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
@@ -75,14 +76,17 @@ if [[ -n "$dump" ]]; then
   # notice) runs alongside this process for the whole run. Its environment is
   # readable by the same user, so whatever it inherited is exposed as long as
   # the run lasts. Matched in bash, not with grep, so the probe never finds
-  # itself. Only a child of our own parent: the filter is forked by the CLI's
-  # process, which then exec'd into `timeout`, so its parent is $PPID — and a
-  # filter from another delegate run on this machine is not this run's.
+  # itself. Only a sibling of our parent `timeout`: the CLI's process starts
+  # both the filter and the child, so they share a parent — and a filter from
+  # another delegate run on this machine is not this run's.
+  gst="$(cat "/proc/$PPID/stat" 2>/dev/null)"
+  gst="${gst##*) }"
+  read -r _ gpid _ <<<"$gst"
   for p in /proc/[0-9]*; do
     st="$(cat "$p/stat" 2>/dev/null)" || continue
     st="${st##*) }"
     read -r _ ppid _ <<<"$st"
-    [[ "$ppid" == "$PPID" ]] || continue
+    [[ "$ppid" == "$gpid" ]] || continue
     c="$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)" || continue
     if [[ "$c" == *--line-buffered*unrecognized_model* ]]; then
       : >"$dump/filter_found"
@@ -95,11 +99,24 @@ fi
 if [[ "$mode" == probe-tools ]]; then
   # The child tries to reach another AI CLI by PATH; all four must be blocked.
   : >"$dump/blocked"
-  for tool in codex claude delegate dg; do
+  for tool in codex claude delegate dlg dg deepseek-agent qwen-agent opencode gemini; do
     rc=0
     "$tool" >/dev/null 2>&1 || rc=$?
     printf '%s %s\n' "$tool" "$rc" >>"$dump/blocked"
   done
+fi
+
+if [[ "$mode" == probe-stubs ]]; then
+  # Where the stubs live for THIS run, and what a name that is not a stub
+  # resolves to: a directory shared between runs could hold anything.
+  stubs="$(dirname "$(command -v codex)")"
+  printf '%s\n' "$stubs" >"$dump/stub_dir"
+  stat -c %a "$stubs" >"$dump/stub_mode"
+  command -v node >"$dump/node_path" 2>/dev/null || :
+fi
+
+if [[ "$mode" == exit7 ]]; then
+  exit 7
 fi
 
 if [[ "$mode" == stderr-notice ]]; then
@@ -972,7 +989,7 @@ test_edit_and_bash_widen_the_allowed_tools_the_child_gets() {
 
 # ─── invariant 5: other AI CLIs are blocked in the child's PATH ──────────────
 
-test_codex_claude_delegate_and_dg_are_blocked_from_the_child() {
+test_other_ai_clis_are_blocked_from_the_child() {
   setup
   printf 'probe-tools\n' >"$TMP/fake_mode"
   capture dg_ok "tarea"
@@ -981,9 +998,9 @@ test_codex_claude_delegate_and_dg_are_blocked_from_the_child() {
 
   local results
   results="$(cat "$TMP/dump/blocked")"
-  assert_eq 4 "$(printf '%s\n' "$results" | grep -c .)" "all four were probed"
+  assert_eq 9 "$(printf '%s\n' "$results" | grep -c .)" "all nine were probed"
   local tool
-  for tool in codex claude delegate dg; do
+  for tool in codex claude delegate dlg dg deepseek-agent qwen-agent opencode gemini; do
     assert_eq "$tool 126" "$(grep "^$tool " "$TMP/dump/blocked")" "$tool exits 126 in the child"
   done
 }
@@ -1110,6 +1127,87 @@ test_a_relative_or_tree_path_entry_never_supplies_a_binary() {
   done
   # A trailing empty entry is an empty entry too, and `read -a` drops it.
   [[ "$child_path" != *: ]] || fail "the child's PATH ends in an empty entry"
+}
+
+test_the_stubs_live_in_a_private_directory_per_run_removed_at_exit() {
+  # The stubs used to live in one shared directory under XDG_CACHE_HOME,
+  # rewritten by every run with `>`: a symlink precreated there was followed
+  # and its target overwritten, and any extra executable left there (`node`,
+  # `git`) ran ahead of the real one in every later run. Now each run gets its
+  # own mktemp directory, and nothing of it survives the run.
+  setup
+  mkdir -p "$TMP/cache/delegate/stubs" "$TMP/run"
+  printf 'intacto\n' >"$TMP/victim"
+  ln -s "$TMP/victim" "$TMP/cache/delegate/stubs/codex"
+  printf '#!/bin/sh\n: >%q\n' "$TMP/pwned-node" >"$TMP/cache/delegate/stubs/node"
+  chmod +x "$TMP/cache/delegate/stubs/node"
+
+  printf 'probe-stubs\n' >"$TMP/fake_mode"
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/run")
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the first run exits 0"
+  require_child_ran || return 0
+  local first
+  first="$(cat "$TMP/dump/stub_dir")"
+  assert_eq "intacto" "$(cat "$TMP/victim")" "a symlink in the old shared directory is not followed"
+  assert_ne "$TMP/cache/delegate/stubs" "$first" "the stubs are not in the shared cache directory"
+  assert_eq "700" "$(cat "$TMP/dump/stub_mode")" "the run's stub directory is private"
+  assert_not_contains "$(cat "$TMP/dump/node_path")" "$TMP/cache" "an executable left in the old directory is not on PATH"
+  [[ ! -e "$first" ]] || fail "the stub directory survives the run: $first"
+
+  clear_dump
+  capture dg_ok "tarea"
+  require_child_ran || return 0
+  assert_ne "$first" "$(cat "$TMP/dump/stub_dir")" "each run gets its own directory"
+  [[ -z "$(ls -A "$TMP/run")" ]] || fail "something was left in the runtime directory: $(ls -A "$TMP/run")"
+
+  # A parent anyone can write without the sticky bit lets them rename the
+  # run's directory away and put their own in its place: refused.
+  mkdir -p "$TMP/open"
+  chmod 777 "$TMP/open"
+  clear_dump
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/open")
+  capture dg_ok "tarea"
+  assert_ne 0 "$RC" "a world-writable, non-sticky parent is refused"
+  assert_contains "$ERR" "sticky" "and the message says why"
+  child_ran && fail "the child ran anyway"
+  return 0
+}
+
+test_a_term_to_the_cli_reaches_the_child_and_removes_the_stubs() {
+  # The CLI now waits for the child instead of exec'ing into it. A TERM sent to
+  # the CLI's process must still end the run — forwarded to the child — and
+  # the EXIT trap must still remove the stub directory.
+  setup
+  mkdir -p -m 700 "$TMP/run"
+  printf '30\n' >"$TMP/fake_sleep"
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/run")
+  dg_ok "tarea-larga-$$" >/dev/null 2>&1 &
+  local bg=$!
+  wait_for "$TMP/dump/started" || { fail "the child never started"; kill "$bg" 2>/dev/null; return 0; }
+  local pid
+  pid="$(pgrep -f -- "bin/delegate testprov --dir $TMP/work tarea-larga-$$" | head -n 1)"
+  [[ -n "$pid" ]] || { fail "control: the CLI's process was not found"; kill "$bg" 2>/dev/null; return 0; }
+  kill -TERM "$pid"
+  local tries=100
+  while kill -0 "$bg" 2>/dev/null && (( tries-- > 0 )); do sleep 0.1; done
+  if kill -0 "$bg" 2>/dev/null; then
+    fail "the run is still alive 10 s after TERM"
+    pkill -f -- "tarea-larga-$$" 2>/dev/null
+  fi
+  wait "$bg" 2>/dev/null
+  [[ -z "$(ls -A "$TMP/run")" ]] || fail "the stub directory survived the TERM: $(ls -A "$TMP/run")"
+  rm -f "$TMP/fake_sleep"
+  return 0
+}
+
+test_the_childs_exit_code_is_the_runs_exit_code() {
+  # The CLI no longer execs into the child (it has to remove the stub
+  # directory afterwards), so the child's exit code has to be passed on.
+  setup
+  printf 'exit7\n' >"$TMP/fake_mode"
+  capture dg_ok "tarea"
+  assert_eq 7 "$RC" "the child's exit code comes back"
 }
 
 # ─── invariant 6: a provider file is parsed, never sourced ───────────────────

@@ -99,7 +99,7 @@ dg_clean_path() {
 PATH="$(dg_clean_path "$PATH")"
 export PATH
 
-# Resolve the real script location so the `dg` symlink finds lib/ too.
+# Resolve the real script location so the `dlg` symlink finds lib/ too.
 DG_BIN="${BASH_SOURCE[0]}"
 while [[ -L "$DG_BIN" ]]; do
   DG_LINK="$(readlink "$DG_BIN")"
@@ -136,7 +136,7 @@ ok()   { printf '%s✓%s %s\n' "$GREEN" "$R" "$*" >&2; }
 
 usage() {
   cat >&2 <<EOF
-${B}delegate${R} — manda trabajo de código acotado a un modelo más barato ${D}(alias: dg)${R}
+${B}delegate${R} — manda trabajo de código acotado a un modelo más barato ${D}(alias: dlg)${R}
 
 ${B}USO${R}
   ${CYAN}delegate${R} <proveedor> [opciones] "tarea"      agente con herramientas
@@ -621,17 +621,31 @@ cmd_run() {
   env_bin="$(type -P env)" || die "no encuentro env en el PATH"
   [[ "$claude_bin" == /* && "$timeout_bin" == /* && "$grep_bin" == /* && "$env_bin" == /* ]] ||
     die "claude, timeout, grep y env tienen que resolverse a rutas absolutas"
-  stub_dir="${XDG_CACHE_HOME:-$HOME/.cache}/delegate/stubs"
-  # 700 and owner-checked. This directory goes FIRST in the child's PATH, and
-  # its location comes from XDG_CACHE_HOME, an inherited variable. Pointed at a
-  # shared writable directory, anything a third party precreated there as
-  # `git`, `grep` or `node` would run ahead of the real binary inside the
-  # delegated process. Refused rather than repaired: silently relocating the
-  # stubs would hide the fact that the cache path is not the caller's.
-  mkdir -p -m 700 "$stub_dir"
-  [[ -O "$stub_dir" ]] || die "el directorio de stubs $stub_dir no es tuyo; revisa XDG_CACHE_HOME"
-  chmod 700 "$stub_dir"
-  for tool in codex claude delegate dg; do
+  # A private directory per run, created by mktemp (exclusive, mode 700) and
+  # removed when the run ends. It used to be one shared directory under
+  # XDG_CACHE_HOME, rewritten by every run with `>`: a symlink precreated there
+  # was followed and its target overwritten, an extra executable left there
+  # (`node`, `git`) ran ahead of the real one in every later run, and two
+  # concurrent runs rewrote each other's `git`. Verified. XDG_RUNTIME_DIR first
+  # because it is the user's own 700 directory; a parent that others can write
+  # without the sticky bit would let them rename ours away, so it is refused
+  # (group-writable is left alone: with a private group per user it is the
+  # normal result of umask 002).
+  local stub_parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" pmode
+  [[ "$stub_parent" == /* && -d "$stub_parent" ]] || stub_parent=/tmp
+  pmode="$(stat -L -c %a -- "$stub_parent")" || die "no puedo leer los permisos de $stub_parent"
+  if (( (8#$pmode & 8#0002) && !(8#$pmode & 8#1000) )); then
+    die "el directorio temporal $stub_parent lo pueden escribir otros sin sticky bit; revisa XDG_RUNTIME_DIR y TMPDIR"
+  fi
+  stub_dir="$(mktemp -d -p "$stub_parent" delegate-stubs.XXXXXXXX)" ||
+    die "no pude crear el directorio de stubs en $stub_parent"
+  _DG_X_STUBS="$stub_dir"
+  # Absolute: the cleanup runs after the environment wipe, when PATH is gone.
+  _DG_X_RM="$(type -P rm)" || die "no encuentro rm en el PATH"
+  trap 'dg_cleanup_stubs' EXIT
+  # Name interception, not a sandbox: a run with --bash can still call a binary
+  # by its absolute path or rewrite PATH. Invariant 5 says exactly that.
+  for tool in codex claude delegate dlg dg deepseek-agent qwen-agent opencode gemini; do
     printf '#!/bin/sh\necho "delegate: %s está bloqueado en tareas delegadas" >&2\nexit 126\n' \
       "$tool" > "$stub_dir/$tool"
     chmod +x "$stub_dir/$tool"
@@ -676,8 +690,6 @@ cmd_run() {
         "${real_git//\'/\'\\\'\'}"
     } > "$stub_dir/git"
     chmod +x "$stub_dir/git"
-  else
-    rm -f -- "$stub_dir/git"
   fi
   export PATH="$stub_dir:$PATH"
 
@@ -868,11 +880,34 @@ dg_exec_child() {
   # A single-quoted constant: nothing in it is expanded here.
   local _dg_tramp='while IFS= read -r -d "" kv <&3; do export "$kv" || exit 125; done; exec 3<&-; exec "$@"'
 
-  exec "$_DG_X_ENV_BIN" -i /bin/bash -p -c "$_dg_tramp" delegate-exec \
+  # Not `exec`: this shell stays to remove the run's stub directory when the
+  # child ends (the EXIT trap), and passes the child's exit code on. The child
+  # runs in the background so a TERM, INT or HUP sent to this process is
+  # forwarded instead of waiting, unhandled, behind a foreground job.
+  "$_DG_X_ENV_BIN" -i /bin/bash -p -c "$_dg_tramp" delegate-exec \
     "$_DG_X_TIMEOUT_BIN" "$_DG_X_TIMEOUT" \
     "$_DG_X_BIN" "${_DG_X_ARGS[@]}" "$_DG_X_PROMPT" \
     3< <(printf '%s\0' "${_dg_pairs[@]}") \
-    < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
+    < /dev/null &  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
+  _dg_child=$!
+  trap 'kill -TERM "$_dg_child" 2>/dev/null || true' TERM INT HUP
+  local _dg_rc=0
+  while :; do
+    _dg_rc=0
+    wait "$_dg_child" || _dg_rc=$?
+    # A wait cut short by a trapped signal returns >128 while the child lives.
+    kill -0 "$_dg_child" 2>/dev/null || break
+  done
+  exit "$_dg_rc"
+}
+
+# Removes the run's private stub directory. Only ever a directory this run
+# created with mktemp, whose path is in _DG_X_STUBS.
+dg_cleanup_stubs() {
+  if [[ -n "${_DG_X_STUBS:-}" && -d "$_DG_X_STUBS" ]]; then
+    "${_DG_X_RM:-rm}" -rf -- "$_DG_X_STUBS"
+  fi
+  return 0
 }
 
 # ─── despacho ────────────────────────────────────────────────────────────────

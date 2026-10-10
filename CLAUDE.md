@@ -68,8 +68,17 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    (`caps`) gana sobre los flags: si no incluye `bash`, `--bash` se **rechaza**, no se
    ignora en silencio, y un rechazo no deja ningún global seteado, para que una corrida
    negada no pueda leerse como una más angosta.
-5. **Otras CLIs de IA bloqueadas en el PATH del hijo.** Un delegado no invoca `codex`,
-   `claude` ni `delegate` para gastar cuota cara ni para re-delegar.
+5. **Otras CLIs de IA bloqueadas por nombre en el PATH del hijo.** `codex`, `claude`,
+   `delegate`, `dlg`, `dg`, `deepseek-agent`, `qwen-agent`, `opencode` y `gemini` son
+   stubs que salen con 126, para que un delegado no gaste cuota cara ni re-delegue.
+   Lo que esto promete es exactamente eso: bloquea la invocación **por nombre**. Una
+   corrida con `--bash` puede llamar un binario por su ruta absoluta o reescribir su
+   `PATH`, y eso no lo impide nada aquí. Los stubs viven en un directorio privado por
+   corrida (`mktemp -d`, 700, en `XDG_RUNTIME_DIR` o `TMPDIR`), que se borra al
+   terminar: el directorio compartido de antes se reescribía con `>` en cada corrida,
+   así que seguía un symlink precreado y un ejecutable dejado ahí (`node`, `git`)
+   corría antes que el real. Por eso el CLI ya no hace `exec` al hijo: lo espera, le
+   reenvía TERM, INT y HUP, borra el directorio y sale con su código.
 6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
    y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
    variables de entorno, ni reescribir lo que la corrida fija. Una entrada declara
@@ -133,7 +142,8 @@ de usuario.
 
 ## Superficie
 
-Ejecutable `delegate`, con `dg` como abreviación (el mismo script, no una copia).
+Ejecutable `delegate`, con `dlg` como abreviación (el mismo script por symlink, no una
+copia). No `dg`: en esta máquina ese nombre es el CLI de Deepgram.
 Proveedor como subcomando; modo agente por defecto.
 
 ```
@@ -330,6 +340,10 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   sentinela. Los tests de aislamiento ejecutan el script, no `bash bin/delegate`.
 - El `grep` que filtra stderr no lleva el environment del padre ni la key: un
   `GITHUB_TOKEN` del shell que invoca no aparece en su `/proc/<pid>/environ`.
+- Los stubs viven en un directorio privado (700) por corrida, distinto en cada una y
+  borrado al terminar, también si al CLI le llega un TERM; un symlink o un ejecutable
+  dejados en el viejo directorio compartido no tienen efecto, un padre escribible por
+  todos sin sticky bit se rechaza, y el código de salida del hijo es el de la corrida.
 
 ## Lo que NO se construye
 
