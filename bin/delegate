@@ -970,9 +970,17 @@ dg_exec_child() {
     s=$1 rm=$2; shift 2
     cleanup() { if [[ -n $s && -d $s ]]; then "$rm" -rf -- "$s" 2>/dev/null; fi; return 0; }
     trap cleanup EXIT
+    # The traps go in BEFORE the launch. Installed after it, a signal arriving
+    # in between killed this shell untrapped: the EXIT trap removed the stubs
+    # and the child ran on without them. One that lands before `c` is known is
+    # kept in `p` and delivered right after the launch.
+    c= p=
+    for g in TERM INT HUP; do
+      trap "if [ -n \"\$c\" ]; then kill -s $g \$c 2>/dev/null; else p=$g; fi" "$g"
+    done
     "$@" &
     c=$!
-    for g in TERM INT HUP; do trap "kill -s $g \$c 2>/dev/null" "$g"; done
+    if [ -n "$p" ]; then kill -s "$p" "$c" 2>/dev/null; fi
     while :; do
       r=0; wait "$c" || r=$?
       kill -0 "$c" 2>/dev/null || break
