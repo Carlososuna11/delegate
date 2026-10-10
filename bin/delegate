@@ -628,7 +628,8 @@ cmd_run() {
   [[ "$claude_bin" == /* && "$timeout_bin" == /* && "$grep_bin" == /* && "$env_bin" == /* ]] ||
     die "claude, timeout, grep y env tienen que resolverse a rutas absolutas"
   # A private directory per run, created by mktemp (exclusive, mode 700) and
-  # removed when the run ends. It used to be one shared directory under
+  # removed when the run ends (not on a SIGKILL of the run's process, which
+  # nothing can trap; see CLAUDE.md). It used to be one shared directory under
   # XDG_CACHE_HOME, rewritten by every run with `>`: a symlink precreated there
   # was followed and its target overwritten, an extra executable left there
   # (`node`, `git`) ran ahead of the real one in every later run, and two
@@ -673,11 +674,12 @@ cmd_run() {
   #
   # The allowlist only lets `git <subcommand>` through by name, so a `git`
   # first in PATH is what the model's command reaches. It ignores system and
-  # global config, overrides the executable keys of the repository's, forces
-  # --no-ext-diff/--no-textconv, and refuses --ext-diff, --textconv and
-  # --output in the forms git accepts. Defence in depth, not a boundary: a
-  # filter in .git/config with a matching .gitattributes still runs, and the
-  # real limit stays "never delegate over a hostile tree" (CLAUDE.md). Floor
+  # global config, overrides the executable keys of the repository's (filters
+  # and signature programs included), appends --no-ext-diff/--no-textconv, and
+  # refuses --ext-diff, --textconv and every prefix of --output. Defence in
+  # depth, not a boundary: it lists the helpers git 2.43 is known to run, a
+  # newer git may add one, and the real limit stays "never delegate over a
+  # hostile tree" (CLAUDE.md). Floor
   # only: --bash is unrestricted shell, and constraining git there would be a
   # narrower grant than the one asked for.
   local real_git=''

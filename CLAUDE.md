@@ -73,20 +73,30 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    stubs que salen con 126, para que un delegado no gaste cuota cara ni re-delegue.
    Lo que esto promete es exactamente eso: bloquea la invocación **por nombre**. Una
    corrida con `--bash` puede llamar un binario por su ruta absoluta o reescribir su
-   `PATH`, y eso no lo impide nada aquí. Los stubs viven en un directorio privado por
-   corrida (`mktemp -d`, 700, en `XDG_RUNTIME_DIR` o `TMPDIR`), que se borra al
-   terminar. El padre tiene que ser del usuario o de root, y solo escribible por su
-   dueño o con sticky bit: quien puede escribir el padre puede renombrar el directorio
-   de la corrida y poner el suyo, aunque este sea 700. El directorio compartido de
-   antes se reescribía con `>` en cada corrida,
-   así que seguía un symlink precreado y un ejecutable dejado ahí (`node`, `git`)
-   corría antes que el real. Por eso alguien tiene que esperar al hijo para borrar el
-   directorio, y no puede ser el CLI: un proceso vivo conserva en `/proc/<pid>/environ`
-   el environment con el que arrancó aunque haga `unset`, y el CLI arrancó con las
-   credenciales del padre. El CLI hace `exec` a un supervisor `/bin/bash -p` arrancado
-   con `env -i` (mismo pid, environ vacío), que lanza al hijo, le reenvía TERM, INT y
-   HUP cada una como sí misma,
-   borra el directorio y sale con el código del hijo, aunque el borrado falle.
+   `PATH`, y eso no lo impide nada aquí.
+
+   Los stubs viven en un directorio privado por corrida (`mktemp -d`, 700, en
+   `XDG_RUNTIME_DIR` o `TMPDIR`), que se borra al terminar. El directorio compartido
+   de antes se reescribía con `>` en cada corrida, así que seguía un symlink
+   precreado, y un ejecutable dejado ahí (`node`, `git`) corría antes que el real. El
+   padre tiene que ser del usuario o de root, y solo escribible por su dueño o con
+   sticky bit: quien puede escribir el padre puede renombrar el directorio de la
+   corrida y poner el suyo, aunque este sea 700.
+
+   Alguien tiene que esperar al hijo para borrar el directorio, y no puede ser el CLI:
+   un proceso vivo conserva en `/proc/<pid>/environ` el environment con el que
+   arrancó, aunque haga `unset`, y el CLI arrancó con las credenciales del padre. Por
+   eso el CLI hace `exec` a un supervisor `/bin/bash -p` arrancado con `env -i` (mismo
+   pid, environ vacío). El supervisor:
+   - instala sus trampas antes de lanzar al hijo;
+   - le reenvía TERM, INT y HUP, cada una como sí misma;
+   - cierra todo descriptor por encima de 2;
+   - borra el directorio y sale con el código del hijo, aunque el borrado falle.
+
+   **Límite:** un SIGKILL al proceso de la corrida no se puede atrapar. El hijo
+   (`timeout` y el harness) sigue vivo hasta su timeout, y el directorio de stubs
+   queda en disco. Supervisar por grupo de procesos o cgroup le toca a `delegate-run`
+   (Fase B), no a este CLI.
 6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
    y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
    variables de entorno, ni reescribir lo que la corrida fija. Una entrada declara
