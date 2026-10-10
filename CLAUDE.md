@@ -68,8 +68,10 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
      ganar; el rechazo no es por el orden sino porque un servidor que pide un nombre que
      la corrida posee está pidiendo algo que no puede tener.
    - Los que se interpretan como **código** dentro del hijo: `LD_*`, `NODE_OPTIONS`,
-     `BASH_ENV`, `ENV`, `PATH`, `HOME`, `PYTHONPATH`, `GIT_SSH_COMMAND`,
-     `GIT_EXTERNAL_DIFF`, `PAGER`, `EDITOR` y compañía. Como el environment del hijo se
+     `BASH_ENV`, `ENV`, `PATH`, `HOME`, `PYTHONPATH`, todo `GIT_*` (con
+     `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` una entrada http
+     configuraba `diff.external` y el `git diff` del piso lo corría), `PAGER`,
+     `EDITOR` y compañía. Como el environment del hijo se
      construye desde una allowlist, el passthrough es el **único** canal por el que algo
      de este shell cruza, y un nombre de estos lo convierte en ejecución de código.
      Las credenciales **no** están en esa lista a propósito: reenviar un token es para lo

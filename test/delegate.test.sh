@@ -693,6 +693,25 @@ test_env_passthrough_of_a_code_carrying_name_is_refused() {
   done
 }
 
+test_env_passthrough_of_any_git_variable_is_refused() {
+  # GIT_CONFIG_COUNT, GIT_CONFIG_KEY_0 and GIT_CONFIG_VALUE_0 passed the guard,
+  # so an http entry could forward a parent's `diff.external=<program>` into
+  # the child and every `git diff` on the read-only floor ran it — no --bash,
+  # no `trust local-exec`. Git reads dozens of GIT_* names, several of them as
+  # config or as commands, so the whole family is refused rather than a list
+  # that would have to keep up with git.
+  local name
+  for name in GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 \
+              GIT_CONFIG_PARAMETERS GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_DIR GIT_ASKPASS; do
+    setup_runnable
+    write_mcp_http_entry docs 'get_thing' env_passthrough "$name"
+    dg_run alpha --dir "$TMP/work" --mcp docs "haz algo"
+    assert_eq 2 "$RC" "forwarding $name exits 2"
+    assert_contains "$ERR" "$name" "names the variable it refused"
+    assert_fails "nothing reached the child for $name" test -f "$FAKE_CLAUDE_LOG"
+  done
+}
+
 test_forwarded_names_are_announced_on_stderr() {
   setup_runnable
   DG_ENV+=(FAKE_CLAUDE_ENV_LOG="$FAKE_CLAUDE_ENV_LOG")

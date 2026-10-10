@@ -468,7 +468,14 @@ cmd_run() {
             printf '%s✗%s %s\n' "$RED" "$R" \
               "un servidor MCP pidió reenviar ${B}${rn}${R}, que esta corrida define; quita ese nombre de env_passthrough" >&2
             exit 2 ;;
-          LD_*|NODE_OPTIONS|NODE_REPL_EXTERNAL_MODULE|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|IFS|PATH|HOME|PYTHONPATH|PYTHONSTARTUP|PERL5LIB|PERL5OPT|RUBYOPT|GIT_SSH_COMMAND|GIT_EXTERNAL_DIFF|GIT_PAGER|GIT_EDITOR|PAGER|EDITOR|VISUAL)
+          # GIT_* whole, not one name at a time. GIT_CONFIG_COUNT with
+          # GIT_CONFIG_KEY_0/GIT_CONFIG_VALUE_0 passed when only GIT_SSH_COMMAND
+          # and friends were listed, and forwarded `diff.external=<program>`
+          # into the child, where the floor's `git diff` ran it. Git reads
+          # dozens of these names, several as config or as commands; a list
+          # would have to keep up with git. The allowlist of safe GIT_* names
+          # is empty until one is actually needed.
+          LD_*|GIT_*|NODE_OPTIONS|NODE_REPL_EXTERNAL_MODULE|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|IFS|PATH|HOME|PYTHONPATH|PYTHONSTARTUP|PERL5LIB|PERL5OPT|RUBYOPT|PAGER|EDITOR|VISUAL)
             printf '%s✗%s %s\n' "$RED" "$R" \
               "un servidor MCP pidió reenviar ${B}${rn}${R}: su valor se interpreta como código dentro de la corrida delegada, así que no se reenvía nunca" >&2
             exit 2 ;;
