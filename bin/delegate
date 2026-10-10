@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # delegate — manda trabajo de código acotado a un modelo más barato.
 #
 # Corre el harness de Claude Code en headless contra el endpoint
@@ -13,21 +13,37 @@
 #   delegate account deepseek list|add|use|rm|default
 #   delegate providers
 #   delegate help
+#
+# The shebang is `/bin/bash -p`, a fixed path and privileged mode, and both
+# matter. Everything below this comment runs AFTER bash has processed its own
+# startup, and three things the caller controls acted there, before any
+# cleanup in this file could: BASH_ENV (a file sourced before line one), an
+# exported function named `set` (imported, then run by the cleanup's own `set`
+# call — twice, verified), and SHELLOPTS (xtrace with a PS4 that printed the
+# parent's ANTHROPIC_API_KEY; allexport, which re-exported the account key
+# through every assignment). Privileged mode skips BASH_ENV and ENV, imports no
+# functions and ignores SHELLOPTS, BASHOPTS, CDPATH and GLOBIGNORE from the
+# environment. `env bash` would let PATH pick the interpreter, and env passes
+# no option portably. Run as `bash bin/delegate`, the shebang is ignored and
+# none of this holds; installed and invoked by name, it does.
+
+# FIRST useful line. Privileged mode already ignored an inherited SHELLOPTS, but
+# `bash -a delegate` or `bash -x delegate` set the same options from the
+# command line: allexport would export `key` through `local +x`, and xtrace
+# would print `key=<the actual key>` to the stderr that `--json 2>&1` collects.
+set +a +x +v
 set -euo pipefail
 
-# FIRST, before anything reads a key. Bash honours an inherited SHELLOPTS, so
-# `env SHELLOPTS=xtrace delegate ...` turns tracing on for this whole script and
-# prints every assignment to stderr — including `key=<the actual key>`, and into
-# the stream that `--json 2>&1` collects. Verified on this machine. BASH_ENV and
-# ENV are the same shape of problem: a file the caller chooses, sourced before
-# the script runs. CDPATH is the third: it makes a later `cd` into a relative
-# directory land somewhere else and print the path, which both misplaces the run
-# and corrupts `--json`.
-set +x +v
+# BASH_ENV and ENV are already harmless here (privileged mode did not read
+# them) and unset so nothing this script runs inherits them. CDPATH makes a
+# later `cd` into a relative directory land somewhere else and print the path,
+# which both misplaces the run and corrupts `--json`. SHELLOPTS is readonly,
+# hence the `|| true`.
 unset -v SHELLOPTS BASH_ENV ENV CDPATH 2>/dev/null || true
 
-# Exported FUNCTIONS, and here rather than next to the environment wipe further
-# down, because this script itself runs grep, ls and git long before it gets
+# Exported FUNCTIONS. Privileged mode already declined to import them; this
+# loop is for a run started as `bash bin/delegate`, where the shebang does not
+# apply. Here rather than next to the environment wipe further down, because this script itself runs grep, ls and git long before it gets
 # there. A function arriving in the environ as `BASH_FUNC_<name>%%` is imported
 # by bash and WINS over the binary of the same name, so a parent with
 # `export -f grep` was already executing its own code inside this script —

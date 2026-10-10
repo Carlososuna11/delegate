@@ -71,6 +71,24 @@ if [[ -n "$dump" ]]; then
   # level up would still be visible in `ps`.
   cat "/proc/$PPID/comm" >"$dump/parent_comm" 2>/dev/null || true
   tr '\0' '\n' <"/proc/$PPID/cmdline" >"$dump/parent_cmdline" 2>/dev/null || true
+  # The CLI's stderr filter (a `grep` on Claude Code's unrecognized_model
+  # notice) runs alongside this process for the whole run. Its environment is
+  # readable by the same user, so whatever it inherited is exposed as long as
+  # the run lasts. Matched in bash, not with grep, so the probe never finds
+  # itself. Only a child of our own parent: the filter is forked by the CLI's
+  # process, which then exec'd into `timeout`, so its parent is $PPID — and a
+  # filter from another delegate run on this machine is not this run's.
+  for p in /proc/[0-9]*; do
+    st="$(cat "$p/stat" 2>/dev/null)" || continue
+    st="${st##*) }"
+    read -r _ ppid _ <<<"$st"
+    [[ "$ppid" == "$PPID" ]] || continue
+    c="$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)" || continue
+    if [[ "$c" == *--line-buffered*unrecognized_model* ]]; then
+      tr '\0' '\n' <"$p/environ" >"$dump/filter_env" 2>/dev/null || true
+      break
+    fi
+  done
 fi
 
 if [[ "$mode" == probe-tools ]]; then
@@ -205,7 +223,9 @@ dg_run() {
     export DELEGATE_MCP_DIR="$TMP/mcp.d"
     local kv
     for kv in "${DG_ENV[@]+"${DG_ENV[@]}"}"; do export "$kv"; done
-    bash "$DELEGATE_BIN" "$@"
+    # Executed, not `bash "$DELEGATE_BIN"`: that ignores the shebang, and the
+    # shebang's privileged mode is part of what this suite is testing.
+    "$DELEGATE_BIN" "$@"
   )
 }
 
@@ -254,7 +274,7 @@ clear_dump() {
   # still tell "this run never reached the child" from "an earlier run did".
   rm -f "$TMP/dump/args" "$TMP/dump/argv" "$TMP/dump/env" "$TMP/dump/cmdline" \
         "$TMP/dump/parent_comm" "$TMP/dump/parent_cmdline" "$TMP/dump/blocked" \
-        "$TMP/dump/started"
+        "$TMP/dump/started" "$TMP/dump/filter_env"
 }
 
 wait_for() {
@@ -751,7 +771,7 @@ test_an_exported_function_does_not_reach_the_child() {
     export DELEGATE_MCP_DIR="$TMP/mcp.d"
     grep() { printf 'PWNED\n'; }
     export -f grep
-    bash "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea" >/dev/null 2>&1
+    "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea" >/dev/null 2>&1
   )
   require_child_ran || return 0
   assert_not_contains "$(child_env)" "BASH_FUNC" "no exported function crosses into the child"
@@ -776,6 +796,81 @@ test_environ_entries_bash_cannot_name_never_reach_the_child() {
   assert_eq "$SENTINEL" "$(env_value ANTHROPIC_API_KEY)" "the key still travels"
   assert_not_contains "$(child_cmdline)" "$SENTINEL" "and still never as an argument"
   assert_not_contains "$(cat "$TMP/dump/parent_cmdline")" "$SENTINEL" "not even one level up"
+}
+
+# ─── startup: nothing the caller's shell sets runs before the cleanup ────────
+
+dg_raw() {
+  # The real CLI under `env`, so a test can hand it environ entries that no
+  # `export` can create (BASH_FUNC_set%%) alongside the fixture's own.
+  env PATH="$TMP/bin:$PATH" XDG_CACHE_HOME="$TMP/cache" \
+      DELEGATE_PROVIDERS_DIR="$TMP/providers" DELEGATE_MCP_DIR="$TMP/mcp.d" \
+      "$@"
+}
+
+test_bash_env_is_never_sourced_at_startup() {
+  # Bash sources $BASH_ENV before the first line of a non-interactive script,
+  # so the `unset BASH_ENV` the script began with came too late: the file had
+  # already run. Verified with a sentinel.
+  setup
+  printf ': >%q\n' "$TMP/pwned-bash-env" >"$TMP/bash_env"
+  capture dg_raw BASH_ENV="$TMP/bash_env" ENV="$TMP/bash_env" "$DELEGATE_BIN" help
+  assert_eq 0 "$RC" "help still works"
+  [[ ! -e "$TMP/pwned-bash-env" ]] || fail "BASH_ENV was sourced"
+}
+
+test_an_exported_set_function_never_runs() {
+  # The cleanup itself is a `set` call, and a function named `set` exported by
+  # the caller was imported by bash and ran there — twice, before anything
+  # could remove it.
+  setup
+  capture dg_raw "BASH_FUNC_set%%=() { : >$TMP/pwned-set; builtin set \"\$@\"; }" \
+    "$DELEGATE_BIN" help
+  assert_eq 0 "$RC" "help still works"
+  [[ ! -e "$TMP/pwned-set" ]] || fail "an exported set function ran inside the CLI"
+}
+
+test_inherited_xtrace_never_prints_the_key() {
+  # SHELLOPTS=xtrace with a PS4 that expands a variable printed the parent's
+  # ANTHROPIC_API_KEY before `set +x` ran, and then every traced line of the
+  # run, including the one that reads the account key.
+  setup
+  capture dg_raw SHELLOPTS=xtrace 'PS4=+$ANTHROPIC_API_KEY ' ANTHROPIC_API_KEY=PARENT-KEY-c41e \
+    "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  assert_not_contains "$ERR" "PARENT-KEY-c41e" "the parent's key is not traced"
+  assert_not_contains "$ERR" "$SENTINEL" "the account key is not traced"
+  assert_not_contains "$OUT" "$SENTINEL" "nor printed on stdout"
+}
+
+test_inherited_allexport_never_exports_the_clis_variables() {
+  # With allexport on, every assignment exports: `local +x key` followed by
+  # `key=...` put the key back in the environment of every helper, and the
+  # child received it again as _DG_X_KEY next to ANTHROPIC_API_KEY. Both
+  # routes in: SHELLOPTS (ignored by privileged mode) and `bash -a` (only the
+  # script's own `set +a` covers it).
+  setup
+  clear_dump
+  capture dg_raw SHELLOPTS=allexport "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea"
+  assert_eq 0 "$RC" "SHELLOPTS=allexport: the run exits 0"
+  if require_child_ran; then
+    assert_eq 1 "$(grep -c -F -- "$SENTINEL" "$TMP/dump/env")" \
+      "SHELLOPTS=allexport: the key is in the child's environment exactly once"
+    assert_not_contains "$(child_env)" "_DG_" "SHELLOPTS=allexport: no internal variable reaches the child"
+  fi
+  clear_dump
+  capture dg_raw bash -a "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea"
+  assert_eq 0 "$RC" "bash -a: the run exits 0"
+  if require_child_ran; then
+    assert_eq 1 "$(grep -c -F -- "$SENTINEL" "$TMP/dump/env")" \
+      "bash -a: the key is in the child's environment exactly once"
+    assert_not_contains "$(child_env)" "_DG_" "bash -a: no internal variable reaches the child"
+    # The helpers the CLI starts after reading the key are the other half: with
+    # allexport, the stderr filter inherited the key for the whole run.
+    [[ -s "$TMP/dump/filter_env" ]] || fail "control: the stderr filter's environment was not found"
+    assert_not_contains "$(cat "$TMP/dump/filter_env" 2>/dev/null)" "$SENTINEL" \
+      "bash -a: the key is not in the stderr filter's environment"
+  fi
 }
 
 test_a_parent_export_cannot_shadow_the_clis_own_variables() {

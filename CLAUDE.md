@@ -20,9 +20,16 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    separado, escrito por el `printf` builtin) hacia un trampolín `/bin/bash -p`
    arrancado con `env -i`, que la exporta y hace `exec`. Corolarios, cada uno un
    camino de fuga que existió:
-   - `set +x` y `unset SHELLOPTS BASH_ENV ENV` en la primera línea útil del script: Bash
-     honra un `SHELLOPTS=xtrace` heredado y trazaría `key=<la key>` a stderr, que es el
-     mismo stream que recoge `--json 2>&1`.
+   - El shebang es `#!/bin/bash -p`: ruta fija y modo privilegiado. Lo que el shell que
+     invoca controla actuaba **antes** de la primera línea del script: `BASH_ENV` se
+     sourceaba, una función exportada llamada `set` corría dentro de la propia limpieza,
+     y un `SHELLOPTS=xtrace` con un `PS4` que expandía `$ANTHROPIC_API_KEY` imprimía la
+     key del padre. El modo privilegiado no lee `BASH_ENV` ni `ENV`, no importa
+     funciones e ignora `SHELLOPTS`, `BASHOPTS`, `CDPATH` y `GLOBIGNORE` del environ.
+     La primera línea útil es `set +a +x +v`, para `bash -a` y `bash -x`: `allexport`
+     volvía a exportar la key a pesar del `local +x`, y `xtrace` trazaría `key=<la key>`
+     al stderr que recoge `--json 2>&1`. El límite: invocado como `bash bin/delegate`
+     el shebang no aplica y nada de esto vale; instalado y llamado por nombre, sí.
    - `local +x key`: un `local` que tapa una variable exportada del mismo nombre
      **conserva** el atributo de export, así que con `export key=...` en el shell que
      invoca, la key entraba al environment de todo helper posterior.
@@ -32,8 +39,8 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
      una entrada del environ cuyo nombre no es un identificador (`SECRET-TOKEN`, `A.B`,
      un `BASH_FUNC_x%%` que no importó), `compgen -e` no la ve, y Bash se la pasa intacta
      a cada hijo.
-   - Las **funciones** exportadas se borran aparte, en la primera línea útil del script.
-     Viven en el environ como `BASH_FUNC_<nombre>%%`, que `compgen -e` no lista y
+   - Las **funciones** exportadas: el modo privilegiado no las importa, y el script igual
+     borra las que hubiera, por si lo corren como `bash bin/delegate`. Viven en el environ como `BASH_FUNC_<nombre>%%`, que `compgen -e` no lista y
      `unset -v` no toca, y una función importada **gana** sobre el binario del mismo
      nombre: con `export -f grep` en el shell padre, el piso de solo lectura —donde
      `Bash(grep:*)` está permitido— pasaba a ser ejecución arbitraria, y este script
@@ -317,6 +324,10 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   antes de leer la key.
 - Una entrada del environ con un nombre que Bash no puede nombrar (`SECRET-TOKEN`,
   `A.B`) no llega al hijo, y la key sigue sin aparecer en ningún argv.
+- Invocado por nombre, nada del shell que llama corre antes de la limpieza: un
+  `BASH_ENV`, una función exportada `set`, un `SHELLOPTS=xtrace` con un `PS4` que
+  expande la key, y `allexport` (por `SHELLOPTS` o por `bash -a`), cada uno con su
+  sentinela. Los tests de aislamiento ejecutan el script, no `bash bin/delegate`.
 
 ## Lo que NO se construye
 
