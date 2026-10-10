@@ -723,7 +723,31 @@ if [ -n "$tail" ]; then
   # shellcheck disable=SC2086
   [ "$seen" = 1 ] || set -- "$@" $tail
 fi
-exec @REAL_GIT@ -c core.fsmonitor=false -c core.pager=cat -c core.hooksPath=/dev/null -c diff.external= --no-pager "$@"
+# Filters named by the repository's own config (`clean`, `smudge`, `process`)
+# run from `git diff` and `git status` through .gitattributes, and the global
+# and system config being ignored does nothing against them. Each one the
+# config names is overridden with an empty value, which disables it (and a
+# `required` filter then fails instead of running). A name git cannot take
+# back through `-c` (one with `=`) is refused rather than left active.
+set -f
+keys=$(@REAL_GIT@ config --name-only --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null) || keys=
+old_ifs=$IFS; IFS='
+'
+for k in $keys; do
+  case "$k" in
+    *=*) echo "delegate: el filtro $k no se puede anular; git está denegado en este repo" >&2; exit 126 ;;
+  esac
+  set -- -c "$k=" "$@"
+done
+IFS=$old_ifs
+set +f
+# Signature verification runs gpg.program (or its ssh and x509 variants) from
+# `git log` and `git show` on any signed commit, with log.showSignature in the
+# repository's config or --show-signature on the command line. Verified with a
+# crafted signed commit. All three point at /bin/false.
+exec @REAL_GIT@ -c core.fsmonitor=false -c core.pager=cat -c core.hooksPath=/dev/null -c diff.external= \
+  -c log.showSignature=false -c gpg.program=/bin/false -c gpg.ssh.program=/bin/false \
+  -c gpg.x509.program=/bin/false --no-pager "$@"
 WRAP
 )"
     printf '%s\n' "${wrapper//@REAL_GIT@/\'${real_git//\'/\'\\\'\'}\'}" > "$stub_dir/git"

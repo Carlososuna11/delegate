@@ -175,7 +175,8 @@ if [[ "$mode" == probe-git ]]; then
              'log -p --textc' 'show --textcon' "diff --outp=$dump/git_out" \
              "diff --out $dump/git_out" "diff --o=$dump/git_out" \
              'diff --no-index --textcon f .gitattributes' \
-             'diff --no-index --ext-dif f .gitattributes' 'log -p --textcon -- f'; do
+             'diff --no-index --ext-dif f .gitattributes' 'log -p --textcon -- f' \
+             'log -1 sig' 'show -s sig' 'log --show-signature -1 sig'; do
     rc=0
     # shellcheck disable=SC2086
     git $cmd >/dev/null 2>&1 || rc=$?
@@ -1081,10 +1082,27 @@ hostile_repo() {
   chmod +x "$helper"
   git init -q "$repo"
   printf 'uno\n' >"$repo/f"
-  git -C "$repo" add f
+  printf 'uno\n' >"$repo/p"
+  git -C "$repo" add f p
   git -C "$repo" -c user.name=t -c user.email=t@t.invalid commit -qm init
-  printf 'f diff=evil filter=evil\n' >"$repo/.gitattributes"
+  printf 'f diff=evil filter=evil\np filter=evilp\n' >"$repo/.gitattributes"
   printf 'dos\n' >>"$repo/f"
+  printf 'dos\n' >>"$repo/p"
+  # Filters in the REPOSITORY's own config: a clean filter, and a long-running
+  # `process` filter on a second file. The wrapper's GIT_CONFIG_GLOBAL does
+  # nothing against these.
+  git -C "$repo" config filter.evil.clean "$helper"
+  git -C "$repo" config filter.evilp.process "$helper"
+  # A commit carrying a signature, and a config that verifies signatures with
+  # a program of its choosing: `git log` and `git show` then run it.
+  local signed
+  signed="$(git -C "$repo" cat-file commit HEAD | awk '/^committer /{print; print "gpgsig -----BEGIN PGP SIGNATURE-----"; print " "; print " -----END PGP SIGNATURE-----"; next} 1' |
+    git -C "$repo" hash-object -t commit -w --stdin)"
+  git -C "$repo" update-ref refs/heads/sig "$signed"
+  git -C "$repo" config log.showSignature true
+  git -C "$repo" config gpg.program "$helper"
+  git -C "$repo" config gpg.ssh.program "$helper"
+  git -C "$repo" config gpg.x509.program "$helper"
   git -C "$repo" config diff.external "$helper"
   git -C "$repo" config diff.evil.textconv "$helper"
   git -C "$repo" config core.fsmonitor "$helper"
@@ -1107,6 +1125,11 @@ test_git_on_the_read_only_floor_runs_no_helper_the_repository_configures() {
   # an empty $TMP/ran below is evidence and not an accident.
   HOME="$TMP/home" git -C "$TMP/repo" --no-pager diff >/dev/null 2>&1
   [[ -s "$TMP/ran" ]] || fail "control: the hostile repo should run its helper with plain git"
+  rm -f "$TMP/ran"
+  # And its filters alone run with no global config and no diff helpers.
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$TMP/repo" --no-pager diff --no-ext-diff --no-textconv \
+    >/dev/null 2>&1
+  [[ -s "$TMP/ran" ]] || fail "control: the repository's own filters should run with plain git"
   rm -f "$TMP/ran"
 
   printf 'probe-git\n' >"$TMP/fake_mode"

@@ -122,22 +122,28 @@ que un `>` no es una vía de escritura. De ahí salen tres consecuencias:
   `rg --pre=/usr/bin/rm` hace que ripgrep lance ese programa. `grep` cubre la
   necesidad de búsqueda y no tiene equivalente.
 - `git` se queda, porque `log`/`diff`/`show` es casi todo lo que hace una tarea de
-  review, y git corre programas que nombra su config: `diff.external`, el
-  `command` o el `textconv` de un driver, `core.fsmonitor`, `core.pager`, un
-  filtro `clean`. Quien pudiera escribir `.git/config` —un árbol hostil, o la
-  misma corrida con `--edit`— convertía el piso en ejecución de código. Por eso,
-  en el piso, el `git` que alcanza el modelo es un wrapper primero en el `PATH`:
-  ignora la config de sistema y la global, anula `core.fsmonitor`, `core.pager`,
-  `core.hooksPath` y `diff.external`, y agrega `--no-ext-diff`/`--no-textconv`
-  **después** de las opciones del llamador (antes de un `--`), porque git se queda con
-  la última y `git diff --no-index` acepta abreviaturas como `--textcon`. Rechaza
-  `--ext-diff` y `--textconv` escritas completas y `--output` en cualquier prefijo.
-  Es defensa en profundidad, no
-  un límite: un filtro `clean` en el `.git/config` del repo con su
-  `.gitattributes` sigue corriendo, y el wrapper se alcanza por nombre, no por
-  ruta absoluta. El límite real sigue siendo **no delegar sobre árboles
-  hostiles**. Con `--bash` el `git` es el de la máquina: el shell sin
-  restricción no se angosta.
+  review, y git corre programas que nombra su config: `diff.external`, el `command` o
+  el `textconv` de un driver, `core.fsmonitor`, `core.pager`, un filtro `clean` o
+  `process`, y el `gpg.program` que verifica una firma. Quien pudiera escribir
+  `.git/config` —un árbol hostil, o la misma corrida con `--edit`— convertía el piso
+  en ejecución de código. Por eso, en el piso, el `git` que alcanza el modelo es un
+  wrapper primero en el `PATH`, que:
+  - ignora la config de sistema y la global;
+  - anula `core.fsmonitor`, `core.pager`, `core.hooksPath` y `diff.external`;
+  - anula cada filtro `clean`/`smudge`/`process` que nombre la config del repo: los
+    lista con `git config` y los vacía con `-c`;
+  - apaga `log.showSignature` y apunta los tres `gpg.*.program` a `/bin/false`;
+  - agrega `--no-ext-diff`/`--no-textconv` **después** de las opciones del llamador
+    (antes de un `--`), porque git se queda con la última y `git diff --no-index`
+    acepta abreviaturas como `--textcon`;
+  - rechaza `--ext-diff` y `--textconv` escritas completas y `--output` en cualquier
+    prefijo.
+
+  Es defensa en profundidad, no un límite: es una lista de mecanismos **conocidos** de
+  git 2.43, y una versión de git que agregue otro helper configurable lo deja pasar. El
+  wrapper se alcanza por nombre, no por ruta absoluta. El límite real sigue siendo **no
+  delegar sobre árboles hostiles**. Con `--bash` el `git` es el de la máquina: el shell
+  sin restricción no se angosta.
 - **Una corrida de solo lectura puede leer cualquier archivo que pueda leer quien
   la invoca**, y mandarlo al proveedor. `--add-dir` agrega acceso, no confina;
   `--restricted` confina las herramientas de archivo pero no el Bash. Por eso el
@@ -361,7 +367,9 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   un `--`, y `--append-system-prompt` sigue siendo la última opción.
 - En el piso, el `git` del hijo no corre ningún helper que nombre la config del
   repo o la global (`diff.external`, `textconv`, `core.fsmonitor`, `core.pager`,
-  un filtro `clean`), tampoco con abreviaturas (`--textcon`, `--ext-dif` con
+  un filtro `clean` o `process` en el `.git/config` del repo, `gpg.program` con
+  `log.showSignature` o `--show-signature` sobre un commit firmado), tampoco con
+  abreviaturas (`--textcon`, `--ext-dif` con
   `--no-index`); rechaza `--ext-diff`, `--textconv` y todo prefijo de `--output`; con
   `--bash`, el `git` es el de la máquina.
 - Un `env_passthrough` con cualquier nombre `GIT_*` se rechaza con 2.
