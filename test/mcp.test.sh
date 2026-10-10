@@ -932,6 +932,24 @@ test_a_write_on_an_entry_without_tools_write_is_refused() {
   assert_globals_unset "a refused write"
 }
 
+test_a_refusal_after_a_grant_leaves_no_global_from_the_grant() {
+  # The resolver published its globals on success and simply returned on a
+  # refusal, so a refused call kept the JSON, tools and env names of the call
+  # before it. The CLI exits on a refusal today; the contract is that a refused
+  # run is never readable as a granted one, whoever the caller is.
+  local dir="$TMP/both"
+  mkdir -p "$dir"
+  write_kv "$dir/alpha" transport http url 'https://a.example.com/mcp' tools_read 'get_thing' \
+    tools_write 'put_thing' env_passthrough 'ALPHA_TOKEN' rules 'Regla de alpha.' requires_file 'NOTAS.md'
+  reset_globals
+  capture dg_mcp_resolve "$dir" '' alpha
+  assert_eq 0 "$RC" "control: the write grant resolves"
+  assert_ne '' "$(dg_global DG_MCP_TOOLS)" "control: the grant set DG_MCP_TOOLS"
+  capture dg_mcp_resolve "$dir" alpha,ghost ''
+  assert_eq 2 "$RC" "the second call is refused"
+  assert_globals_unset "a refusal right after a grant"
+}
+
 test_an_unknown_id_is_refused() {
   local dir="$TMP/known"
   mkdir -p "$dir"

@@ -126,6 +126,13 @@ dg_perm_resolve() {
   local caps="${1-}" want_edit="${2-}" want_bash="${3-}"
   local want_mcp="${4-}" want_mcp_write="${5-}" mcp_rules="${6-}"
 
+  # Cleared on entry, before any return. The globals were only assigned on
+  # success, so a refusal right after a grant left the earlier, wider
+  # DG_ALLOWED in place, readable as this call's answer. Verified: an
+  # unrestricted grant followed by a refused one returned 2 with `Bash` still
+  # in DG_ALLOWED.
+  unset DG_TOOLS DG_ALLOWED DG_RULES
+
   # caps arrives already validated by lib/config.sh. Empty means the default
   # ceiling, which is what a provider file without a `caps` line gets.
   [[ -n "${caps// /}" ]] || caps="$(dg_perm_caps_default)"

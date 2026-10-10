@@ -302,6 +302,10 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   un filtro `clean`) y rechaza `--ext-diff`, `--textconv` y `--output`; con
   `--bash`, el `git` es el de la máquina.
 - Un `env_passthrough` con cualquier nombre `GIT_*` se rechaza con 2.
+- Un rechazo de `dg_perm_resolve` o de `dg_mcp_resolve` justo después de un grant
+  no deja ningún global del grant, probado en el **mismo** shell: inspeccionar
+  los globals del padre después de correr el resolver en un subshell no prueba
+  nada.
 
 ## Lo que NO se construye
 

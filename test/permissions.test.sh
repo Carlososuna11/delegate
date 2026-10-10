@@ -19,12 +19,18 @@ reset_globals() {
   unset DG_TOOLS DG_ALLOWED DG_RULES
 }
 
-# Rejections run in a subshell: only the exit code and stderr matter, and the
-# globals the function might have set must not leak into the test.
+# Rejections run in THIS shell, right after the widest grant there is. They used
+# to run in a subshell and then inspect the parent's globals, which a subshell
+# cannot touch: a resolver that refused while keeping the previous call's
+# unrestricted DG_ALLOWED passed every one of these assertions. Granting first
+# is what makes "no globals set on rejection" mean something.
 expect_reject() {
   # <caps> <want_edit> <want_bash> <want_mcp> <want_mcp_write> [mcp_rules]
+  dg_perm_resolve "read,edit,bash,mcp,mcp-write" 1 1 1 1 'regla previa' >/dev/null 2>&1 ||
+    fail "control: the widest grant must resolve before the rejection"
+  [[ -n "${DG_ALLOWED:-}" ]] || fail "control: the widest grant must set DG_ALLOWED"
   REJECT_RC=0
-  ( dg_perm_resolve "$@" ) >"$TMP/out" 2>"$TMP/err" || REJECT_RC=$?
+  dg_perm_resolve "$@" >"$TMP/out" 2>"$TMP/err" || REJECT_RC=$?
   REJECT_OUT="$(cat "$TMP/out")"
   REJECT_ERR="$(cat "$TMP/err")"
 }
