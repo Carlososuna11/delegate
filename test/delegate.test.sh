@@ -1054,6 +1054,23 @@ test_delegate_account_env_beats_default_and_active() {
   assert_contains "$(claude_log)" "APIKEY:$FAKE_KEY-tres" "the env var beats default and active"
 }
 
+test_the_obsolete_deepseek_account_variable_is_refused() {
+  # DEEPSEEK_ACCOUNT was documented as selecting an account and was ignored:
+  # a caller following the docs was billed to the default or the active
+  # account without a word. Refused before any key is read, naming the
+  # variable that does work.
+  setup_runnable
+  write_key dos
+  export DEEPSEEK_ACCOUNT=dos
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  unset DEEPSEEK_ACCOUNT
+  assert_ne 0 "$RC" "a run with DEEPSEEK_ACCOUNT set fails"
+  assert_contains "$ERR" "DEEPSEEK_ACCOUNT" "names the variable it refused"
+  assert_contains "$ERR" "DELEGATE_ACCOUNT" "and the one to use instead"
+  assert_fails "nothing reached the child" test -f "$FAKE_CLAUDE_LOG"
+  assert_no_key_leak "obsolete variable"
+}
+
 test_default_account_beats_active_symlink() {
   setup_runnable
   write_key dos

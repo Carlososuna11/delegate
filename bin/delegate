@@ -433,6 +433,16 @@ cmd_run() {
   done
 
   [[ $# -gt 0 ]] || die "falta la tarea. Uso: delegate $PROVIDER [opciones] \"tarea\""
+
+  # DEEPSEEK_ACCOUNT was documented as choosing the account and was ignored, so
+  # a caller following the docs was billed to the default or the active one
+  # without a word. Refused, not honoured as an alias: silently changing which
+  # key pays is worse than failing, and one name is easier to keep honest.
+  if [[ -n "${DEEPSEEK_ACCOUNT:-}" ]]; then
+    printf '%s✗%s %s\n' "$RED" "$R" \
+      "DEEPSEEK_ACCOUNT ya no elige la cuenta: usa ${B}DELEGATE_ACCOUNT${R} o ${B}--account${R}, y quita DEEPSEEK_ACCOUNT del entorno" >&2
+    exit 2
+  fi
   local prompt="$*"
 
   [[ -d "$workdir" ]] || die "no existe el directorio: $workdir"

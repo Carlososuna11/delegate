@@ -215,7 +215,9 @@ login y **ningún token pasa por acá** — por eso su `env_passthrough` está v
 ## Cuentas
 
 `<key_dir>/api_key.<cuenta>` (modo 600) es la fuente de verdad. `--account <nombre>` y
-`DEEPSEEK_ACCOUNT` resuelven directo a uno de esos archivos. La cuenta por defecto vive
+`DELEGATE_ACCOUNT` resuelven directo a uno de esos archivos. `DEEPSEEK_ACCOUNT`, el
+nombre viejo, se **rechaza** con 2: estuvo documentado y se ignoraba, así que quien lo
+usaba pagaba con otra cuenta sin enterarse. La cuenta por defecto vive
 en un archivo de metadata no secreto, para no depender de estado global mutable.
 
 `api_key` sin sufijo se mantiene **solo como proyección de compatibilidad** para
@@ -306,6 +308,8 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   no deja ningún global del grant, probado en el **mismo** shell: inspeccionar
   los globals del padre después de correr el resolver en un subshell no prueba
   nada.
+- `DEEPSEEK_ACCOUNT` definida rechaza la corrida con 2, nombrando `DELEGATE_ACCOUNT`,
+  antes de leer la key.
 
 ## Lo que NO se construye
 
