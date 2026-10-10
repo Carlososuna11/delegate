@@ -1,0 +1,7 @@
+# Tabla de precios de delegate-run (USD por millón de tokens).
+#
+# Hay que llenarla desde la página oficial de precios de cada proveedor.
+# NO inventes valores: un precio equivocado es peor que una tabla vacía,
+# porque el costo se reporta como estimación y nadie lo va a notar.
+# Las columnas van separadas por TAB. Las líneas que empiezan con # son comentarios.
+provider	model	input_per_mtok	output_per_mtok	cache_read_per_mtok	cache_write_per_mtok	as_of
