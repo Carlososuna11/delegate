@@ -432,12 +432,15 @@ dg_account_load() {
   }
   fdp="/proc/$BASHPID/fd/$fd"
   real=$(readlink -- "$fdp" 2>/dev/null) || real=''
-  st=$(stat -L -c '%F|%a|%u|%s' -- "$fdp" 2>/dev/null) || st=''
+  # %f, the raw mode in hex, and not %F: %F is the file type as TEXT, and it
+  # is translated, so on a system in another language "regular file" never
+  # matched and every valid key was refused.
+  st=$(stat -L -c '%f|%a|%u|%s' -- "$fdp" 2>/dev/null) || st=''
   if [[ -z $real || -z $st ]]; then
     _dg_account_err "key file '$rpath' cannot be checked on its descriptor"
   elif ! _dg_account_inside "$rdir" "$real"; then
     _dg_account_err "key file '$real' is outside the key dir '$rdir'"
-  elif [[ $st != 'regular file|'* && $st != 'regular empty file|'* ]]; then
+  elif (( (16#${st%%|*} & 8#170000) != 8#100000 )); then
     _dg_account_err "key file '$real' is not a regular file"
   elif [[ $st != *'|600|'* ]]; then
     _dg_account_err "key file '$real' must have mode 600"

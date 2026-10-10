@@ -646,4 +646,20 @@ test_load_checks_and_reads_the_same_descriptor() {
   assert_eq 1 "$RC" "a missing file is refused"
 }
 
+# `%F` in stat is translated: on a system in another language "regular file"
+# comes back in that language, and a check comparing it with the English text
+# refused every valid key. Simulated by a `stat` that answers in Spanish.
+test_load_does_not_depend_on_the_language_of_stat() {
+  local dir="$TMP/keys"
+  make_key "$dir/api_key.work" 'fake-key-a'
+  stat() {
+    command stat "$@" | sed -e 's/regular empty file/fichero regular vacío/' \
+                            -e 's/regular file/fichero regular/' -e 's/directory/directorio/'
+  }
+  capture dg_account_load "$dir" "$dir/api_key.work"
+  unset -f stat
+  assert_eq 0 "$RC" "a valid key loads whatever language stat answers in"
+  assert_eq 'fake-key-a' "$OUT" "and it is the key"
+}
+
 run_tests
