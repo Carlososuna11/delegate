@@ -412,6 +412,7 @@ dg_account_load() {
   # Same `+x` reason as dg_account_read.
   local +x key=''
   local key_dir="${1:-}" path="${2:-}" rpath rdir fd fdp real st ok=0
+  local ftype fmode fuid fsize
 
   if [[ -z $key_dir || -z $path ]]; then
     _dg_account_err "dg_account_load: expects <key_dir> <path>"
@@ -436,17 +437,20 @@ dg_account_load() {
   # is translated, so on a system in another language "regular file" never
   # matched and every valid key was refused.
   st=$(stat -L -c '%f|%a|%u|%s' -- "$fdp" 2>/dev/null) || st=''
+  # Field by field: a pattern over the whole line (`*|600|*`) also matched the
+  # uid field, so for uid 600 a 644 file passed.
+  IFS='|' read -r ftype fmode fuid fsize <<<"$st"
   if [[ -z $real || -z $st ]]; then
     _dg_account_err "key file '$rpath' cannot be checked on its descriptor"
   elif ! _dg_account_inside "$rdir" "$real"; then
     _dg_account_err "key file '$real' is outside the key dir '$rdir'"
-  elif (( (16#${st%%|*} & 8#170000) != 8#100000 )); then
+  elif [[ ! $ftype =~ ^[0-9a-f]+$ ]] || (( (16#$ftype & 8#170000) != 8#100000 )); then
     _dg_account_err "key file '$real' is not a regular file"
-  elif [[ $st != *'|600|'* ]]; then
+  elif [[ $fmode != 600 ]]; then
     _dg_account_err "key file '$real' must have mode 600"
-  elif [[ ${st#*|*|} != "$EUID|"* ]]; then
+  elif [[ $fuid != "$EUID" ]]; then
     _dg_account_err "key file '$real' is not owned by the current user"
-  elif [[ ${st##*|} == 0 ]]; then
+  elif [[ $fsize == 0 ]]; then
     _dg_account_err "key file '$real' is empty"
   else
     IFS= read -r -d '' key <&"$fd" || true

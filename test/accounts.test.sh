@@ -662,4 +662,33 @@ test_load_does_not_depend_on_the_language_of_stat() {
   assert_eq 'fake-key-a' "$OUT" "and it is the key"
 }
 
+# The descriptor check looked for `|600|` anywhere in "type|mode|uid|size", so
+# for a user whose uid is 600 a 644 file passed on the uid field. That check is
+# the one meant to catch a file changed after the path checks, so the change
+# is simulated: a `stat` that reports 644 only when asked about the descriptor.
+# uid 600 comes from a user namespace.
+test_the_descriptor_mode_check_reads_the_mode_field_only() {
+  local dir="$TMP/keys"
+  make_key "$dir/api_key.work" 'fake-key-a'
+  if ! unshare -U --map-user=600 --map-group=600 true 2>/dev/null; then
+    pass_detail "skipped: no user namespaces on this machine"
+    return 0
+  fi
+  local probe='
+    source "$1"
+    stat() {
+      if [[ "$*" == */proc/*/fd/* ]]; then command stat "$@" | sed "s/|600|/|644|/"
+      else command stat "$@"; fi
+    }
+    dg_account_load "$2" "$3"'
+  capture unshare -U --map-user=600 --map-group=600 bash -c "$probe" _ \
+    "$ACCOUNTS_LIB" "$dir" "$dir/api_key.work"
+  assert_eq 1 "$RC" "a 644 descriptor is refused for uid 600"
+  assert_eq '' "$OUT" "and no key is printed"
+
+  capture unshare -U --map-user=600 --map-group=600 bash -c 'source "$1"; dg_account_load "$2" "$3"' _ \
+    "$ACCOUNTS_LIB" "$dir" "$dir/api_key.work"
+  assert_eq 'fake-key-a' "$OUT" "control: unchanged, the key loads for uid 600"
+}
+
 run_tests
