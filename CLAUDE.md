@@ -289,6 +289,10 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   servidor, y **antes** de leer la key; presente, la deja pasar. Se resuelve contra
   `--dir`, no contra el cwd del CLI. Y una entrada declarada pero **no pedida** no bloquea
   nada: la precondición de un servidor que no se alcanza no es precondición de la corrida.
+- Una entrada vacía, relativa o dentro de `--dir` en el `PATH` nunca aporta un
+  binario: `claude`, `timeout` y el `grep` del filtro se resuelven a ruta absoluta
+  antes del `cd`, y el `PATH` del hijo es stubs más las entradas absolutas que
+  quedan.
 
 ## Lo que NO se construye
 

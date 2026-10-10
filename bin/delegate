@@ -57,6 +57,32 @@ for _dg_fn in $(compgen -e); do
 done
 unset -v _dg_fn
 
+# PATH without empty or relative entries. Both resolve against whatever the
+# current directory happens to be, and this script cd's into --dir, the tree
+# under review: with `.` in PATH, `command -v claude` came back RELATIVE and the
+# tree chose what ran as claude, as `timeout` and as the stderr filter's
+# `grep`. Verified. Dropped rather than refused: a caller with `.` in PATH is
+# common and harmless everywhere except here. Entries INSIDE --dir are dropped
+# too, in cmd_run, once --dir is known.
+#   dg_clean_path <path> [root] — prints <path> keeping absolute entries only,
+#   and none that resolves to <root> or below it.
+dg_clean_path() {
+  local in="$1" root="${2-}" out='' entry real
+  local -a parts=()
+  IFS=: read -r -a parts <<<"$in"
+  for entry in ${parts[@]+"${parts[@]}"}; do
+    [[ "$entry" == /* ]] || continue
+    if [[ -n "$root" ]]; then
+      real="$(readlink -m -- "$entry")" || continue
+      [[ "$real" == "$root" || "$real" == "$root"/* ]] && continue
+    fi
+    out="${out:+$out:}$entry"
+  done
+  printf '%s\n' "${out:-/usr/bin:/bin}"
+}
+PATH="$(dg_clean_path "$PATH")"
+export PATH
+
 # Resolve the real script location so the `dg` symlink finds lib/ too.
 DG_BIN="${BASH_SOURCE[0]}"
 while [[ -L "$DG_BIN" ]]; do
@@ -410,6 +436,11 @@ cmd_run() {
   local prompt="$*"
 
   [[ -d "$workdir" ]] || die "no existe el directorio: $workdir"
+  # No PATH entry inside the tree under review, for this script and for the
+  # child: an absolute entry pointing into --dir is `.` spelled differently.
+  local wroot
+  wroot="$(readlink -f -- "$workdir")" || die "no puedo resolver el directorio de trabajo $workdir"
+  PATH="$(dg_clean_path "$PATH" "$wroot")"
 
   if [[ "$mode" == 'chat' ]]; then
     # chat is a mode, not a lesser agent: no tools at all, so a permission flag
@@ -553,8 +584,16 @@ cmd_run() {
   # from here spent the scarcest quota on reviews nobody asked for, and a rule in
   # the prompt did not stop it. Stubs first in PATH make those calls fail; claude
   # itself is resolved to an absolute path before PATH changes.
-  local claude_bin stub_dir tool
-  claude_bin="$(command -v claude)" || die "no encuentro el binario de claude en el PATH"
+  #
+  # claude, timeout and the stderr filter's grep are resolved to absolute paths
+  # HERE, before the cd into --dir and before PATH gains the stubs: resolved
+  # later, a relative or tree-controlled PATH entry chose them.
+  local claude_bin timeout_bin grep_bin stub_dir tool
+  claude_bin="$(type -P claude)" || die "no encuentro el binario de claude en el PATH"
+  timeout_bin="$(type -P timeout)" || die "no encuentro timeout en el PATH"
+  grep_bin="$(type -P grep)" || die "no encuentro grep en el PATH"
+  [[ "$claude_bin" == /* && "$timeout_bin" == /* && "$grep_bin" == /* ]] ||
+    die "claude, timeout y grep tienen que resolverse a rutas absolutas"
   stub_dir="${XDG_CACHE_HOME:-$HOME/.cache}/delegate/stubs"
   # 700 and owner-checked. This directory goes FIRST in the child's PATH, and
   # its location comes from XDG_CACHE_HOME, an inherited variable. Pointed at a
@@ -589,7 +628,7 @@ cmd_run() {
   # only: --bash is unrestricted shell, and constraining git there would be a
   # narrower grant than the one asked for.
   local real_git=''
-  real_git="$(command -v git 2>/dev/null)" || true
+  real_git="$(type -P git 2>/dev/null)" || true
   if [[ "$mode" == 'agent' ]] && (( ! want_bash )) && [[ "$real_git" == /* ]]; then
     {
       printf '#!/bin/sh\n'
@@ -697,7 +736,7 @@ cmd_run() {
   cd "$workdir"
   # Harmless notice from Claude Code when it titles a session with a model it
   # does not know. It goes to stderr, but it dirties any `2>&1` over --json.
-  exec 2> >(grep --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
+  exec 2> >("$grep_bin" --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
 
   # The environment is BUILT, not inherited. `env -u A -u B VAR=x cmd` keeps
   # everything else the parent had, so GITHUB_TOKEN, AWS_*, NODE_OPTIONS and
@@ -724,6 +763,7 @@ cmd_run() {
   _DG_X_BIN="$claude_bin"
   _DG_X_PROMPT="$prompt"
   _DG_X_TIMEOUT="$timeout_s"
+  _DG_X_TIMEOUT_BIN="$timeout_bin"
   _DG_X_ENDPOINT="${CFG[endpoint]}"
   _DG_X_MODEL="$model"
   _DG_X_SMALL="${CFG[small_model]}"
@@ -783,7 +823,7 @@ dg_exec_child() {
   # altogether means one less process that ever saw it.
   export "${_DG_X_AUTHENV}=$_DG_X_KEY"
 
-  exec timeout "$_DG_X_TIMEOUT" \
+  exec "$_DG_X_TIMEOUT_BIN" "$_DG_X_TIMEOUT" \
     "$_DG_X_BIN" "${_DG_X_ARGS[@]}" "$_DG_X_PROMPT" \
     < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
 }

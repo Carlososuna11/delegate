@@ -915,6 +915,57 @@ test_git_with_bash_is_the_real_one() {
   assert_eq "$(command -v git)" "$(cat "$TMP/dump/git_path")" "the child's git is the machine's"
 }
 
+# ─── PATH: the tree under review never supplies a binary ─────────────────────
+
+plant_binaries() {
+  # <dir>: claude, timeout, grep and git that only leave a mark. If any of them
+  # runs, the delegated run executed code from the tree under review.
+  local dir="$1" name
+  mkdir -p "$dir"
+  for name in claude timeout grep git; do
+    printf '#!/bin/sh\n: >%q\nexit 0\n' "$TMP/pwned-$name" >"$dir/$name"
+    chmod +x "$dir/$name"
+  done
+}
+
+test_a_relative_or_tree_path_entry_never_supplies_a_binary() {
+  # With `.`, an empty entry or a relative directory in PATH, `command -v
+  # claude` returned a RELATIVE path and the CLI then cd'd into --dir, so the
+  # tree under review chose what ran as claude, timeout (resolved at exec) and
+  # the stderr-filtering grep (started after the cd). An absolute entry inside
+  # --dir is the same thing spelled differently.
+  setup
+  plant_binaries "$TMP/work"
+  plant_binaries "$TMP/work/rel"
+  plant_binaries "$TMP/work/abs"
+  DG_ENV=("PATH=.::rel:$TMP/work/abs:$TMP/bin:$PATH")
+  RC=0
+  ( cd "$TMP/work" && dg_run testprov --dir "$TMP/work" "tarea" ) >"$TMP/out" 2>"$TMP/err" || RC=$?
+  assert_eq 0 "$RC" "the run exits 0"
+  local name
+  for name in claude timeout grep git; do
+    [[ ! -e "$TMP/pwned-$name" ]] || fail "the tree under review supplied $name"
+  done
+  require_child_ran || return 0
+
+  local child_path entry first=1
+  child_path="$(env_value PATH)"
+  [[ -n "$child_path" ]] || fail "the child got no PATH at all"
+  IFS=: read -r -a entries <<<"$child_path"
+  for entry in "${entries[@]}"; do
+    if [[ -z "$entry" ]]; then fail "the child's PATH has an empty entry"; continue; fi
+    [[ "$entry" == /* ]] || fail "the child's PATH has a relative entry: $entry"
+    [[ "$entry" == "$TMP/work" || "$entry" == "$TMP/work/"* ]] &&
+      fail "the child's PATH has an entry inside --dir: $entry"
+    if (( first )); then
+      assert_contains "$entry" "stubs" "the stubs still come first"
+      first=0
+    fi
+  done
+  # A trailing empty entry is an empty entry too, and `read -a` drops it.
+  [[ "$child_path" != *: ]] || fail "the child's PATH ends in an empty entry"
+}
+
 # ─── invariant 6: a provider file is parsed, never sourced ───────────────────
 
 test_shell_payloads_in_a_provider_file_never_execute() {
