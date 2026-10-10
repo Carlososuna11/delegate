@@ -598,12 +598,13 @@ cmd_run() {
   # claude, timeout and the stderr filter's grep are resolved to absolute paths
   # HERE, before the cd into --dir and before PATH gains the stubs: resolved
   # later, a relative or tree-controlled PATH entry chose them.
-  local claude_bin timeout_bin grep_bin stub_dir tool
+  local claude_bin timeout_bin grep_bin env_bin stub_dir tool
   claude_bin="$(type -P claude)" || die "no encuentro el binario de claude en el PATH"
   timeout_bin="$(type -P timeout)" || die "no encuentro timeout en el PATH"
   grep_bin="$(type -P grep)" || die "no encuentro grep en el PATH"
-  [[ "$claude_bin" == /* && "$timeout_bin" == /* && "$grep_bin" == /* ]] ||
-    die "claude, timeout y grep tienen que resolverse a rutas absolutas"
+  env_bin="$(type -P env)" || die "no encuentro env en el PATH"
+  [[ "$claude_bin" == /* && "$timeout_bin" == /* && "$grep_bin" == /* && "$env_bin" == /* ]] ||
+    die "claude, timeout, grep y env tienen que resolverse a rutas absolutas"
   stub_dir="${XDG_CACHE_HOME:-$HOME/.cache}/delegate/stubs"
   # 700 and owner-checked. This directory goes FIRST in the child's PATH, and
   # its location comes from XDG_CACHE_HOME, an inherited variable. Pointed at a
@@ -774,6 +775,7 @@ cmd_run() {
   _DG_X_PROMPT="$prompt"
   _DG_X_TIMEOUT="$timeout_s"
   _DG_X_TIMEOUT_BIN="$timeout_bin"
+  _DG_X_ENV_BIN="$env_bin"
   _DG_X_ENDPOINT="${CFG[endpoint]}"
   _DG_X_MODEL="$model"
   _DG_X_SMALL="${CFG[small_model]}"
@@ -813,28 +815,41 @@ dg_exec_child() {
 
   # Exported functions were already dropped at the top of the script, before
   # anything ran a single external command; see the note there.
+  #
+  # The wipe above clears what bash can NAME. It cannot clear an environ entry
+  # whose name is not a valid identifier — `SECRET-TOKEN=...`, `A.B=...`, or a
+  # `BASH_FUNC_x%%` that bash declined to import — because bash never made a
+  # variable out of it, and it hands every such entry to each child untouched.
+  # Verified: `SECRET-TOKEN` crossed the wipe and reached the delegated run.
+  # So the child is started under `env -i`, and only what is named here exists
+  # on the other side.
+  #
+  # The values do NOT travel in env's argv. `env -i ANTHROPIC_API_KEY=<key> ...`
+  # puts the key in /proc/<pid>/cmdline, world-readable on Linux, for as long
+  # as env runs; the same goes for a forwarded token. They travel NUL-separated
+  # through fd 3, a pipe from a builtin `printf`, into a trampoline: a
+  # `/bin/bash -p` that started from an empty environment, exports each pair,
+  # closes the pipe and execs timeout. Its argv holds the trampoline text, the
+  # harness arguments and the prompt, which were already arguments before.
+  local -a _dg_pairs=(
+    ${_DG_X_KEEP[@]+"${_DG_X_KEEP[@]}"}
+    ${_DG_X_PASS[@]+"${_DG_X_PASS[@]}"}
+    "ANTHROPIC_BASE_URL=$_DG_X_ENDPOINT"
+    "ANTHROPIC_MODEL=$_DG_X_MODEL"
+    "ANTHROPIC_DEFAULT_OPUS_MODEL=$_DG_X_MODEL"
+    "ANTHROPIC_DEFAULT_SONNET_MODEL=$_DG_X_MODEL"
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL=$_DG_X_SMALL"
+    "CLAUDE_CODE_SUBAGENT_MODEL=$_DG_X_SMALL"
+    # Last, so nothing above can shadow it.
+    "${_DG_X_AUTHENV}=$_DG_X_KEY"
+  )
+  # A single-quoted constant: nothing in it is expanded here.
+  local _dg_tramp='while IFS= read -r -d "" kv <&3; do export "$kv" || exit 125; done; exec 3<&-; exec "$@"'
 
-  for _dg_pair in ${_DG_X_KEEP[@]+"${_DG_X_KEEP[@]}"} ${_DG_X_PASS[@]+"${_DG_X_PASS[@]}"}; do
-    export "${_dg_pair?}"
-  done
-
-  export ANTHROPIC_BASE_URL="$_DG_X_ENDPOINT"
-  export ANTHROPIC_MODEL="$_DG_X_MODEL"
-  export ANTHROPIC_DEFAULT_OPUS_MODEL="$_DG_X_MODEL"
-  export ANTHROPIC_DEFAULT_SONNET_MODEL="$_DG_X_MODEL"
-  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$_DG_X_SMALL"
-  export CLAUDE_CODE_SUBAGENT_MODEL="$_DG_X_SMALL"
-
-  # The key enters THIS shell's environment and the exec inherits it. It is
-  # never an argument, not even to `env`: `env ANTHROPIC_API_KEY=<key> ...` puts
-  # the key in env's own argv, and /proc/<pid>/cmdline is world-readable on
-  # Linux, so until env replaced itself any user on the machine could read it.
-  # `export` with a computed name has no such window, and dropping `env`
-  # altogether means one less process that ever saw it.
-  export "${_DG_X_AUTHENV}=$_DG_X_KEY"
-
-  exec "$_DG_X_TIMEOUT_BIN" "$_DG_X_TIMEOUT" \
+  exec "$_DG_X_ENV_BIN" -i /bin/bash -p -c "$_dg_tramp" delegate-exec \
+    "$_DG_X_TIMEOUT_BIN" "$_DG_X_TIMEOUT" \
     "$_DG_X_BIN" "${_DG_X_ARGS[@]}" "$_DG_X_PROMPT" \
+    3< <(printf '%s\0' "${_dg_pairs[@]}") \
     < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
 }
 

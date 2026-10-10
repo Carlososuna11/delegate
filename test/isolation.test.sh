@@ -758,6 +758,26 @@ test_an_exported_function_does_not_reach_the_child() {
   assert_not_contains "$(child_env)" "PWNED" "nor its body"
 }
 
+test_environ_entries_bash_cannot_name_never_reach_the_child() {
+  # `compgen -e` lists the variables bash imported, and bash does not import an
+  # environ entry whose name is not a valid identifier — but it passes it on to
+  # every child untouched. `SECRET-TOKEN=...` and `A.B=...` crossed the whole
+  # wipe and reached the delegated run. Verified with a sentinel.
+  setup
+  clear_dump
+  capture env PATH="$TMP/bin:$PATH" XDG_CACHE_HOME="$TMP/cache" \
+      DELEGATE_PROVIDERS_DIR="$TMP/providers" DELEGATE_MCP_DIR="$TMP/mcp.d" \
+      'SECRET-TOKEN=RAW-SENTINEL-9d2a' 'A.B=RAW-SENTINEL-77c0' \
+      "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  assert_not_contains "$(child_env)" "RAW-SENTINEL-9d2a" "SECRET-TOKEN does not reach the child"
+  assert_not_contains "$(child_env)" "RAW-SENTINEL-77c0" "A.B does not reach the child"
+  assert_eq "$SENTINEL" "$(env_value ANTHROPIC_API_KEY)" "the key still travels"
+  assert_not_contains "$(child_cmdline)" "$SENTINEL" "and still never as an argument"
+  assert_not_contains "$(cat "$TMP/dump/parent_cmdline")" "$SENTINEL" "not even one level up"
+}
+
 test_a_parent_export_cannot_shadow_the_clis_own_variables() {
   setup
   # `unset -v NAME` inside a function removes the LOCAL binding and leaves it

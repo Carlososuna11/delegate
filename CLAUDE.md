@@ -16,8 +16,10 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    en `ps` para cualquier usuario de la máquina. Se lee de un archivo modo 600 y se pasa
    solo por el environment del proceso hijo. Ni siquiera como argumento de `env`:
    `env ANTHROPIC_API_KEY=... cmd` pone la key en el argv de `env`, y
-   `/proc/<pid>/cmdline` es legible por cualquiera. Se exporta en este shell y el `exec`
-   la hereda. Tres corolarios, cada uno un camino de fuga que existió:
+   `/proc/<pid>/cmdline` es legible por cualquiera. Viaja por un pipe (fd 3, NUL
+   separado, escrito por el `printf` builtin) hacia un trampolín `/bin/bash -p`
+   arrancado con `env -i`, que la exporta y hace `exec`. Corolarios, cada uno un
+   camino de fuga que existió:
    - `set +x` y `unset SHELLOPTS BASH_ENV ENV` en la primera línea útil del script: Bash
      honra un `SHELLOPTS=xtrace` heredado y trazaría `key=<la key>` a stderr, que es el
      mismo stream que recoge `--json 2>&1`.
@@ -26,7 +28,10 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
      invoca, la key entraba al environment de todo helper posterior.
    - El environment del hijo se **construye** desde una allowlist. `env -u A -u B` deja
      pasar todo lo demás, así que `GITHUB_TOKEN`, `AWS_*` y `NODE_OPTIONS` llegaban a una
-     corrida sin flags.
+     corrida sin flags. Y se construye con `env -i`, no solo con el wipe: Bash no importa
+     una entrada del environ cuyo nombre no es un identificador (`SECRET-TOKEN`, `A.B`,
+     un `BASH_FUNC_x%%` que no importó), `compgen -e` no la ve, y Bash se la pasa intacta
+     a cada hijo.
    - Las **funciones** exportadas se borran aparte, en la primera línea útil del script.
      Viven en el environ como `BASH_FUNC_<nombre>%%`, que `compgen -e` no lista y
      `unset -v` no toca, y una función importada **gana** sobre el binario del mismo
@@ -310,6 +315,8 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   nada.
 - `DEEPSEEK_ACCOUNT` definida rechaza la corrida con 2, nombrando `DELEGATE_ACCOUNT`,
   antes de leer la key.
+- Una entrada del environ con un nombre que Bash no puede nombrar (`SECRET-TOKEN`,
+  `A.B`) no llega al hijo, y la key sigue sin aparecer en ningún argv.
 
 ## Lo que NO se construye
 
