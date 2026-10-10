@@ -293,6 +293,15 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   binario: `claude`, `timeout` y el `grep` del filtro se resuelven a ruta absoluta
   antes del `cd`, y el `PATH` del hijo es stubs más las entradas absolutas que
   quedan.
+- El runner cuenta como fallo un test que retorna distinto de 0 aunque no haya
+  llamado a `fail`: un test de seguridad tiene que poder ponerse rojo muriendo.
+- Una tarea que parece opción (`-- --help`) llega al hijo como prompt, detrás de
+  un `--`, y `--append-system-prompt` sigue siendo la última opción.
+- En el piso, el `git` del hijo no corre ningún helper que nombre la config del
+  repo o la global (`diff.external`, `textconv`, `core.fsmonitor`, `core.pager`,
+  un filtro `clean`) y rechaza `--ext-diff`, `--textconv` y `--output`; con
+  `--bash`, el `git` es el de la máquina.
+- Un `env_passthrough` con cualquier nombre `GIT_*` se rechaza con 2.
 
 ## Lo que NO se construye
 
