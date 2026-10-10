@@ -353,6 +353,24 @@ test_agent_mode_passes_the_prompt() {
   assert_contains "$(claude_log)" "PROMPT:lista los error paths" "the prompt reaches the child"
 }
 
+test_a_task_that_looks_like_an_option_reaches_the_child_as_the_prompt() {
+  # `delegate alpha -- --help` used to hand `--help` to the harness as its last
+  # argument, where it was parsed as an option: the real `claude -p` printed
+  # its help and exited 0, a "successful" run that never did the task. The
+  # child's own `--` has to come right before the prompt, and right after the
+  # system prompt, which stays the last option.
+  setup_runnable
+  dg_run alpha --dir "$TMP/work" -- --help
+  assert_eq 0 "$RC" "the run succeeds"
+  assert_contains "$(claude_log)" "PROMPT:--help" "the task is the last argument"
+  local tail3
+  tail3="$(grep '^ARG:' "$FAKE_CLAUDE_LOG" | tail -n 3 | sed 's/^ARG://' | head -n 2 | tail -n 1)"
+  assert_eq "--" "$tail3" "a -- terminates the child's options right before the task"
+  local before
+  before="$(grep '^ARG:' "$FAKE_CLAUDE_LOG" | tail -n 4 | head -n 1 | sed 's/^ARG://')"
+  assert_eq "--append-system-prompt" "$before" "the system prompt is still the last option"
+}
+
 test_prompt_survives_quotes_dollars_accents_and_newlines() {
   setup_runnable
   # Nothing here is expanded by the test shell: $'...' only interprets the

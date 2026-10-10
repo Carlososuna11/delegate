@@ -614,7 +614,13 @@ cmd_run() {
   # prompt argument". Ending on an option that takes exactly one value is what
   # makes the positional prompt reach the child. Anything appended after this
   # has to take exactly one value too.
-  claude_args+=(--append-system-prompt "$DG_RULES")
+  #
+  # And then `--`, so the task can never be read as an option. Without it,
+  # `delegate deepseek -- --help` handed `--help` to the harness, which printed
+  # its usage and exited 0: a run that reported success without doing the task.
+  # Verified against the installed harness that `-- --help` is taken as the
+  # prompt. The prompt itself is appended at exec time, right after this.
+  claude_args+=(--append-system-prompt "$DG_RULES" --)
 
   # Names the entries asked to forward. Values are never in the config: the
   # child inherits whatever this shell has under that name, and a name that is
