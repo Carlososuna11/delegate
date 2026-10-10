@@ -191,10 +191,12 @@ dg_perm_resolve() {
   #   `find` is out: -delete and -exec write.
   #   `rg` is out: `rg --pre=/usr/bin/rm pattern file` makes ripgrep spawn rm,
   #     by design and documented. grep has no equivalent and covers the need.
-  #   `git` stays, with its options unconstrained, so `git diff --output=path`
-  #     can still create or truncate a file — verified. It stays because
-  #     log/diff/show is most of what a review task does, and the residual is
-  #     named in CLAUDE.md instead of pretended away.
+  #   `git` stays, because log/diff/show is most of what a review task does.
+  #     The allow list cannot constrain its options, so on the floor
+  #     bin/delegate puts a `git` wrapper first in PATH that refuses
+  #     --ext-diff, --textconv and --output and ignores the executable keys of
+  #     the repository's config. The residual is named in CLAUDE.md instead of
+  #     pretended away.
   local tools='Read,Bash'
   local allowed='Read,Bash(grep:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*),Bash(git blame:*)'
 

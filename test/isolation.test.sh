@@ -83,6 +83,25 @@ if [[ "$mode" == probe-tools ]]; then
   done
 fi
 
+if [[ "$mode" == probe-git ]]; then
+  # The child runs git the way the model would on the read-only floor: by
+  # name, through PATH, inside a repository whose config is hostile. Every
+  # helper that config names appends to $ran, so "nothing ran" is a file that
+  # does not exist.
+  repo="$(cat "$(dirname "$dump")/fake_repo")"
+  cd "$repo" || exit 1
+  command -v git >"$dump/git_path"
+  : >"$dump/git"
+  for cmd in 'diff' 'log -p' 'show' 'status' 'blame f' 'diff --ext-diff' \
+             'diff --textconv' 'log -p --ext-diff' "diff --output=$dump/git_out" \
+             "diff --output $dump/git_out"; do
+    rc=0
+    # shellcheck disable=SC2086
+    git $cmd >/dev/null 2>&1 || rc=$?
+    printf '%s|%s\n' "$cmd" "$rc" >>"$dump/git"
+  done
+fi
+
 exit 0
 FAKE
   chmod +x "$TMP/bin/claude"
@@ -821,6 +840,79 @@ test_codex_claude_delegate_and_dg_are_blocked_from_the_child() {
   for tool in codex claude delegate dg; do
     assert_eq "$tool 126" "$(grep "^$tool " "$TMP/dump/blocked")" "$tool exits 126 in the child"
   done
+}
+
+# ─── the read-only floor: git cannot run what the repository configures ─────
+
+hostile_repo() {
+  # A repository whose own config, and the caller's global config, name a
+  # helper for every git hook-like mechanism the floor's git commands reach.
+  # The helper only appends to $TMP/ran, so the proof is that file's absence.
+  local repo="$TMP/repo" helper="$TMP/helper"
+  printf '#!/bin/sh\necho "ran $*" >>%q\ncat "$1" 2>/dev/null\nexit 0\n' "$TMP/ran" >"$helper"
+  chmod +x "$helper"
+  git init -q "$repo"
+  printf 'uno\n' >"$repo/f"
+  git -C "$repo" add f
+  git -C "$repo" -c user.name=t -c user.email=t@t.invalid commit -qm init
+  printf 'f diff=evil filter=evil\n' >"$repo/.gitattributes"
+  printf 'dos\n' >>"$repo/f"
+  git -C "$repo" config diff.external "$helper"
+  git -C "$repo" config diff.evil.textconv "$helper"
+  git -C "$repo" config core.fsmonitor "$helper"
+  git -C "$repo" config core.pager "$helper"
+  # Global config: only GIT_CONFIG_GLOBAL keeps this one out.
+  mkdir -p "$TMP/home"
+  printf '[filter "evil"]\n\tclean = %s\n' "$helper" >"$TMP/home/.gitconfig"
+  printf '%s\n' "$repo" >"$TMP/fake_repo"
+}
+
+test_git_on_the_read_only_floor_runs_no_helper_the_repository_configures() {
+  # `git diff`, `log -p`, `show`, `status` and `blame` are allowed on the floor,
+  # and every one of them can run a program the repository's config names:
+  # diff.external, a textconv driver, core.fsmonitor, core.pager, a clean
+  # filter from the global config. That turned "read-only" into code execution
+  # by anyone who could write .git/config — including a run with --edit.
+  setup
+  hostile_repo
+  # Positive control: the plain git of this machine does run the helpers, so
+  # an empty $TMP/ran below is evidence and not an accident.
+  HOME="$TMP/home" git -C "$TMP/repo" --no-pager diff >/dev/null 2>&1
+  [[ -s "$TMP/ran" ]] || fail "control: the hostile repo should run its helper with plain git"
+  rm -f "$TMP/ran"
+
+  printf 'probe-git\n' >"$TMP/fake_mode"
+  DG_ENV=("HOME=$TMP/home")
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+
+  assert_eq "" "$(cat "$TMP/ran" 2>/dev/null)" "no helper ran from the floor's git"
+  assert_ne "$(command -v git)" "$(cat "$TMP/dump/git_path")" "the child's git is not the bare binary"
+  local probe
+  probe="$(cat "$TMP/dump/git")"
+  assert_contains "$probe" "diff|0" "plain git diff still works"
+  assert_contains "$probe" "status|0" "git status still works"
+  assert_contains "$probe" "blame f|0" "git blame still works"
+  local refused
+  for refused in 'diff --ext-diff' 'diff --textconv' 'log -p --ext-diff' \
+                 "diff --output=$TMP/dump/git_out" "diff --output $TMP/dump/git_out"; do
+    assert_not_contains "$probe" "$refused|0" "refused: git $refused"
+  done
+  [[ ! -e "$TMP/dump/git_out" ]] || fail "git --output wrote a file from the floor"
+}
+
+test_git_with_bash_is_the_real_one() {
+  # --bash is unrestricted shell by definition; a constrained git there would
+  # be a narrower grant than the one asked for.
+  setup
+  hostile_repo
+  printf 'probe-git\n' >"$TMP/fake_mode"
+  DG_ENV=("HOME=$TMP/home")
+  capture dg_run testprov --dir "$TMP/work" --bash "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  assert_eq "$(command -v git)" "$(cat "$TMP/dump/git_path")" "the child's git is the machine's"
 }
 
 # ─── invariant 6: a provider file is parsed, never sourced ───────────────────

@@ -563,6 +563,49 @@ cmd_run() {
       "$tool" > "$stub_dir/$tool"
     chmod +x "$stub_dir/$tool"
   done
+
+  # git on the read-only floor. `git diff`, `log`, `show`, `status` and `blame`
+  # are allowed there, and every one of them runs programs that configuration
+  # names: diff.external and a diff driver's command, a textconv driver,
+  # core.fsmonitor, core.pager, a clean filter. Anyone who can write the
+  # repository's .git/config — a hostile tree, or this very run with --edit —
+  # turned "read-only" into code execution. Verified: each helper ran from a
+  # plain `git diff`/`status`/`blame` before this.
+  #
+  # The allowlist only lets `git <subcommand>` through by name, so a `git`
+  # first in PATH is what the model's command reaches. It ignores system and
+  # global config, overrides the executable keys of the repository's, forces
+  # --no-ext-diff/--no-textconv, and refuses --ext-diff, --textconv and
+  # --output in the forms git accepts. Defence in depth, not a boundary: a
+  # filter in .git/config with a matching .gitattributes still runs, and the
+  # real limit stays "never delegate over a hostile tree" (CLAUDE.md). Floor
+  # only: --bash is unrestricted shell, and constraining git there would be a
+  # narrower grant than the one asked for.
+  local real_git=''
+  real_git="$(command -v git 2>/dev/null)" || true
+  if [[ "$mode" == 'agent' ]] && (( ! want_bash )) && [[ "$real_git" == /* ]]; then
+    {
+      printf '#!/bin/sh\n'
+      printf '# Written by delegate for the read-only floor. See bin/delegate.\n'
+      printf 'for a in "$@"; do\n'
+      printf '  case "$a" in\n'
+      printf '    --ext-diff|--textconv|--output|--output=*)\n'
+      printf '      echo "delegate: git $a está denegado en el piso de solo lectura" >&2; exit 126 ;;\n'
+      printf '  esac\n'
+      printf 'done\n'
+      printf 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL\n'
+      printf 'unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_EXTERNAL_DIFF GIT_PAGER PAGER GIT_ATTR_SOURCE\n'
+      printf 'case "${1-}" in\n'
+      printf '  diff|log|show) s="$1"; shift; set -- "$s" --no-ext-diff --no-textconv "$@" ;;\n'
+      printf '  blame) shift; set -- blame --no-textconv "$@" ;;\n'
+      printf 'esac\n'
+      printf "exec '%s' -c core.fsmonitor=false -c core.pager=cat -c core.hooksPath=/dev/null -c diff.external= --no-pager \"\$@\"\n" \
+        "${real_git//\'/\'\\\'\'}"
+    } > "$stub_dir/git"
+    chmod +x "$stub_dir/git"
+  else
+    rm -f -- "$stub_dir/git"
+  fi
   export PATH="$stub_dir:$PATH"
 
   local claude_args=(
