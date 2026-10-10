@@ -691,4 +691,28 @@ test_the_descriptor_mode_check_reads_the_mode_field_only() {
   assert_eq 'fake-key-a' "$OUT" "control: unchanged, the key loads for uid 600"
 }
 
+# `add` writes the key to a dot-named temporary and then links it into place.
+# Interrupted in between, the temporary — a copy of the key — stayed behind.
+# The interruption is made deterministic with an `ln` that takes a while.
+test_an_interrupted_add_leaves_no_temporary_key_behind() {
+  local dir="$TMP/keys" sig pid tries leftovers
+  mkdir -p "$TMP/slow"
+  printf '#!/bin/sh\nsleep 1\nexec %q "$@"\n' "$(type -P ln)" >"$TMP/slow/ln"
+  chmod +x "$TMP/slow/ln"
+  for sig in TERM INT HUP; do
+    rm -rf "$dir"; mkdir -m 700 "$dir"
+    ( PATH="$TMP/slow:$PATH"; dg_account_add "$dir" 'api_key.%s' work <<<'fake-key-a' ) \
+      >/dev/null 2>&1 &
+    pid=$!
+    tries=100
+    until compgen -G "$dir/.api_key.add.*" >/dev/null || (( tries-- <= 0 )); do sleep 0.02; done
+    compgen -G "$dir/.api_key.add.*" >/dev/null || { fail "$sig: control: the temporary never appeared"; continue; }
+    kill -s "$sig" "$pid"
+    wait "$pid" 2>/dev/null
+    sleep 1.2   # the slow ln outlives an untrapped shell
+    leftovers=$(find "$dir" -maxdepth 1 -name '.api_key.add.*' | wc -l)
+    assert_eq 0 "$leftovers" "$sig: no temporary copy of the key is left"
+  done
+}
+
 run_tests

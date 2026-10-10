@@ -404,8 +404,10 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   `list` nunca muestra esos archivos como cuentas.
 - Un `key_dir` en 750, 705, 770, 777 o 755 se rechaza al validar, al leer y en `add`.
   `add` no escribe a través de un symlink, vivo o colgante, ni sobre un archivo plantado
-  en la ruta después de su chequeo; no deja temporales. `dg_account_load` rechaza, sin
-  imprimir la key, lo mismo que `validate`, y un FIFO sin bloquearse.
+  en la ruta después de su chequeo. No deja temporales, tampoco si lo interrumpen TERM
+  o HUP entre el temporal y su borrado; un SIGKILL sí puede dejar uno con nombre de
+  punto en `key_dir`, que es 700. `dg_account_load` rechaza, sin imprimir la key, lo
+  mismo que `validate`, y un FIFO sin bloquearse.
 
 ## Lo que NO se construye
 

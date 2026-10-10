@@ -509,6 +509,14 @@ dg_account_activate() {
   return 0
 }
 
+# Puts back INT/TERM/HUP as `trap -p` printed them: the ones it lists are
+# re-installed, the others go back to their default.
+_dg_account_restore_traps() {
+  trap - INT TERM HUP
+  [[ -n ${1:-} ]] && eval "$1"
+  return 0
+}
+
 dg_account_add() {
   # Same `+x` reason as dg_account_read: the key must not become exported.
   local +x key
@@ -548,6 +556,17 @@ dg_account_add() {
   }
   _dg_account_dir_private "$rdir" || return 1
 
+  # A signal between creating the temporary and removing it left a copy of
+  # the key behind under a dot name. The traps remove it and then let the
+  # signal do what it would have done; the caller's traps are put back after.
+  # `made` is set only once the temporary is ours: a name that was already
+  # taken by something else is never removed.
+  local prev_traps made=''
+  prev_traps=$(trap -p INT TERM HUP)
+  trap '[[ -n ${made:-} ]] && rm -f -- "$made"; trap - INT; kill -INT $BASHPID' INT
+  trap '[[ -n ${made:-} ]] && rm -f -- "$made"; trap - TERM; kill -TERM $BASHPID' TERM
+  trap '[[ -n ${made:-} ]] && rm -f -- "$made"; trap - HUP; kill -HUP $BASHPID' HUP
+
   # The existence check above runs BEFORE stdin is read, so anything can land
   # on $path while add waits for the key; `printf >"$path"` then followed a
   # planted symlink and wrote the key wherever it pointed, or overwrote a
@@ -557,10 +576,10 @@ dg_account_add() {
   # replacing or following anything at $path.
   while :; do
     tmp="$rdir/.api_key.add.$$.$RANDOM$tries"
-    if ( set -C; umask 077; printf '%s\n' "$key" >"$tmp" ) 2>/dev/null; then break; fi
+    if ( set -C; umask 077; printf '%s\n' "$key" >"$tmp" ) 2>/dev/null; then made=$tmp; break; fi
     if [[ ! -e $tmp && ! -L $tmp ]] || (( ++tries > 32 )); then
       _dg_account_err "cannot write a temporary key file in '$rdir'"
-      return 1
+      _dg_account_restore_traps "$prev_traps"; return 1
     fi
   done
   chmod 600 -- "$tmp" 2>/dev/null
@@ -571,9 +590,10 @@ dg_account_add() {
     else
       _dg_account_err "cannot write key file '$path'"
     fi
-    return 1
+    _dg_account_restore_traps "$prev_traps"; return 1
   fi
   rm -f -- "$tmp"
+  _dg_account_restore_traps "$prev_traps"
   return 0
 }
 
