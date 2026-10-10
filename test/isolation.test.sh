@@ -1302,6 +1302,30 @@ test_a_term_to_the_cli_reaches_the_child_and_removes_the_stubs() {
   return 0
 }
 
+test_int_and_hup_reach_the_child_as_themselves() {
+  # The supervisor forwarded INT, HUP and TERM all as TERM, so a harness with
+  # its own handling for an interrupt or a hangup saw a termination instead.
+  setup
+  mkdir -p -m 700 "$TMP/run"
+  printf 'trap-signals\n' >"$TMP/fake_mode"
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/run")
+  local sig bg pid tries
+  for sig in INT HUP TERM; do
+    clear_dump
+    dg_ok "tarea-senal-$$" >/dev/null 2>&1 &
+    bg=$!
+    wait_for "$TMP/dump/trapping" || { fail "$sig: the child never got ready"; kill "$bg" 2>/dev/null; continue; }
+    pid="$(cat "$TMP/dump/supervisor_pid")"
+    kill -s "$sig" "$pid"
+    tries=100
+    while kill -0 "$bg" 2>/dev/null && (( tries-- > 0 )); do sleep 0.1; done
+    kill -0 "$bg" 2>/dev/null && { fail "$sig: the run is still alive"; pkill -f -- "tarea-senal-$$"; }
+    wait "$bg" 2>/dev/null
+    assert_eq "$sig" "$(cat "$TMP/dump/signal" 2>/dev/null)" "$sig reaches the child as $sig"
+  done
+  return 0
+}
+
 test_the_childs_exit_code_is_the_runs_exit_code() {
   # The CLI no longer execs into the child (it has to remove the stub
   # directory afterwards), so the child's exit code has to be passed on.

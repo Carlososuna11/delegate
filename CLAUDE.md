@@ -84,7 +84,8 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    directorio, y no puede ser el CLI: un proceso vivo conserva en `/proc/<pid>/environ`
    el environment con el que arrancó aunque haga `unset`, y el CLI arrancó con las
    credenciales del padre. El CLI hace `exec` a un supervisor `/bin/bash -p` arrancado
-   con `env -i` (mismo pid, environ vacío), que lanza al hijo, le reenvía las señales,
+   con `env -i` (mismo pid, environ vacío), que lanza al hijo, le reenvía TERM, INT y
+   HUP cada una como sí misma,
    borra el directorio y sale con el código del hijo, aunque el borrado falle.
 6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
    y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
@@ -380,6 +381,8 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   el grupo o por todos sin sticky bit (770, 775, 730, 777) se rechaza y uno en 1770,
   700 o 755 se acepta, y el código de salida del hijo es el de la corrida,
   también cuando falla el borrado.
+- TERM, INT y HUP enviadas al proceso de la corrida llegan al hijo como esa misma
+  señal, no todas como TERM.
 - Mientras el hijo vive, ningún proceso de la máquina tiene en su
   `/proc/<pid>/environ` un `GITHUB_TOKEN` del shell que invoca.
 - Una cuenta cuyo archivo caería sobre `api_key`, `default_account` o un temporal con

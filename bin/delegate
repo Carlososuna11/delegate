@@ -900,6 +900,9 @@ dg_exec_child() {
   # pairs for its child only, launches the child in the background, waits for
   # it, removes the stub directory and exits with the child's code.
   #
+  # Each signal is forwarded as itself: INT and HUP used to arrive as TERM, so a
+  # harness with its own handling for an interrupt or a hangup never saw one.
+  #
   # The cleanup cannot change that code: this bash runs without errexit, and
   # the status is kept in `r` and passed to `exit` explicitly. Under the CLI's
   # `set -e`, a failing `rm` in the old EXIT trap turned a child's 7 into 1.
@@ -911,7 +914,7 @@ dg_exec_child() {
     trap cleanup EXIT
     "$@" &
     c=$!
-    trap "kill -TERM \$c 2>/dev/null" TERM INT HUP
+    for g in TERM INT HUP; do trap "kill -s $g \$c 2>/dev/null" "$g"; done
     while :; do
       r=0; wait "$c" || r=$?
       kill -0 "$c" 2>/dev/null || break
