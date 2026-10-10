@@ -1144,12 +1144,17 @@ test_git_with_bash_is_the_real_one() {
 
 # ─── PATH: the tree under review never supplies a binary ─────────────────────
 
+# What the CLI runs by name: the four it hands to the child, and the helpers
+# its own startup and checks run before --dir is even known (dirname and
+# readlink resolved the script's location through the caller's PATH).
+PLANTED='claude timeout grep git dirname readlink stat sed awk cat tr mktemp chmod rm ln mv env sha256sum head sort'
+
 plant_binaries() {
-  # <dir>: claude, timeout, grep and git that only leave a mark. If any of them
+  # <dir>: the PLANTED names, each one only leaving a mark. If any of them
   # runs, the delegated run executed code from the tree under review.
   local dir="$1" name
   mkdir -p "$dir"
-  for name in claude timeout grep git; do
+  for name in $PLANTED; do
     printf '#!/bin/sh\n: >%q\nexit 0\n' "$TMP/pwned-$name" >"$dir/$name"
     chmod +x "$dir/$name"
   done
@@ -1170,7 +1175,7 @@ test_a_relative_or_tree_path_entry_never_supplies_a_binary() {
   ( cd "$TMP/work" && dg_run testprov --dir "$TMP/work" "tarea" ) >"$TMP/out" 2>"$TMP/err" || RC=$?
   assert_eq 0 "$RC" "the run exits 0"
   local name
-  for name in claude timeout grep git; do
+  for name in $PLANTED; do
     [[ ! -e "$TMP/pwned-$name" ]] || fail "the tree under review supplied $name"
   done
   require_child_ran || return 0

@@ -96,7 +96,14 @@ dg_clean_path() {
   done
   printf '%s\n' "${out:-/usr/bin:/bin}"
 }
-PATH="$(dg_clean_path "$PATH")"
+# The caller's PATH is kept aside and NOT used by this script until cmd_run
+# has removed every entry inside --dir. Until then everything this script runs
+# by name resolves against a fixed root-owned PATH: an absolute entry pointing
+# into the tree under review used to supply `dirname` and `readlink` to the
+# lines right below, which ran with the caller's whole environment before any
+# repository-aware filter existed. Verified with a planted `dirname`.
+_DG_CALLER_PATH="$(dg_clean_path "$PATH")"
+PATH=/usr/bin:/bin
 export PATH
 
 # Resolve the real script location so the `dlg` symlink finds lib/ too.
@@ -466,7 +473,7 @@ cmd_run() {
   # child: an absolute entry pointing into --dir is `.` spelled differently.
   local wroot
   wroot="$(readlink -f -- "$workdir")" || die "no puedo resolver el directorio de trabajo $workdir"
-  PATH="$(dg_clean_path "$PATH" "$wroot")"
+  PATH="$(dg_clean_path "$_DG_CALLER_PATH" "$wroot")"
 
   if [[ "$mode" == 'chat' ]]; then
     # chat is a mode, not a lesser agent: no tools at all, so a permission flag
