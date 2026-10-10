@@ -218,6 +218,7 @@ activate_account() {
 
 setup() {
   mkdir -p "$TMP/bin" "$TMP/providers" "$TMP/keys" "$TMP/work" "$TMP/dump" "$TMP/mcp.d"
+  chmod 700 "$TMP/keys"   # key_dir must be private (A11)
   DG_ENV=()
   write_fake_claude
   # The ceiling a provider declares, in the current vocabulary. `mcp-write`

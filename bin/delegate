@@ -599,11 +599,9 @@ cmd_run() {
   # substitution, which is not the child. Verified on Bash 5.2.
   local +x key_path key
   key_path="$(resolve_account_path "$account")"
-  # The path validate PRINTS, not the one it was given: the mode, owner, type
-  # and size checks were all made against the resolved file, and reopening the
-  # argument would follow the symlink a second time.
-  key_path="$(dg_account_validate "${CFG[key_dir]}" "$key_path")" || exit 1
-  key="$(dg_account_read "$key_path")"
+  # One descriptor for the checks and the read: validating a name and then
+  # reading it again let the file be swapped in between.
+  key="$(dg_account_load "${CFG[key_dir]}" "$key_path")" || exit 1
   [[ -n "$key" ]] || die "la key en $key_path está vacía"
 
   # Other AI CLIs are unreachable from a delegated run. Invoking codex or claude

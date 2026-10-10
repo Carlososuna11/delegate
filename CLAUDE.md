@@ -254,7 +254,27 @@ en un archivo de metadata no secreto, para no depender de estado global mutable.
   desvincular y después crear: dejó 28.382 observaciones de ruta inexistente contra 0 de
   `mv -T`.
 - Antes de usar una key se valida que el target esté **dentro** de `key_dir` y tenga
-  permisos 600.
+  permisos 600. La corrida valida y lee **el mismo descriptor**: abre el archivo una vez,
+  repite los chequeos sobre `/proc/$BASHPID/fd/<fd>` y lee de ese fd. Validar un nombre y
+  leerlo después dejaba cambiar el archivo entre las dos cosas.
+- `key_dir` tiene que ser del usuario y no tener bits de grupo ni de otros (700). Se
+  comprueba en **cada** uso (validar, leer, `add`), no solo cuando `add` lo crea.
+- `account add` nunca escribe sobre la ruta final: crea un temporal con punto, con
+  noclobber y `umask 077`, y lo publica con `link(2)` (`ln -T`), que falla con EEXIST en
+  vez de reemplazar o seguir un symlink. Lo que aparezca en esa ruta mientras `add`
+  espera la key se deja intacto y `add` falla.
+
+**Lo que esto NO promete:**
+
+- No hay locking de cuentas. Todo lo anterior protege contra **otros** usuarios, que con
+  `key_dir` en 700 no pueden entrar; el mismo usuario puede seguir cambiando archivos en
+  su `key_dir` mientras corre `delegate`.
+- La primera verificación es por ruta, y lo que la sigue es un `open(2)` normal. Si entre
+  ambas el archivo se cambia por un FIFO, la apertura se bloquea, y el `--timeout` de la
+  corrida no la cubre porque solo limita al hijo. Desde Bash no hay `O_NONBLOCK` ni
+  `O_NOFOLLOW`. Una vez abierto, lo leído es lo verificado.
+- Solo se revisa `key_dir` resuelto, no sus ancestros. Si un ancestro es escribible por
+  otros, pueden renombrar el directorio completo.
 - La ruta de una cuenta nunca puede ser `api_key`, `default_account` ni un archivo con
   punto: `%s` es un `key_pattern` válido y `api_key` un nombre de cuenta válido, y
   juntos hacían que la key **fuera** el symlink de compatibilidad.
@@ -350,6 +370,10 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
 - Una cuenta cuyo archivo caería sobre `api_key`, `default_account` o un temporal con
   punto (por ejemplo `key_pattern` `%s` con la cuenta `api_key`) se rechaza con 2, y
   `list` nunca muestra esos archivos como cuentas.
+- Un `key_dir` en 750, 705, 770, 777 o 755 se rechaza al validar, al leer y en `add`.
+  `add` no escribe a través de un symlink, vivo o colgante, ni sobre un archivo plantado
+  en la ruta después de su chequeo; no deja temporales. `dg_account_load` rechaza, sin
+  imprimir la key, lo mismo que `validate`, y un FIFO sin bloquearse.
 
 ## Lo que NO se construye
 
