@@ -43,6 +43,10 @@ write_fake_claude() {
 #!/usr/bin/env bash
 set -u
 dump='$TMP/dump'
+# Descriptors this process inherited beyond 0, 1 and 2, listed before this
+# script opens any of its own (a command substitution leaves bash holding a
+# pipe for a while). 255 is bash's handle on this script.
+ls -l /proc/\$\$/fd 2>/dev/null | awk '\$9 > 2 && \$9 != 255 { print \$9, \$11 }' >'$TMP/inherited_fds'
 mode="\$(cat '$TMP/fake_mode' 2>/dev/null || echo record)"
 sleep_for="\$(cat '$TMP/fake_sleep' 2>/dev/null || echo 0)"
 FAKE
@@ -59,13 +63,6 @@ if [[ -n "$dump" ]]; then
   gst="${gst##*) }"
   read -r _ gpid _ <<<"$gst"
   printf '%s\n' "$gpid" >"$dump/.supervisor_pid" && mv -f "$dump/.supervisor_pid" "$dump/supervisor_pid"
-  # Descriptors this process inherited beyond 0, 1 and 2, with their targets.
-  # 255 is bash's own handle on this script.
-  for f in /proc/$$/fd/*; do
-    n="${f##*/}"
-    (( n > 2 && n != 255 )) || continue
-    printf '%s %s\n' "$n" "$(readlink "$f" 2>/dev/null)" >>"$dump/fds"
-  done
 fi
 
 sleep "$sleep_for"
@@ -338,7 +335,7 @@ clear_dump() {
   rm -f "$TMP/dump/args" "$TMP/dump/argv" "$TMP/dump/env" "$TMP/dump/cmdline" \
         "$TMP/dump/parent_comm" "$TMP/dump/parent_cmdline" "$TMP/dump/blocked" \
         "$TMP/dump/started" "$TMP/dump/filter_env" "$TMP/dump/filter_found" \
-        "$TMP/dump/supervisor_pid" "$TMP/dump/fds" "$TMP/dump/signal" "$TMP/dump/trapping"
+        "$TMP/dump/supervisor_pid" "$TMP/dump/signal" "$TMP/dump/trapping"
 }
 
 wait_for() {
@@ -1324,6 +1321,18 @@ test_int_and_hup_reach_the_child_as_themselves() {
     assert_eq "$sig" "$(cat "$TMP/dump/signal" 2>/dev/null)" "$sig reaches the child as $sig"
   done
   return 0
+}
+
+test_the_child_inherits_no_descriptor_beyond_stdio() {
+  # The key travels through a pipe on fd 3. Bash also kept the process
+  # substitution's own copy of it (fd 63) open, and the harness inherited it.
+  setup
+  clear_dump
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  [[ -e "$TMP/inherited_fds" ]] || { fail "control: the child did not list its descriptors"; return 0; }
+  assert_eq "" "$(cat "$TMP/inherited_fds")" "no descriptor beyond 0, 1 and 2 reaches the child"
 }
 
 test_the_childs_exit_code_is_the_runs_exit_code() {

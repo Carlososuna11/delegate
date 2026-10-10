@@ -909,6 +909,13 @@ dg_exec_child() {
   local _dg_super='
     while IFS= read -r -d "" kv <&3; do export "$kv" || exit 125; done
     exec 3<&-
+    # Every descriptor but 0, 1 and 2 closed before the child is launched: the
+    # process substitutions (the pairs on fd 3 and the stderr filter) left the
+    # shell holding its own copies, and the harness inherited them as fd 3 and 63.
+    for f in /proc/$BASHPID/fd/*; do
+      n=${f##*/}
+      if (( n > 2 )); then { exec {n}<&-; } 2>/dev/null; fi
+    done
     s=$1 rm=$2; shift 2
     cleanup() { if [[ -n $s && -d $s ]]; then "$rm" -rf -- "$s" 2>/dev/null; fi; return 0; }
     trap cleanup EXIT

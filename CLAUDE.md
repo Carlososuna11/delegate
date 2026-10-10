@@ -381,6 +381,8 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   el grupo o por todos sin sticky bit (770, 775, 730, 777) se rechaza y uno en 1770,
   700 o 755 se acepta, y el código de salida del hijo es el de la corrida,
   también cuando falla el borrado.
+- El hijo no hereda ningún descriptor aparte de 0, 1 y 2: la copia que bash guardaba
+  del pipe de la key (fd 63) le llegaba abierta.
 - TERM, INT y HUP enviadas al proceso de la corrida llegan al hijo como esa misma
   señal, no todas como TERM.
 - Mientras el hijo vive, ningún proceso de la máquina tiene en su
