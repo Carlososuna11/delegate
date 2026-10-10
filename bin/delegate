@@ -625,15 +625,21 @@ cmd_run() {
   # was followed and its target overwritten, an extra executable left there
   # (`node`, `git`) ran ahead of the real one in every later run, and two
   # concurrent runs rewrote each other's `git`. Verified. XDG_RUNTIME_DIR first
-  # because it is the user's own 700 directory; a parent that others can write
-  # without the sticky bit would let them rename ours away, so it is refused
-  # (group-writable is left alone: with a private group per user it is the
-  # normal result of umask 002).
-  local stub_parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" pmode
+  # because it is the user's own 700 directory.
+  #
+  # Mode 700 protects what is INSIDE the directory, not its entry in the parent:
+  # whoever can write the parent can rename ours away and put their own, with a
+  # `grep` that then runs holding the delegated environment and its key. So the
+  # parent must be owned by this user or by root, and either writable by its
+  # owner alone or sticky (as /tmp is, where nobody renames another's entry).
+  # Group-writable used to be accepted, and a shared group is enough for that.
+  local stub_parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" pmode powner
   [[ "$stub_parent" == /* && -d "$stub_parent" ]] || stub_parent=/tmp
-  pmode="$(stat -L -c %a -- "$stub_parent")" || die "no puedo leer los permisos de $stub_parent"
-  if (( (8#$pmode & 8#0002) && !(8#$pmode & 8#1000) )); then
-    die "el directorio temporal $stub_parent lo pueden escribir otros sin sticky bit; revisa XDG_RUNTIME_DIR y TMPDIR"
+  read -r pmode powner < <(stat -L -c '%a %u' -- "$stub_parent") ||
+    die "no puedo leer los permisos de $stub_parent"
+  if [[ "$powner" != "$EUID" && "$powner" != 0 ]] ||
+     (( (8#$pmode & 8#0022) && !(8#$pmode & 8#1000) )); then
+    die "el directorio temporal $stub_parent no es tuyo o lo pueden escribir otros (grupo o todos) sin sticky bit; revisa XDG_RUNTIME_DIR y TMPDIR"
   fi
   stub_dir="$(mktemp -d -p "$stub_parent" delegate-stubs.XXXXXXXX)" ||
     die "no pude crear el directorio de stubs en $stub_parent"

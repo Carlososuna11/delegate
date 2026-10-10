@@ -75,7 +75,10 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    corrida con `--bash` puede llamar un binario por su ruta absoluta o reescribir su
    `PATH`, y eso no lo impide nada aquí. Los stubs viven en un directorio privado por
    corrida (`mktemp -d`, 700, en `XDG_RUNTIME_DIR` o `TMPDIR`), que se borra al
-   terminar: el directorio compartido de antes se reescribía con `>` en cada corrida,
+   terminar. El padre tiene que ser del usuario o de root, y solo escribible por su
+   dueño o con sticky bit: quien puede escribir el padre puede renombrar el directorio
+   de la corrida y poner el suyo, aunque este sea 700. El directorio compartido de
+   antes se reescribía con `>` en cada corrida,
    así que seguía un symlink precreado y un ejecutable dejado ahí (`node`, `git`)
    corría antes que el real. Por eso alguien tiene que esperar al hijo para borrar el
    directorio, y no puede ser el CLI: un proceso vivo conserva en `/proc/<pid>/environ`
@@ -370,7 +373,8 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
 - Los stubs viven en un directorio privado (700) por corrida, distinto en cada una y
   borrado al terminar, también si al CLI le llega un TERM; un symlink o un ejecutable
   dejados en el viejo directorio compartido no tienen efecto, un padre escribible por
-  todos sin sticky bit se rechaza, y el código de salida del hijo es el de la corrida,
+  el grupo o por todos sin sticky bit (770, 775, 730, 777) se rechaza y uno en 1770,
+  700 o 755 se acepta, y el código de salida del hijo es el de la corrida,
   también cuando falla el borrado.
 - Mientras el hijo vive, ningún proceso de la máquina tiene en su
   `/proc/<pid>/environ` un `GITHUB_TOKEN` del shell que invoca.

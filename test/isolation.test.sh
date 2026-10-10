@@ -1201,6 +1201,7 @@ test_the_stubs_live_in_a_private_directory_per_run_removed_at_exit() {
   # own mktemp directory, and nothing of it survives the run.
   setup
   mkdir -p "$TMP/cache/delegate/stubs" "$TMP/run"
+  chmod 700 "$TMP/run"
   printf 'intacto\n' >"$TMP/victim"
   ln -s "$TMP/victim" "$TMP/cache/delegate/stubs/codex"
   printf '#!/bin/sh\n: >%q\n' "$TMP/pwned-node" >"$TMP/cache/delegate/stubs/node"
@@ -1235,6 +1236,36 @@ test_the_stubs_live_in_a_private_directory_per_run_removed_at_exit() {
   assert_ne 0 "$RC" "a world-writable, non-sticky parent is refused"
   assert_contains "$ERR" "sticky" "and the message says why"
   child_ran && fail "the child ran anyway"
+  return 0
+}
+
+test_a_stub_parent_others_in_the_group_can_write_is_refused() {
+  # A group member who can write the parent can rename the run's 700 directory
+  # away and put their own in its place, with a `grep` that then runs with the
+  # delegated environment and its key. Mode 700 on the directory does not
+  # protect its entry in the parent. Group-writable used to be accepted.
+  setup
+  local mode
+  for mode in 770 775 730; do
+    mkdir -p "$TMP/shared-$mode"
+    chmod "$mode" "$TMP/shared-$mode"
+    clear_dump
+    DG_ENV=("XDG_RUNTIME_DIR=$TMP/shared-$mode")
+    capture dg_ok "tarea"
+    assert_ne 0 "$RC" "a parent in mode $mode is refused"
+    child_ran && fail "mode $mode: the child ran anyway"
+  done
+
+  # The sticky bit keeps others from renaming entries they do not own, as in
+  # /tmp; and a parent only the user can write is the normal case.
+  for mode in 1770 700 755; do
+    mkdir -p "$TMP/ok-$mode"
+    chmod "$mode" "$TMP/ok-$mode"
+    clear_dump
+    DG_ENV=("XDG_RUNTIME_DIR=$TMP/ok-$mode")
+    capture dg_ok "tarea"
+    assert_eq 0 "$RC" "a parent in mode $mode is accepted"
+  done
   return 0
 }
 
