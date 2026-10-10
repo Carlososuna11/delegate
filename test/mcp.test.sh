@@ -174,7 +174,7 @@ test_dir_follows_delegate_mcp_dir() {
   assert_eq "$HOME/.config/delegate/mcp.d" "$OUT" "an empty override falls back to the default"
 
   unset DELEGATE_MCP_DIR
-  [[ -n "$saved" ]] && DELEGATE_MCP_DIR="$saved"
+  if [[ -n "$saved" ]]; then DELEGATE_MCP_DIR="$saved"; fi
 }
 
 # ── dg_mcp_servers ──────────────────────────────────────────────────────────

@@ -117,7 +117,14 @@ run_tests() {
     _current_failed=0
     TMP="$(mktemp -d)"
     export TMP
-    "$name"
+    # The exit status counts too. A test that bailed out half way — a
+    # `return 1`, a helper that gave up — without calling `fail` used to be
+    # reported as passing, so a security test could not go red by dying.
+    local rc=0
+    "$name" || rc=$?
+    if (( rc != 0 )); then
+      fail "the test function itself returned $rc"
+    fi
     rm -rf "$TMP"
     if (( _current_failed )); then
       (( _failed++ ))
