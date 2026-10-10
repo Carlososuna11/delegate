@@ -128,8 +128,11 @@ que un `>` no es una vía de escritura. De ahí salen tres consecuencias:
   misma corrida con `--edit`— convertía el piso en ejecución de código. Por eso,
   en el piso, el `git` que alcanza el modelo es un wrapper primero en el `PATH`:
   ignora la config de sistema y la global, anula `core.fsmonitor`, `core.pager`,
-  `core.hooksPath` y `diff.external`, fuerza `--no-ext-diff`/`--no-textconv`, y
-  rechaza `--ext-diff`, `--textconv` y `--output`. Es defensa en profundidad, no
+  `core.hooksPath` y `diff.external`, y agrega `--no-ext-diff`/`--no-textconv`
+  **después** de las opciones del llamador (antes de un `--`), porque git se queda con
+  la última y `git diff --no-index` acepta abreviaturas como `--textcon`. Rechaza
+  `--ext-diff` y `--textconv` escritas completas y `--output` en cualquier prefijo.
+  Es defensa en profundidad, no
   un límite: un filtro `clean` en el `.git/config` del repo con su
   `.gitattributes` sigue corriendo, y el wrapper se alcanza por nombre, no por
   ruta absoluta. El límite real sigue siendo **no delegar sobre árboles
@@ -358,7 +361,8 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   un `--`, y `--append-system-prompt` sigue siendo la última opción.
 - En el piso, el `git` del hijo no corre ningún helper que nombre la config del
   repo o la global (`diff.external`, `textconv`, `core.fsmonitor`, `core.pager`,
-  un filtro `clean`) y rechaza `--ext-diff`, `--textconv` y `--output`; con
+  un filtro `clean`), tampoco con abreviaturas (`--textcon`, `--ext-dif` con
+  `--no-index`); rechaza `--ext-diff`, `--textconv` y todo prefijo de `--output`; con
   `--bash`, el `git` es el de la máquina.
 - Un `env_passthrough` con cualquier nombre `GIT_*` se rechaza con 2.
 - Un rechazo de `dg_perm_resolve` o de `dg_mcp_resolve` justo después de un grant

@@ -682,24 +682,51 @@ cmd_run() {
   local real_git=''
   real_git="$(type -P git 2>/dev/null)" || true
   if [[ "$mode" == 'agent' ]] && (( ! want_bash )) && [[ "$real_git" == /* ]]; then
-    {
-      printf '#!/bin/sh\n'
-      printf '# Written by delegate for the read-only floor. See bin/delegate.\n'
-      printf 'for a in "$@"; do\n'
-      printf '  case "$a" in\n'
-      printf '    --ext-diff|--textconv|--output|--output=*)\n'
-      printf '      echo "delegate: git $a está denegado en el piso de solo lectura" >&2; exit 126 ;;\n'
-      printf '  esac\n'
-      printf 'done\n'
-      printf 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL\n'
-      printf 'unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_EXTERNAL_DIFF GIT_PAGER PAGER GIT_ATTR_SOURCE\n'
-      printf 'case "${1-}" in\n'
-      printf '  diff|log|show) s="$1"; shift; set -- "$s" --no-ext-diff --no-textconv "$@" ;;\n'
-      printf '  blame) shift; set -- blame --no-textconv "$@" ;;\n'
-      printf 'esac\n'
-      printf "exec '%s' -c core.fsmonitor=false -c core.pager=cat -c core.hooksPath=/dev/null -c diff.external= --no-pager \"\$@\"\n" \
-        "${real_git//\'/\'\\\'\'}"
-    } > "$stub_dir/git"
+    # Quoted heredoc: nothing in it is expanded here. Only the path of the real
+    # git is substituted, single-quoted for sh.
+    local wrapper
+    wrapper="$(cat <<'WRAP'
+#!/bin/sh
+# Written by delegate for the read-only floor. See bin/delegate.
+#
+# `git diff --no-index` takes any unique prefix of a long option, so refusing
+# only the exact spellings let `--textcon` through, and it ran the
+# repository's textconv driver. --output is refused in every prefix (it would
+# write a file). --ext-diff and --textconv are refused when spelled out, and
+# their abbreviations are made harmless by appending --no-ext-diff and
+# --no-textconv AFTER the caller's options, before any `--`: git keeps the
+# last one it sees. They used to be prepended, so a later `--textcon` won.
+for a in "$@"; do
+  case "$a" in
+    --ext-diff|--textconv|--o|--o=*|--ou|--ou=*|--out|--out=*|--outp|--outp=*|--outpu|--outpu=*|--output|--output=*)
+      echo "delegate: git $a está denegado en el piso de solo lectura" >&2; exit 126 ;;
+  esac
+done
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_EXTERNAL_DIFF GIT_PAGER PAGER GIT_ATTR_SOURCE
+case "${1-}" in
+  diff|log|show) tail='--no-ext-diff --no-textconv' ;;
+  blame) tail='--no-textconv' ;;
+  *) tail='' ;;
+esac
+if [ -n "$tail" ]; then
+  seen=0
+  for a do
+    shift
+    if [ "$seen" = 0 ] && [ "$a" = -- ]; then
+      # shellcheck disable=SC2086
+      set -- "$@" $tail --; seen=1
+    else
+      set -- "$@" "$a"
+    fi
+  done
+  # shellcheck disable=SC2086
+  [ "$seen" = 1 ] || set -- "$@" $tail
+fi
+exec @REAL_GIT@ -c core.fsmonitor=false -c core.pager=cat -c core.hooksPath=/dev/null -c diff.external= --no-pager "$@"
+WRAP
+)"
+    printf '%s\n' "${wrapper//@REAL_GIT@/\'${real_git//\'/\'\\\'\'}\'}" > "$stub_dir/git"
     chmod +x "$stub_dir/git"
   fi
   export PATH="$stub_dir:$PATH"

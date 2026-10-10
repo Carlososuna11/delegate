@@ -171,7 +171,11 @@ if [[ "$mode" == probe-git ]]; then
   : >"$dump/git"
   for cmd in 'diff' 'log -p' 'show' 'status' 'blame f' 'diff --ext-diff' \
              'diff --textconv' 'log -p --ext-diff' "diff --output=$dump/git_out" \
-             "diff --output $dump/git_out"; do
+             "diff --output $dump/git_out" 'diff --textcon' 'diff --ext-dif' \
+             'log -p --textc' 'show --textcon' "diff --outp=$dump/git_out" \
+             "diff --out $dump/git_out" "diff --o=$dump/git_out" \
+             'diff --no-index --textcon f .gitattributes' \
+             'diff --no-index --ext-dif f .gitattributes' 'log -p --textcon -- f'; do
     rc=0
     # shellcheck disable=SC2086
     git $cmd >/dev/null 2>&1 || rc=$?
@@ -1119,8 +1123,14 @@ test_git_on_the_read_only_floor_runs_no_helper_the_repository_configures() {
   assert_contains "$probe" "status|0" "git status still works"
   assert_contains "$probe" "blame f|0" "git blame still works"
   local refused
+  # Abbreviations too: `git diff --no-index` takes any unique prefix of a long
+  # option, and an exact-match blacklist let `--textcon` through — it ran the
+  # repository's textconv driver. Every prefix of --output is refused, and the
+  # textconv and ext-diff ones are overridden (covered by $TMP/ran above).
   for refused in 'diff --ext-diff' 'diff --textconv' 'log -p --ext-diff' \
-                 "diff --output=$TMP/dump/git_out" "diff --output $TMP/dump/git_out"; do
+                 "diff --output=$TMP/dump/git_out" "diff --output $TMP/dump/git_out" \
+                 "diff --outp=$TMP/dump/git_out" "diff --out $TMP/dump/git_out" \
+                 "diff --o=$TMP/dump/git_out"; do
     assert_not_contains "$probe" "$refused|0" "refused: git $refused"
   done
   [[ ! -e "$TMP/dump/git_out" ]] || fail "git --output wrote a file from the floor"
