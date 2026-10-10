@@ -328,6 +328,8 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   `BASH_ENV`, una función exportada `set`, un `SHELLOPTS=xtrace` con un `PS4` que
   expande la key, y `allexport` (por `SHELLOPTS` o por `bash -a`), cada uno con su
   sentinela. Los tests de aislamiento ejecutan el script, no `bash bin/delegate`.
+- El `grep` que filtra stderr no lleva el environment del padre ni la key: un
+  `GITHUB_TOKEN` del shell que invoca no aparece en su `/proc/<pid>/environ`.
 
 ## Lo que NO se construye
 

@@ -763,7 +763,13 @@ cmd_run() {
   cd "$workdir"
   # Harmless notice from Claude Code when it titles a session with a model it
   # does not know. It goes to stderr, but it dirties any `2>&1` over --json.
-  exec 2> >("$grep_bin" --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
+  #
+  # Under `env -i`: this filter lives as long as the run and starts before the
+  # environment wipe, so it used to hold the parent's whole environment —
+  # GITHUB_TOKEN, AWS_* — readable in its /proc/<pid>/environ for the entire
+  # run. Verified with a sentinel. grep needs nothing from the environment, and
+  # `exec` leaves no forked copy of this shell behind it.
+  exec 2> >(exec "$env_bin" -i "$grep_bin" --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
 
   # The environment is BUILT, not inherited. `env -u A -u B VAR=x cmd` keeps
   # everything else the parent had, so GITHUB_TOKEN, AWS_*, NODE_OPTIONS and

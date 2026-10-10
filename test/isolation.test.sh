@@ -85,6 +85,7 @@ if [[ -n "$dump" ]]; then
     [[ "$ppid" == "$PPID" ]] || continue
     c="$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)" || continue
     if [[ "$c" == *--line-buffered*unrecognized_model* ]]; then
+      : >"$dump/filter_found"
       tr '\0' '\n' <"$p/environ" >"$dump/filter_env" 2>/dev/null || true
       break
     fi
@@ -99,6 +100,11 @@ if [[ "$mode" == probe-tools ]]; then
     "$tool" >/dev/null 2>&1 || rc=$?
     printf '%s %s\n' "$tool" "$rc" >>"$dump/blocked"
   done
+fi
+
+if [[ "$mode" == stderr-notice ]]; then
+  printf '[claude-code:unrecognized_model] aviso inofensivo\n' >&2
+  printf 'una linea de stderr que importa\n' >&2
 fi
 
 if [[ "$mode" == probe-git ]]; then
@@ -274,7 +280,7 @@ clear_dump() {
   # still tell "this run never reached the child" from "an earlier run did".
   rm -f "$TMP/dump/args" "$TMP/dump/argv" "$TMP/dump/env" "$TMP/dump/cmdline" \
         "$TMP/dump/parent_comm" "$TMP/dump/parent_cmdline" "$TMP/dump/blocked" \
-        "$TMP/dump/started" "$TMP/dump/filter_env"
+        "$TMP/dump/started" "$TMP/dump/filter_env" "$TMP/dump/filter_found"
 }
 
 wait_for() {
@@ -867,10 +873,35 @@ test_inherited_allexport_never_exports_the_clis_variables() {
     assert_not_contains "$(child_env)" "_DG_" "bash -a: no internal variable reaches the child"
     # The helpers the CLI starts after reading the key are the other half: with
     # allexport, the stderr filter inherited the key for the whole run.
-    [[ -s "$TMP/dump/filter_env" ]] || fail "control: the stderr filter's environment was not found"
+    [[ -e "$TMP/dump/filter_found" ]] || fail "control: the stderr filter's environment was not found"
     assert_not_contains "$(cat "$TMP/dump/filter_env" 2>/dev/null)" "$SENTINEL" \
       "bash -a: the key is not in the stderr filter's environment"
   fi
+}
+
+test_the_stderr_filter_does_not_carry_the_parents_environment() {
+  # The `grep` that hides Claude Code's unrecognized_model notice was started
+  # BEFORE the environment wipe, so it held the parent's whole environment —
+  # credentials included — readable in /proc/<pid>/environ for the entire run,
+  # after the launching shell had already unset them. Verified with a sentinel.
+  setup
+  clear_dump
+  DG_ENV=("GITHUB_TOKEN=FILTER-SENTINEL-3b1f" "AWS_SECRET_ACCESS_KEY=FILTER-SENTINEL-a0c2")
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  [[ -e "$TMP/dump/filter_found" ]] || { fail "control: the stderr filter's environment was not found"; return 0; }
+  local fenv
+  fenv="$(cat "$TMP/dump/filter_env")"
+  assert_not_contains "$fenv" "FILTER-SENTINEL" "no parent credential in the filter's environment"
+  assert_not_contains "$fenv" "$SENTINEL" "nor the account key"
+
+  # And it still does its job with nothing in its environment.
+  printf 'stderr-notice\n' >"$TMP/fake_mode"
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  assert_not_contains "$ERR" "unrecognized_model" "the notice is filtered out"
+  assert_contains "$ERR" "una linea de stderr que importa" "every other stderr line gets through"
 }
 
 test_a_parent_export_cannot_shadow_the_clis_own_variables() {
