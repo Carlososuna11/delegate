@@ -1069,6 +1069,14 @@ test_the_obsolete_deepseek_account_variable_is_refused() {
   assert_contains "$ERR" "DELEGATE_ACCOUNT" "and the one to use instead"
   assert_fails "nothing reached the child" test -f "$FAKE_CLAUDE_LOG"
   assert_no_key_leak "obsolete variable"
+
+  # Defined but empty is still defined: the documented check is "set", and an
+  # empty value let a stale `export DEEPSEEK_ACCOUNT=` through unnoticed.
+  export DEEPSEEK_ACCOUNT=
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  unset DEEPSEEK_ACCOUNT
+  assert_ne 0 "$RC" "a run with DEEPSEEK_ACCOUNT set but empty fails too"
+  assert_contains "$ERR" "DEEPSEEK_ACCOUNT" "and names the variable"
 }
 
 test_default_account_beats_active_symlink() {

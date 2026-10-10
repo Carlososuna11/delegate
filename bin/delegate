@@ -461,7 +461,8 @@ cmd_run() {
   # a caller following the docs was billed to the default or the active one
   # without a word. Refused, not honoured as an alias: silently changing which
   # key pays is worse than failing, and one name is easier to keep honest.
-  if [[ -n "${DEEPSEEK_ACCOUNT:-}" ]]; then
+  # `+x`: defined counts, even empty; a stale `export DEEPSEEK_ACCOUNT=` passed.
+  if [[ -n "${DEEPSEEK_ACCOUNT+x}" ]]; then
     printf '%s✗%s %s\n' "$RED" "$R" \
       "DEEPSEEK_ACCOUNT ya no elige la cuenta: usa ${B}DELEGATE_ACCOUNT${R} o ${B}--account${R}, y quita DEEPSEEK_ACCOUNT del entorno" >&2
     exit 2

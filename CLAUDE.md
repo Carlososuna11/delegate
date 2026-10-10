@@ -377,8 +377,8 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   no deja ningún global del grant, probado en el **mismo** shell: inspeccionar
   los globals del padre después de correr el resolver en un subshell no prueba
   nada.
-- `DEEPSEEK_ACCOUNT` definida rechaza la corrida con 2, nombrando `DELEGATE_ACCOUNT`,
-  antes de leer la key.
+- `DEEPSEEK_ACCOUNT` definida, aunque esté vacía, rechaza la corrida con 2, nombrando
+  `DELEGATE_ACCOUNT`, antes de leer la key.
 - Una entrada del environ con un nombre que Bash no puede nombrar (`SECRET-TOKEN`,
   `A.B`) no llega al hijo, y la key sigue sin aparecer en ningún argv.
 - Invocado por nombre, nada del shell que llama corre antes de la limpieza: un
