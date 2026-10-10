@@ -875,28 +875,48 @@ dg_exec_child() {
     # Last, so nothing above can shadow it.
     "${_DG_X_AUTHENV}=$_DG_X_KEY"
   )
-  # A single-quoted constant: nothing in it is expanded here.
-  local _dg_tramp='while IFS= read -r -d "" kv <&3; do export "$kv" || exit 125; done; exec 3<&-; exec "$@"'
+  # The supervisor, a single-quoted constant: nothing in it is expanded here.
+  #
+  # This shell does NOT stay alive to wait for the child. Unsetting variables
+  # never touches /proc/<pid>/environ, which keeps the environment a process
+  # was STARTED with, so a CLI waiting for the child held the parent's
+  # credentials there — readable by any same-user process, and by an allowed
+  # `grep` on the read-only floor — for the whole run. Verified with a
+  # sentinel. It execs instead into `env -i /bin/bash -p`, which starts from an
+  # empty environment: same pid, nothing in its environ. That bash exports the
+  # pairs for its child only, launches the child in the background, waits for
+  # it, removes the stub directory and exits with the child's code.
+  #
+  # The cleanup cannot change that code: this bash runs without errexit, and
+  # the status is kept in `r` and passed to `exit` explicitly. Under the CLI's
+  # `set -e`, a failing `rm` in the old EXIT trap turned a child's 7 into 1.
+  local _dg_super='
+    while IFS= read -r -d "" kv <&3; do export "$kv" || exit 125; done
+    exec 3<&-
+    s=$1 rm=$2; shift 2
+    cleanup() { if [[ -n $s && -d $s ]]; then "$rm" -rf -- "$s" 2>/dev/null; fi; return 0; }
+    trap cleanup EXIT
+    "$@" &
+    c=$!
+    trap "kill -TERM \$c 2>/dev/null" TERM INT HUP
+    while :; do
+      r=0; wait "$c" || r=$?
+      kill -0 "$c" 2>/dev/null || break
+    done
+    cleanup
+    trap - EXIT
+    exit "$r"
+  '
 
-  # Not `exec`: this shell stays to remove the run's stub directory when the
-  # child ends (the EXIT trap), and passes the child's exit code on. The child
-  # runs in the background so a TERM, INT or HUP sent to this process is
-  # forwarded instead of waiting, unhandled, behind a foreground job.
-  "$_DG_X_ENV_BIN" -i /bin/bash -p -c "$_dg_tramp" delegate-exec \
+  # The stub directory now belongs to the supervisor: the EXIT trap of this
+  # shell goes away with the exec.
+  trap - EXIT
+  exec "$_DG_X_ENV_BIN" -i /bin/bash -p -c "$_dg_super" delegate-run \
+    "$_DG_X_STUBS" "$_DG_X_RM" \
     "$_DG_X_TIMEOUT_BIN" "$_DG_X_TIMEOUT" \
     "$_DG_X_BIN" "${_DG_X_ARGS[@]}" "$_DG_X_PROMPT" \
     3< <(printf '%s\0' "${_dg_pairs[@]}") \
-    < /dev/null &  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
-  _dg_child=$!
-  trap 'kill -TERM "$_dg_child" 2>/dev/null || true' TERM INT HUP
-  local _dg_rc=0
-  while :; do
-    _dg_rc=0
-    wait "$_dg_child" || _dg_rc=$?
-    # A wait cut short by a trapped signal returns >128 while the child lives.
-    kill -0 "$_dg_child" 2>/dev/null || break
-  done
-  exit "$_dg_rc"
+    < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
 }
 
 # Removes the run's private stub directory. Only ever a directory this run

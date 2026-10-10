@@ -53,6 +53,19 @@ if [[ -n "$dump" ]]; then
   # The child is alive from here on. The account-swap test waits for this marker
   # instead of guessing how long the CLI takes to start.
   : >"$dump/started"
+  # The process that supervises the run, the parent of our parent `timeout`:
+  # a signal test sends to it.
+  gst="$(cat "/proc/$PPID/stat" 2>/dev/null)"
+  gst="${gst##*) }"
+  read -r _ gpid _ <<<"$gst"
+  printf '%s\n' "$gpid" >"$dump/.supervisor_pid" && mv -f "$dump/.supervisor_pid" "$dump/supervisor_pid"
+  # Descriptors this process inherited beyond 0, 1 and 2, with their targets.
+  # 255 is bash's own handle on this script.
+  for f in /proc/$$/fd/*; do
+    n="${f##*/}"
+    (( n > 2 && n != 255 )) || continue
+    printf '%s %s\n' "$n" "$(readlink "$f" 2>/dev/null)" >>"$dump/fds"
+  done
 fi
 
 sleep "$sleep_for"
@@ -113,6 +126,32 @@ if [[ "$mode" == probe-stubs ]]; then
   printf '%s\n' "$stubs" >"$dump/stub_dir"
   stat -c %a "$stubs" >"$dump/stub_mode"
   command -v node >"$dump/node_path" 2>/dev/null || :
+fi
+
+if [[ "$mode" == probe-environ ]]; then
+  # Every process of this machine whose initial environment (what any process
+  # of the same user reads in /proc/<pid>/environ) holds one of the needles.
+  # The needles come from a file, so this process and its helpers never carry
+  # them in their own environment.
+  : >"$dump/environ_hits"
+  while IFS= read -r needle; do
+    [[ -n "$needle" ]] || continue
+    for p in /proc/[0-9]*; do
+      e="$(tr '\0' '\n' <"$p/environ" 2>/dev/null)" || continue
+      [[ "$e" == *"$needle"* ]] || continue
+      printf '%s|%s|%s\n' "$needle" "${p#/proc/}" "$(cat "$p/comm" 2>/dev/null)" >>"$dump/environ_hits"
+    done
+  done <"$(dirname "$dump")/environ_needles"
+  : >"$dump/environ_scanned"
+fi
+
+if [[ "$mode" == trap-signals ]]; then
+  # Writes down which signal reached it, so a test can tell an INT from a TERM.
+  for sig in INT HUP TERM; do
+    trap "printf '%s\\n' $sig >'$dump/signal'; exit 0" "$sig"
+  done
+  : >"$dump/trapping"
+  sleep 30 & wait $!
 fi
 
 if [[ "$mode" == exit7 ]]; then
@@ -298,7 +337,8 @@ clear_dump() {
   # still tell "this run never reached the child" from "an earlier run did".
   rm -f "$TMP/dump/args" "$TMP/dump/argv" "$TMP/dump/env" "$TMP/dump/cmdline" \
         "$TMP/dump/parent_comm" "$TMP/dump/parent_cmdline" "$TMP/dump/blocked" \
-        "$TMP/dump/started" "$TMP/dump/filter_env" "$TMP/dump/filter_found"
+        "$TMP/dump/started" "$TMP/dump/filter_env" "$TMP/dump/filter_found" \
+        "$TMP/dump/supervisor_pid" "$TMP/dump/fds" "$TMP/dump/signal" "$TMP/dump/trapping"
 }
 
 wait_for() {
@@ -922,6 +962,29 @@ test_the_stderr_filter_does_not_carry_the_parents_environment() {
   assert_contains "$ERR" "una linea de stderr que importa" "every other stderr line gets through"
 }
 
+test_no_process_of_the_run_keeps_the_parents_environment() {
+  # The CLI used to stay alive for the whole run as the child's supervisor.
+  # Unsetting variables does not touch a process's /proc/<pid>/environ, which
+  # keeps the environment the process was started with, so the parent's
+  # credentials stayed readable there — by a same-user process, or by an
+  # allowed `grep` on the read-only floor — for as long as the run lasted.
+  setup
+  clear_dump
+  printf 'probe-environ\n' >"$TMP/fake_mode"
+  printf '%s\n' "PARENT-ENVIRON-SENTINEL-5d2e" "ANTHROPIC_BASE_URL=https://api.example.invalid/v1" \
+    >"$TMP/environ_needles"
+  DG_ENV=("GITHUB_TOKEN=PARENT-ENVIRON-SENTINEL-5d2e")
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  [[ -e "$TMP/dump/environ_scanned" ]] || { fail "control: the scan did not finish"; return 0; }
+  local hits
+  hits="$(cat "$TMP/dump/environ_hits")"
+  # Control: the scan does find what the child itself was started with.
+  assert_contains "$hits" "ANTHROPIC_BASE_URL=https://api.example.invalid/v1|" "control: the child's own environment is found"
+  assert_not_contains "$hits" "PARENT-ENVIRON-SENTINEL-5d2e|" "no process alive during the run holds the parent's environment"
+}
+
 test_a_parent_export_cannot_shadow_the_clis_own_variables() {
   setup
   # `unset -v NAME` inside a function removes the LOCAL binding and leaves it
@@ -1187,7 +1250,8 @@ test_a_term_to_the_cli_reaches_the_child_and_removes_the_stubs() {
   local bg=$!
   wait_for "$TMP/dump/started" || { fail "the child never started"; kill "$bg" 2>/dev/null; return 0; }
   local pid
-  pid="$(pgrep -f -- "bin/delegate testprov --dir $TMP/work tarea-larga-$$" | head -n 1)"
+  wait_for "$TMP/dump/supervisor_pid" || true
+  pid="$(cat "$TMP/dump/supervisor_pid" 2>/dev/null)"
   [[ -n "$pid" ]] || { fail "control: the CLI's process was not found"; kill "$bg" 2>/dev/null; return 0; }
   kill -TERM "$pid"
   local tries=100
@@ -1209,6 +1273,22 @@ test_the_childs_exit_code_is_the_runs_exit_code() {
   printf 'exit7\n' >"$TMP/fake_mode"
   capture dg_ok "tarea"
   assert_eq 7 "$RC" "the child's exit code comes back"
+}
+
+test_a_failing_cleanup_never_replaces_the_childs_exit_code() {
+  # The stub directory is removed after the child ends. Under errexit, a
+  # failing `rm` there ended the shell with ITS status, so a run whose child
+  # exited 7 reported 1. Verified with an `rm` that always fails.
+  setup
+  mkdir -p -m 700 "$TMP/run"
+  printf '#!/bin/sh\nexit 1\n' >"$TMP/bin/rm"
+  chmod +x "$TMP/bin/rm"
+  printf 'exit7\n' >"$TMP/fake_mode"
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/run")
+  capture dg_ok "tarea"
+  assert_eq 7 "$RC" "the child's exit code survives a failing cleanup"
+  command rm -f "$TMP/bin/rm"
+  return 0
 }
 
 # ─── invariant 6: a provider file is parsed, never sourced ───────────────────

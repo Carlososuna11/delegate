@@ -18,8 +18,8 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    `env ANTHROPIC_API_KEY=... cmd` pone la key en el argv de `env`, y
    `/proc/<pid>/cmdline` es legible por cualquiera. Viaja por un pipe (fd 3, NUL
    separado, escrito por el `printf` builtin) hacia un trampolín `/bin/bash -p`
-   arrancado con `env -i`, que la exporta y hace `exec`. Corolarios, cada uno un
-   camino de fuga que existió:
+   arrancado con `env -i`, que la exporta para el hijo y lo supervisa. Corolarios, cada
+   uno un camino de fuga que existió:
    - El shebang es `#!/bin/bash -p`: ruta fija y modo privilegiado. Lo que el shell que
      invoca controla actuaba **antes** de la primera línea del script: `BASH_ENV` se
      sourceaba, una función exportada llamada `set` corría dentro de la propia limpieza,
@@ -77,8 +77,12 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    corrida (`mktemp -d`, 700, en `XDG_RUNTIME_DIR` o `TMPDIR`), que se borra al
    terminar: el directorio compartido de antes se reescribía con `>` en cada corrida,
    así que seguía un symlink precreado y un ejecutable dejado ahí (`node`, `git`)
-   corría antes que el real. Por eso el CLI ya no hace `exec` al hijo: lo espera, le
-   reenvía TERM, INT y HUP, borra el directorio y sale con su código.
+   corría antes que el real. Por eso alguien tiene que esperar al hijo para borrar el
+   directorio, y no puede ser el CLI: un proceso vivo conserva en `/proc/<pid>/environ`
+   el environment con el que arrancó aunque haga `unset`, y el CLI arrancó con las
+   credenciales del padre. El CLI hace `exec` a un supervisor `/bin/bash -p` arrancado
+   con `env -i` (mismo pid, environ vacío), que lanza al hijo, le reenvía las señales,
+   borra el directorio y sale con el código del hijo, aunque el borrado falle.
 6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
    y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
    variables de entorno, ni reescribir lo que la corrida fija. Una entrada declara
@@ -366,7 +370,10 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
 - Los stubs viven en un directorio privado (700) por corrida, distinto en cada una y
   borrado al terminar, también si al CLI le llega un TERM; un symlink o un ejecutable
   dejados en el viejo directorio compartido no tienen efecto, un padre escribible por
-  todos sin sticky bit se rechaza, y el código de salida del hijo es el de la corrida.
+  todos sin sticky bit se rechaza, y el código de salida del hijo es el de la corrida,
+  también cuando falla el borrado.
+- Mientras el hijo vive, ningún proceso de la máquina tiene en su
+  `/proc/<pid>/environ` un `GITHUB_TOKEN` del shell que invoca.
 - Una cuenta cuyo archivo caería sobre `api_key`, `default_account` o un temporal con
   punto (por ejemplo `key_pattern` `%s` con la cuenta `api_key`) se rechaza con 2, y
   `list` nunca muestra esos archivos como cuentas.
