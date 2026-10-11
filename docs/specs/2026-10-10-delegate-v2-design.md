@@ -159,6 +159,10 @@ Lo que cambió respecto de lo de arriba al implementarlo, y por qué. El código
   (dice `running` y nadie tiene el lock) y `unreadable`; `gc` toma ese lock exclusivo
   antes de decidir, y recoge una abandonada solo pasadas 5 horas (timeout máximo más
   una hora), cuando el `--timeout` de `delegate` ya cortó lo que dejó.
+- **Git del runner fijado.** El gitdir del worktree se lee antes de lanzar al hijo y
+  cada llamada posterior lleva `--git-dir` y `--work-tree`: el `.git` del worktree es un
+  archivo que el delegado puede reescribir. `git` y `delegate` se resuelven a ruta
+  absoluta con las entradas absolutas del `PATH`, nunca desde el worktree.
 - **Checks** con un environment construido (`HOME`, `PATH` filtrado, locale, `TMPDIR`) y
   un `PATH` sin entradas relativas ni dentro del worktree: corren código del modelo, y
   los tokens de quien llama no tienen por qué verlo.

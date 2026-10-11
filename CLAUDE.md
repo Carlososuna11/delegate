@@ -358,6 +358,11 @@ Reglas que el código cumple y los tests prueban:
 - La rama es plumbing (`commit-tree` + `update-ref` que solo crea): sin hooks, sin firma,
   autor `delegate <proveedor>`, padre la base. Lo que escriban los checks no llega a la
   rama. Sin cambios no hay rama.
+- El git del runner nunca lee lo que el delegado puede escribir: el gitdir del worktree
+  se fija antes de lanzar al hijo y toda llamada lleva `--git-dir`/`--work-tree` (el
+  archivo `.git` del worktree reapuntado a un repo con un `filter.*.clean` corría ese
+  programa con el environment del runner). `git` y `delegate` se resuelven a ruta
+  absoluta contra las entradas absolutas del `PATH`, antes de entrar al worktree.
 - Los checks corren con un environment construido (sin tokens del que llama) y un `PATH`
   sin entradas relativas ni dentro del worktree. Ejecutan código que escribió el modelo
   con los permisos del usuario: el environment se limpia, los archivos no se confinan.
