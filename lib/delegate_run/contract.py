@@ -85,6 +85,10 @@ class Result:
     # cannot report a key fingerprint (see the spec).
     account: str | None = None
     grants: list[str] = field(default_factory=list)
+    # "bwrap" when the child ran inside bubblewrap, "none" when it ran without
+    # an OS sandbox (DELEGATE_SANDBOX=off, or auto with bwrap unusable), None
+    # when the run ended before that was decided.
+    sandbox: str | None = None
     changed_files: list[dict] = field(default_factory=list)   # {"path": str, "change": "A"|"M"|"D"|"R"|"?"}
     scope_violation: list[str] = field(default_factory=list)
     checks: list[CheckResult] = field(default_factory=list)

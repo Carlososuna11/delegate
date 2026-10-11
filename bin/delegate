@@ -167,6 +167,8 @@ ${B}OPCIONES${R}
   ${CYAN}--model${R} <id>    pisa el modelo del proveedor
   ${CYAN}--timeout${R} <s>   segundos ${D}(default: el del proveedor)${R}
   ${CYAN}--json${R}          salida JSON: resultado, costo, sesión
+  ${CYAN}--sandbox${R} <m>   ${D}bwrap${R}: el hijo corre en bubblewrap ${D}(default: off; lo usa delegate-run)${R}
+  ${CYAN}--sandbox-ro${R} <r> ruta visible en solo lectura dentro del sandbox ${D}(repetible)${R}
 
 ${B}CUENTAS${R}
   delegate account <proveedor> list
@@ -427,6 +429,114 @@ cmd_mcp() {
   (( found )) || { warn "no hay servidores MCP declarados en $dir"; return 1; }
 }
 
+# ─── sandbox (bubblewrap) ────────────────────────────────────────────────────
+#
+# `--sandbox bwrap` runs the child (timeout's command: the harness and
+# everything it spawns) inside bubblewrap. The CLI itself stays OUTSIDE: it
+# reads the key from its 600 file before the sandbox exists, and the key only
+# crosses into it in the child's environment, as it always did. The key_dir,
+# the rest of the user's home, ~/.ssh and every other repository are simply not
+# mounted. See CLAUDE.md, "Sandbox".
+
+# Refusals of the sandbox flags exit 2, like every other refusal that happens
+# before the key is read: a run asked to be confined never runs unconfined.
+dg_reject() { printf '%s✗%s %s\n' "$RED" "$R" "$*" >&2; exit 2; }
+
+# One classic-BPF instruction (struct sock_filter, little-endian): code, jt,
+# jf, k. Bash's printf builtin emits the \x00 bytes as they are.
+_dg_bpf_ins() {
+  local c=$1 t=$2 f=$3 k=$4 fmt
+  printf -v fmt '\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x' \
+    $(( c & 255 )) $(( c >> 8 & 255 )) "$t" "$f" \
+    $(( k & 255 )) $(( k >> 8 & 255 )) $(( k >> 16 & 255 )) $(( k >> 24 & 255 ))
+  printf "$fmt"
+}
+
+# The seccomp filter bwrap installs on the sandboxed command, for $1 (x86_64
+# or aarch64). The network namespace is SHARED (the harness needs the
+# provider's API), and the abstract unix-socket namespace belongs to the
+# network namespace: without this, the sandbox reached @/tmp/.X11-unix/X0,
+# and an X server that admits the user by uid (SI:localuser) accepted it —
+# keystrokes into a terminal outside. Verified with xdpyinfo. So:
+#   - socket(AF_UNIX, ...) fails with EAFNOSUPPORT: no unix socket can be
+#     created, so none can connect to an abstract (or any) address;
+#   - socketpair() only for SOCK_STREAM and SOCK_SEQPACKET (libuv's stdio
+#     pipes): a datagram pair can be re-connect()ed to another address;
+#   - io_uring_setup fails with ENOSYS: IORING_OP_SOCKET would create a
+#     socket without the socket() syscall that this filter sees;
+#   - x32 syscall numbers fail with ENOSYS, and any foreign architecture
+#     (int 0x80 on x86_64) kills the process.
+dg_seccomp_bpf() {
+  local arch nr_socket nr_pair nr_uring=425
+  case "$1" in
+    x86_64)  arch=$(( 0xC000003E )); nr_socket=41;  nr_pair=53 ;;
+    aarch64) arch=$(( 0xC00000B7 )); nr_socket=198; nr_pair=199 ;;
+    *) return 1 ;;
+  esac
+  local ld=$(( 0x20 )) jeq=$(( 0x15 )) jge=$(( 0x35 )) and=$(( 0x54 )) ret=$(( 0x06 ))
+  local allow=$(( 0x7fff0000 )) kill=$(( 0x80000000 ))
+  local eafnosupport=$(( 0x00050000 | 97 )) enosys=$(( 0x00050000 | 38 ))
+  _dg_bpf_ins $ld  0 0 4                    #  0 A = arch
+  _dg_bpf_ins $jeq 1 0 $arch                #  1 native? -> 3
+  _dg_bpf_ins $ret 0 0 $kill                #  2
+  _dg_bpf_ins $ld  0 0 0                    #  3 A = nr
+  _dg_bpf_ins $jge 13 0 $(( 0x40000000 ))   #  4 x32 -> 18
+  _dg_bpf_ins $jeq 3 0 $nr_socket           #  5 socket -> 9
+  _dg_bpf_ins $jeq 5 0 $nr_pair             #  6 socketpair -> 12
+  _dg_bpf_ins $jeq 10 0 $nr_uring           #  7 io_uring_setup -> 18
+  _dg_bpf_ins $ret 0 0 $allow               #  8
+  _dg_bpf_ins $ld  0 0 16                   #  9 A = low word of args[0] (domain)
+  _dg_bpf_ins $jeq 5 0 1                    # 10 AF_UNIX -> 16
+  _dg_bpf_ins $ret 0 0 $allow               # 11
+  _dg_bpf_ins $ld  0 0 24                   # 12 A = low word of args[1] (type)
+  _dg_bpf_ins $and 0 0 15                   # 13 drop SOCK_CLOEXEC / SOCK_NONBLOCK
+  _dg_bpf_ins $jeq 2 0 1                    # 14 SOCK_STREAM -> 17
+  _dg_bpf_ins $jeq 1 0 5                    # 15 SOCK_SEQPACKET -> 17
+  _dg_bpf_ins $ret 0 0 $eafnosupport        # 16
+  _dg_bpf_ins $ret 0 0 $allow               # 17
+  _dg_bpf_ins $ret 0 0 $enosys              # 18
+}
+
+# Fills _DG_X_SBX with the bwrap prefix for the child. Arguments: bwrap path,
+# the resolved working directory, the stub directory, the resolved claude
+# binary, the seccomp fd, then the read-only paths. The order of the mounts is
+# the policy: system directories read-only, a private tmpfs for /tmp and HOME
+# (so nothing of the real home is there, only what is bound on top of it), the
+# harness binary and the stubs read-only, the working directory read-write,
+# and LAST the read-only paths, so a gitdir inside the tree stays read-only.
+dg_sandbox_argv() {
+  local bwrap="$1" wroot="$2" stubs="$3" claude_real="$4" sfd="$5"; shift 5
+  local d target p
+  _DG_X_SBX=("$bwrap"
+    --unshare-all --share-net --unshare-user --disable-userns
+    --die-with-parent --new-session
+    --ro-bind /usr /usr)
+  for d in /bin /sbin /lib /lib32 /lib64 /libx32; do
+    if [[ -L "$d" ]]; then
+      _DG_X_SBX+=(--symlink "$(readlink -- "$d")" "$d")
+    elif [[ -d "$d" ]]; then
+      _DG_X_SBX+=(--ro-bind "$d" "$d")
+    fi
+  done
+  _DG_X_SBX+=(--ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp)
+  # /etc/resolv.conf is usually a symlink into /run (systemd-resolved): the
+  # one file it names, never its directory (which holds resolved's varlink
+  # socket, unreachable anyway without AF_UNIX).
+  target="$(readlink -f -- /etc/resolv.conf 2>/dev/null)" || target=''
+  if [[ "$target" == /run/* && -f "$target" ]]; then
+    _DG_X_SBX+=(--ro-bind "$target" "$target")
+  fi
+  if [[ "${HOME:-}" == /?* ]]; then
+    _DG_X_SBX+=(--perms 0700 --tmpfs "$HOME")
+  fi
+  d="$(dirname -- "$claude_real")"
+  _DG_X_SBX+=(--ro-bind "$d" "$d" --ro-bind "$stubs" "$stubs" --bind "$wroot" "$wroot")
+  for p in "$@"; do
+    _DG_X_SBX+=(--ro-bind "$p" "$p")
+  done
+  _DG_X_SBX+=(--setenv TMPDIR /tmp --seccomp "$sfd" --chdir "$wroot" --)
+}
+
 # ─── corrida delegada ────────────────────────────────────────────────────────
 
 cmd_run() {
@@ -437,6 +547,8 @@ cmd_run() {
   local format='text' timeout_s='' model=''
   # Repeatable, so they accumulate as comma-separated lists for lib/mcp.sh.
   local mcp_read='' mcp_write=''
+  local sandbox='off'
+  local -a sandbox_ro=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -449,6 +561,8 @@ cmd_run() {
       --dir)         workdir="${2:?--dir necesita una ruta}"; shift 2 ;;
       --model)       model="${2:?--model necesita un id}"; shift 2 ;;
       --timeout)     timeout_s="${2:?--timeout necesita segundos}"; shift 2 ;;
+      --sandbox)     sandbox="${2:?--sandbox necesita bwrap u off}"; shift 2 ;;
+      --sandbox-ro)  sandbox_ro+=("${2:?--sandbox-ro necesita una ruta}"); shift 2 ;;
       --)            shift; break ;;
       -*)            die "opción desconocida: $1" ;;
       *)             break ;;
@@ -487,6 +601,34 @@ cmd_run() {
   [[ -n "$timeout_s" ]] || timeout_s="${CFG[timeout]}"
   [[ "$timeout_s" =~ ^[0-9]+$ && "$timeout_s" -ge 1 ]] || die "--timeout debe ser un entero de segundos"
   [[ -n "$model" ]] || model="${CFG[model]}"
+
+  # ── sandbox: validated here, before the key is read ──
+  local bwrap_bin='' sbx_ro_real=() sp
+  case "$sandbox" in
+    off)
+      (( ${#sandbox_ro[@]} )) && dg_reject "--sandbox-ro solo vale con --sandbox bwrap"
+      ;;
+    bwrap)
+      bwrap_bin="$(type -P bwrap)" ||
+        dg_reject "--sandbox bwrap: no encuentro bwrap en el PATH (instálalo con 'sudo apt install bubblewrap')"
+      [[ "$bwrap_bin" == /* ]] || dg_reject "--sandbox bwrap: bwrap tiene que resolverse a una ruta absoluta"
+      case "$HOSTTYPE" in
+        x86_64|aarch64) ;;
+        *) dg_reject "--sandbox bwrap: no hay filtro seccomp para la arquitectura $HOSTTYPE" ;;
+      esac
+      # A working directory that is / or contains HOME would bind the whole
+      # home back in, read-write, over the private tmpfs.
+      if [[ "$wroot" == / ]] ||
+         { [[ "${HOME:-}" == /?* ]] && [[ "$(readlink -f -- "$HOME" 2>/dev/null || printf '%s' "$HOME")/" == "$wroot"/* ]]; }; then
+        dg_reject "--sandbox bwrap: el directorio de trabajo no puede ser / ni contener tu HOME ($wroot)"
+      fi
+      for sp in ${sandbox_ro[@]+"${sandbox_ro[@]}"}; do
+        [[ "$sp" == /* && -e "$sp" ]] || dg_reject "--sandbox-ro necesita una ruta absoluta que exista: $sp"
+        sbx_ro_real+=("$(readlink -f -- "$sp")") || dg_reject "no puedo resolver $sp"
+      done
+      ;;
+    *) dg_reject "--sandbox acepta bwrap u off, no '$sandbox'" ;;
+  esac
 
   # Permissions before the key: a run that is going to be refused must be
   # refused before anything reads a secret from disk.
@@ -760,6 +902,22 @@ WRAP
     printf '%s\n' "${wrapper//@REAL_GIT@/\'${real_git//\'/\'\\\'\'}\'}" > "$stub_dir/git"
     chmod +x "$stub_dir/git"
   fi
+  # The sandbox prefix, now that the stub directory exists. The seccomp
+  # program lives in it (private, 700) and reaches bwrap as fd 9, which the
+  # supervisor opens for the child alone; inside, the harness is started by
+  # its resolved path, since the symlink that PATH found may live in the home
+  # that the sandbox hides.
+  _DG_X_SBX=()
+  _DG_X_BPF=''
+  if [[ "$sandbox" == 'bwrap' ]]; then
+    local claude_real
+    claude_real="$(readlink -f -- "$claude_bin")" || die "no puedo resolver $claude_bin"
+    dg_seccomp_bpf "$HOSTTYPE" > "$stub_dir/.seccomp.bpf" || die "no pude escribir el filtro seccomp"
+    _DG_X_BPF="$stub_dir/.seccomp.bpf"
+    dg_sandbox_argv "$bwrap_bin" "$wroot" "$stub_dir" "$claude_real" 9 \
+      ${sbx_ro_real[@]+"${sbx_ro_real[@]}"}
+    claude_bin="$claude_real"
+  fi
   export PATH="$stub_dir:$PATH"
 
   local claude_args=(
@@ -974,7 +1132,7 @@ dg_exec_child() {
       n=${f##*/}
       if (( n > 2 )); then { exec {n}<&-; } 2>/dev/null; fi
     done
-    s=$1 rm=$2; shift 2
+    s=$1 rm=$2 bpf=$3; shift 3
     cleanup() { if [[ -n $s && -d $s ]]; then "$rm" -rf -- "$s" 2>/dev/null; fi; return 0; }
     trap cleanup EXIT
     # The traps go in BEFORE the launch. Installed after it, a signal arriving
@@ -985,7 +1143,9 @@ dg_exec_child() {
     for g in TERM INT HUP; do
       trap "if [ -n \"\$c\" ]; then kill -s $g \$c 2>/dev/null; else p=$g; fi" "$g"
     done
-    "$@" &
+    # With the sandbox, its seccomp program goes to bwrap as fd 9, opened here
+    # for the child alone, after every inherited descriptor was closed.
+    if [[ -n $bpf ]]; then "$@" 9<"$bpf" & else "$@" & fi
     c=$!
     if [ -n "$p" ]; then kill -s "$p" "$c" 2>/dev/null; fi
     while :; do
@@ -1001,8 +1161,9 @@ dg_exec_child() {
   # shell goes away with the exec.
   trap - EXIT
   exec "$_DG_X_ENV_BIN" -i /bin/bash -p -c "$_dg_super" delegate-run \
-    "$_DG_X_STUBS" "$_DG_X_RM" \
+    "$_DG_X_STUBS" "$_DG_X_RM" "$_DG_X_BPF" \
     "$_DG_X_TIMEOUT_BIN" "$_DG_X_TIMEOUT" \
+    ${_DG_X_SBX[@]+"${_DG_X_SBX[@]}"} \
     "$_DG_X_BIN" "${_DG_X_ARGS[@]}" "$_DG_X_PROMPT" \
     3< <(printf '%s\0' "${_dg_pairs[@]}") \
     < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar

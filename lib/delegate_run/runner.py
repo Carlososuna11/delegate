@@ -26,6 +26,14 @@ exists only so the tests do not wait a full minute:
   DELEGATE_RUN_GRACE   seconds between SIGTERM and SIGKILL (default 15)
   DELEGATE_RUN_SLACK   seconds the runner waits past the request timeout (30)
   DELEGATE_RUN_WALL    overrides timeout + slack entirely (tests only)
+  DELEGATE_SANDBOX     auto (default), bwrap or off; see _decide_sandbox
+
+OS sandbox. With bwrap usable, `delegate` is told to run its child (the
+harness and everything it starts) inside bubblewrap: private mount, pid, ipc
+and user namespaces, the worktree read-write, the repository's gitdir
+read-only, a tmpfs HOME and /tmp, and no unix sockets (seccomp). `delegate`
+itself runs outside, so the key file is never mounted in the sandbox. The
+network is shared: see CLAUDE.md, "Sandbox".
 """
 from __future__ import annotations
 
@@ -37,6 +45,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -75,6 +84,16 @@ _GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
 _HARDENED_KEYS_RE = r"^(filter\..*\.(clean|smudge|process|required)|diff\..*\.(command|textconv))$"
 
 _trusted_path = contract.trusted_path
+
+SANDBOX_MODES = ("auto", "bwrap", "off")
+# The architectures bin/delegate has a seccomp program for.
+_SANDBOX_ARCHES = ("x86_64", "aarch64")
+# The namespaces bin/delegate asks for, on a throwaway command: if this fails,
+# the real sandbox would fail too (no user namespaces, an AppArmor policy
+# without a profile for bwrap, a bwrap too old for --disable-userns).
+_BWRAP_PROBE = ("--unshare-all", "--share-net", "--unshare-user", "--disable-userns",
+                "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
+                "--proc", "/proc", "--dev", "/dev", "--", "/bin/true")
 
 
 def _resolve(name: str) -> str:
@@ -657,10 +676,86 @@ def _commit(worktree: Path, gitdir: str, base: str, tree: str, result: Result, r
     return branch
 
 
+# --- sandbox ----------------------------------------------------------------
+
+def _sandbox_mode() -> str:
+    raw = os.environ.get("DELEGATE_SANDBOX") or "auto"
+    if raw not in SANDBOX_MODES:
+        raise _Infra(f"DELEGATE_SANDBOX={raw!r} no es válido: usa auto, bwrap u off")
+    return raw
+
+
+def _bwrap_unusable() -> str | None:
+    """None if bwrap can build the sandbox here; otherwise why not."""
+    machine = os.uname().machine
+    if machine not in _SANDBOX_ARCHES:
+        return f"no hay filtro seccomp para la arquitectura {machine}"
+    bwrap = contract.which("bwrap")
+    if not bwrap:
+        return "no encuentro bwrap en el PATH (instálalo con 'sudo apt install bubblewrap')"
+    try:
+        proc = subprocess.run([bwrap, *_BWRAP_PROBE], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              env={"PATH": "/usr/bin:/bin"}, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"bwrap no arrancó: {exc}"
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or f"código {proc.returncode}"
+        return f"bwrap no pudo crear el sandbox: {detail}"
+    return None
+
+
+def _decide_sandbox(result: Result) -> bool:
+    """Whether the child runs inside bwrap; records the answer in result.sandbox.
+
+    auto: bwrap if it works here, else no sandbox, said on stderr and in
+    result.sandbox ("none"). bwrap: no sandbox is a failure (infra_failed),
+    never a silent downgrade. off: no sandbox.
+    """
+    mode = _sandbox_mode()
+    if mode == "off":
+        result.sandbox = "none"
+        return False
+    why = _bwrap_unusable()
+    if why is None:
+        result.sandbox = "bwrap"
+        return True
+    if mode == "bwrap":
+        raise _Infra(f"DELEGATE_SANDBOX=bwrap, pero {why}")
+    result.sandbox = "none"
+    sys.stderr.write(f"delegate-run: aviso: la corrida va SIN sandbox del sistema ({why}); "
+                     "DELEGATE_SANDBOX=bwrap la haría fallar en vez de seguir\n")
+    return False
+
+
+def _sandbox_ro(worktree: Path, gitdir: str) -> list[str]:
+    """Paths the sandbox mounts read-only: the repository's git directory.
+
+    The worktree's `.git` names its own gitdir (.git/worktrees/<run_id>),
+    which names the common one (objects, refs, config, hooks). Both are
+    mounted read-only, so git in the sandbox reads history but cannot write
+    a ref, the config or a hook of the user's repository.
+    """
+    common = _git(worktree, ["rev-parse", "--path-format=absolute",
+                             "--git-common-dir"]).stdout.strip()
+    if not common:
+        raise _Infra("no se pudo leer el gitdir común del worktree")
+    paths = [common]
+    real_common = os.path.realpath(common)
+    real_gitdir = os.path.realpath(gitdir)
+    if not (real_gitdir == real_common or real_gitdir.startswith(real_common + os.sep)):
+        paths.append(gitdir)
+    return paths
+
+
 # --- child ------------------------------------------------------------------
 
-def _child_argv(req: Request, worktree: Path) -> list[str]:
+def _child_argv(req: Request, worktree: Path, sandbox_ro: list[str] | None = None) -> list[str]:
     argv = [_resolve(os.environ.get("DELEGATE_BIN") or "delegate"), req.provider, "--json"]
+    if sandbox_ro is not None:
+        argv += ["--sandbox", "bwrap"]
+        for path in sandbox_ro:
+            argv += ["--sandbox-ro", path]
     if req.account:
         argv += ["--account", req.account]
     if "edit" in req.grants:
@@ -839,6 +934,7 @@ def _request_dict(req: Request) -> dict:
 
 def _run(req: Request, result: Result, run: _Run) -> None:
     rd = run.rd
+    sandboxed = _decide_sandbox(result)
     repo = _toplevel(req.repo)
     run.check_stop()
     base = _resolve_base(repo, req, result.run_id, rd)
@@ -851,11 +947,12 @@ def _run(req: Request, result: Result, run: _Run) -> None:
     gitdir = _git(worktree, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
     if not gitdir:
         raise _Infra("no se pudo leer el gitdir del worktree")
+    sandbox_ro = _sandbox_ro(worktree, gitdir) if sandboxed else None
     run.check_stop()
 
     with open(rd / "stdout.log", "wb") as out, open(rd / "stderr.log", "wb") as err:
-        exit_code, reason = _supervise(_child_argv(req, worktree), worktree, out, err,
-                                       _wall(req), run)
+        exit_code, reason = _supervise(_child_argv(req, worktree, sandbox_ro), worktree,
+                                       out, err, _wall(req), run)
     result.child_exit = exit_code
 
     # The changes are computed from the worktree whatever happened: a run that
