@@ -256,6 +256,48 @@ Solo la interfaz, para que la fase B no la cierre:
 - Si se cae la conexión, se consulta `delegate-run status <run_id>` antes de reintentar: un corte de transporte no significa que la corrida no ocurrió.
 - caracas tiene sus propias keys de delegación, no las de la laptop, y ninguna credencial de producción ni de Claude.
 
+### Decisiones de implementación
+
+Uso y reglas en `CLAUDE.md`, "delegate-run remoto (Fase C)".
+
+- **Un solo ejecutable.** `delegate-run --remote <host>` en vez de un `bin/` nuevo:
+  la petición, el resultado y los códigos de salida son los mismos, y el lado
+  remoto es el mismo `delegate-run`. Se agregan `fetch`, `status --remote` y
+  `mirror` (lado remoto), y dos códigos: 3 (`run_id` ya existe, no se creó nada) y
+  4 (sin contacto con el host; la corrida puede seguir viva).
+- **El `run_id` lo elige el cliente** y viaja en la petición (`run_id`, opcional,
+  misma forma). Es lo que permite preguntar `status` después de un corte, y el
+  rechazo de un `run_id` existente (antes de escribir nada) hace imposible un
+  duplicado al reenviar.
+- **El host decide la ruta del mirror** (`delegate-run mirror <nombre>` responde la
+  ruta): el cliente no conoce el HOME del host, y el `repo` de la petición remota
+  siempre es un mirror, nunca una ruta elegida desde la laptop. El cliente valida la
+  ruta que recibe antes de usarla en `host:ruta`.
+- **La base se resuelve en la laptop**, con las mismas reglas de árbol sucio y
+  snapshot; al host llega un sha completo. Contra un repo bare el runner solo acepta
+  eso: un nombre (`HEAD`, una rama) sería lo que el mirror tenga en ese momento.
+- **Recuperación antes que reintento.** Ante cualquier fallo de transporte se
+  consulta `status` con backoff; solo se reenvía una corrida que el host no conoce
+  dos veces seguidas (hasta 3 reenvíos). Una corrida que el host deja de conocer
+  después de haberla visto no se reenvía.
+- **`--detach` es un corte deliberado**: el cliente manda la petición, espera a que
+  `status` la vea y mata su ssh. No hace falta demonizar nada en el host: el runner
+  ya sobrevive al corte (HUP ignorado, `_emit` y los avisos toleran un pipe cerrado).
+- **La rama traída se verifica**: exactamente un commit sobre la base pedida, sin
+  merge; si no, se borra y la corrida queda `infra_failed`. El fetch nunca fuerza.
+- **Copia local con `host`** en `runs/<run_id>/`, y el registro pendiente aparte
+  (`state/remote/<run_id>.json`) hasta que la corrida termina: así `status` y
+  `stats` no ven como `abandoned` una corrida que sigue viva en el host.
+- **Instalación por bundle**: caracas no tiene acceso a GitHub. El código va a
+  `~/delegate/src`, separado de los mirrors en `~/delegate/repos`, para que
+  actualizar o limpiar el clon no toque los mirrors.
+
+Límites: los logs (`stdout.log`, checks) quedan en el host; el mirror crece hasta el
+`gc` del host; un `gc` del host antes del `fetch` pierde la corrida para la laptop.
+Smoke real contra caracas con el `delegate` falso (transporte, mirror, bwrap, checks,
+`--detach` con corte real de ssh y `fetch`): verde. El smoke con el modelo real queda
+pendiente de la key de DeepSeek en caracas.
+
 ## Tests
 
 - Fase A: un test por fila de la tabla, que falla contra `main`.

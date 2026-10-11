@@ -332,6 +332,9 @@ delegate-run cancel <run_id>          # espera a que la corrida escriba su statu
 delegate-run cost [--days N]
 delegate-run stats [--days N] [--provider P] [--json]   # tabla legible; JSON con --json
 delegate-run gc [--days N] [--dry-run]
+delegate-run --remote <host> [--detach] < peticion.json   # Fase C, ver abajo
+delegate-run fetch <run_id> [--remote <host>]
+delegate-run status <run_id> --remote <host>
 ```
 
 `stats` da, por proveedor/modelo y por proveedor, corridas, estados, éxito al primer
@@ -345,7 +348,8 @@ Petición (claves desconocidas o repetidas se rechazan): `v` (1), `provider`, `r
 `bash`), `mcp` (solo lectura), `timeout` (60–14400, 1800), `checks` (lista de argv,
 nunca una cadena de shell), `scope` (globs relativos a la raíz: `*` no cruza `/`,
 `**` cruza segmentos, una ruta sin comodín cubre todo lo que tiene debajo),
-`snapshot` (`false`), `wait` (`true`).
+`snapshot` (`false`), `wait` (`true`), `run_id` (lo elige quien llama, con la forma
+de siempre; si ya existe, exit 3 y no se crea nada).
 
 Salida: exit 0 solo con `completed`; 1 con cualquier otro status (el JSON dice cuál);
 2 si la petición o los argumentos son inválidos, y entonces no hay corrida ni stdout.
@@ -519,6 +523,62 @@ Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_
 (`request.json`, `result.json`, `stdout.log`, `stderr.log`, `patch.diff`, `checks/`,
 `lock`), `worktrees/<run_id>/` y `slots/` (`DELEGATE_SLOTS`, 2 por defecto).
 
+## delegate-run remoto (Fase C)
+
+`delegate-run --remote caracas < peticion.json` corre la misma petición en otro host.
+La petición es la de siempre, con `repo` local. El cliente:
+
+1. Valida la petición, elige el `run_id` y resuelve la base en el repo **local** con
+   las reglas de siempre (árbol sucio rechazado, `snapshot` congela el estado local).
+2. `ssh host delegate-run mirror <nombre>`: el host crea (la primera vez) o encuentra
+   su mirror bare en `~/delegate/repos/<nombre>.git` (`DELEGATE_MIRROR_ROOT`). El
+   nombre es `<basename>-<10 hex de la ruta absoluta>`.
+3. `git push` de la base a `refs/delegate/base/<run_id>`: un namespace propio, nunca
+   forzado, nunca una rama del usuario.
+4. `ssh host delegate-run` con la petición por stdin: `repo` es el mirror, `base` el
+   sha completo, `run_id` el del cliente.
+5. Trae `delegate/<run_id>` con un fetch sin `+` y verifica que sea un commit sobre
+   la base (si no, la borra y la corrida queda `infra_failed`). Guarda una copia del
+   `result.json` en `runs/<run_id>/` con `host`, `remote_artifacts` y
+   `remote_worktree`: `status`, `list`, `stats` (`by_host`), `cost` y `gc` la ven.
+
+**Corte de conexión:** nunca se reintenta a ciegas. Se consulta `delegate-run status
+<run_id>` con backoff; solo una corrida que el host no conoce (dos veces seguidas) se
+reenvía, hasta 3 veces, y un `run_id` repetido el host lo rechaza (exit 3), así que no
+hay duplicados. Sin contacto durante `DELEGATE_REMOTE_GIVEUP` (900 s) sale con 4 y
+deja el registro en `state/remote/<run_id>.json`: `delegate-run fetch <run_id>` la
+recoge después. `--detach` devuelve el `run_id` apenas el host registra la corrida y
+corta la sesión a propósito (el runner ignora HUP y un stdout cerrado).
+
+Lado remoto: el runner acepta un repo **bare**. Ahí no hay árbol que revisar, la base
+tiene que ser el sha completo de un commit del repo (nunca `HEAD` ni un nombre) y
+`snapshot` se rechaza. `gc` en el host borra también `refs/delegate/base/<run_id>`;
+el `gc` local borra la rama traída y el snapshot local.
+
+Seguridad: la petición viaja solo por stdin; la línea de comando remota es texto fijo
+más `run_id` o el nombre del mirror, que pasan una regex estricta y van citados. El
+host (`check_host`) no puede empezar con `-` ni llevar `:` o `/`. ssh corre con
+`BatchMode`, `ConnectTimeout`, `ServerAlive*` y sin agente, X11 ni forwarding; git
+usa el mismo ssh (`GIT_SSH_COMMAND`). El mirror verifica los objetos que recibe
+(`receive.fsckObjects`). El host tiene sus propias keys de delegación (`delegate
+account <proveedor> add` ahí), nunca las de la laptop, y ninguna credencial de
+producción ni de Claude.
+
+Instalación: `scripts/install-remote.sh [host] [rev]` manda un `git bundle` del commit
+(nada sin commit, ni config, ni keys) por scp, lo deja en `~/delegate/src` (separado
+de `~/delegate/repos`) y enlaza `delegate`, `dlg` y `delegate-run` en
+`~/.local/bin`, sin pisar un archivo que no sea un enlace. El ssh no interactivo de
+caracas encuentra `node`, `claude` y `~/.local/bin` por el bloque de arriba de su
+`~/.bashrc`.
+
+**Límites:** el mirror crece con cada base empujada hasta que el `gc` del host borra
+las refs (y un `git gc` en el mirror los objetos). El `report`, `stdout.log` y los
+logs de checks quedan en el host (`remote_artifacts`); la copia local trae el
+`result.json`, no los logs. `stats` local re-precia una corrida remota sin costo solo
+si su `result.json` lo permite (no tiene el `modelUsage` del host). La recuperación
+depende de que el host conserve `runs/<run_id>`: un `gc` del host antes del `fetch`
+la pierde.
+
 ## Lenguaje
 
 Bash, sin dependencias de runtime. Esto es construir un environment y hacer `exec`.
@@ -534,7 +594,9 @@ riesgo de migración sin fortalecer el manejo de la key, que es lo que importa.
 `test/run.sh` corre todas las suites, incluida la de Python (`test/py.test.sh`:
 `python3 -m unittest discover -s test/py -t .`). `delegate-run` se prueba con un
 `delegate` falso (`test/py/fake_delegate.py`); el smoke contra el proveedor real corre
-solo con `DELEGATE_REAL_HARNESS=1`.
+solo con `DELEGATE_REAL_HARNESS=1`. El modo remoto se prueba con un `ssh` falso
+(`test/py/fake_ssh.py`, vía `DELEGATE_REMOTE_SSH`) que corre el comando en un HOME y
+un state dir de "remoto" locales, y simula cortes (`FAKE_SSH_DROP`, `FAKE_SSH_FAIL`).
 
 Los invariantes son testeables y en los scripts originales no estaban testeados. Mínimo:
 
