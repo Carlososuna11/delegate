@@ -1,0 +1,145 @@
+#!/usr/bin/python3 -I
+"""delegate-run: supervisa, verifica y reporta una corrida de `delegate`.
+
+La petición entra por stdin como JSON, nunca por argv: así sirve igual en local
+y por `ssh -T`. El resultado sale por stdout como JSON. Diseño completo en
+docs/specs/2026-10-10-delegate-v2-design.md, "Fase B".
+
+Este archivo es el único punto de entrada con Python: `delegate` sigue siendo el
+primitivo de exec en Bash. El runner nunca lee, imprime ni reenvía una key.
+
+Códigos de salida:
+  0  la corrida terminó en `completed` (o el subcomando funcionó)
+  1  la corrida terminó con otro status (el JSON de stdout dice cuál)
+  2  petición o argumentos inválidos: no se creó ninguna corrida, stdout vacío
+"""
+import json
+import os
+import sys
+
+# `-I` aísla el intérprete: sys.path no trae ni el directorio del script. Se
+# agrega ../lib resolviendo symlinks, para que un enlace instalado en otro
+# directorio cargue el paquete real.
+_SELF = os.path.realpath(__file__)
+_LIB = os.path.join(os.path.dirname(os.path.dirname(_SELF)), "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+
+from delegate_run import contract, report, request, runner  # noqa: E402
+
+USAGE = """uso: delegate-run < peticion.json
+       delegate-run status <run_id>
+       delegate-run list [--limit N]
+       delegate-run cancel <run_id>
+       delegate-run cost [--days N]
+       delegate-run gc [--days N] [--dry-run]
+"""
+
+
+class _Usage(Exception):
+    pass
+
+
+def _emit(obj, code=0):
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Whoever asked went away (a dropped ssh, a closed pipe). The result is
+        # already on disk; `delegate-run status` recovers it.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+    return code
+
+
+def _error(message, code=2):
+    sys.stderr.write(f"delegate-run: {message}\n")
+    return code
+
+
+def _options(args, allowed):
+    """Parse `--name value` and bare flags; anything unknown is an error."""
+    out, i = {}, 0
+    while i < len(args):
+        name = args[i]
+        if name not in allowed:
+            raise _Usage(f"opción desconocida: {name}")
+        kind = allowed[name]
+        if kind is bool:
+            out[name] = True
+            i += 1
+            continue
+        if i + 1 >= len(args):
+            raise _Usage(f"{name} necesita un valor")
+        try:
+            value = int(args[i + 1])
+        except ValueError:
+            raise _Usage(f"{name} necesita un entero, recibido {args[i + 1]!r}") from None
+        if value < 0:
+            raise _Usage(f"{name} no puede ser negativo")
+        out[name] = value
+        i += 2
+    return out
+
+
+def _run_id(rest, command):
+    if len(rest) != 1:
+        raise _Usage(f"{command} necesita exactamente un run_id")
+    if not contract.RUN_ID_RE.match(rest[0]):
+        raise _Usage(f"run_id inválido: {rest[0]!r}")
+    return rest[0]
+
+
+def _cmd_run():
+    raw = sys.stdin.buffer.read()
+    try:
+        req = request.parse_request(raw)
+    except contract.RequestError as exc:
+        return _error(str(exc))
+    result = runner.execute(req)
+    return _emit(result.to_json(), 0 if result.status == contract.COMPLETED else 1)
+
+
+def main(argv):
+    if not argv:
+        return _cmd_run()
+    command, rest = argv[0], argv[1:]
+    try:
+        if command in ("-h", "--help", "help"):
+            sys.stdout.write(USAGE)
+            return 0
+        if command == "status":
+            run_id = _run_id(rest, command)
+            try:
+                return _emit(report.status(run_id))
+            except FileNotFoundError as exc:
+                return _error(str(exc), 1)
+        if command == "list":
+            opts = _options(rest, {"--limit": int})
+            return _emit(report.list_runs(opts.get("--limit", 20)))
+        if command == "cancel":
+            out = runner.cancel(_run_id(rest, command))
+            return _emit(out, 0 if out["cancelled"] else 1)
+        if command == "cost":
+            opts = _options(rest, {"--days": int})
+            try:
+                return _emit(report.cost(opts.get("--days", 7)))
+            except ValueError as exc:  # a malformed prices.tsv
+                return _error(str(exc), 1)
+        if command == "gc":
+            opts = _options(rest, {"--days": int, "--dry-run": bool})
+            return _emit(report.gc(opts.get("--days", 14),
+                                   dry_run=opts.get("--dry-run", False)))
+    except _Usage as exc:
+        _error(str(exc))
+        sys.stderr.write(USAGE)
+        return 2
+    _error(f"subcomando desconocido: {command}")
+    sys.stderr.write(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
