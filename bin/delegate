@@ -529,7 +529,20 @@ dg_sandbox_argv() {
   if [[ "${HOME:-}" == /?* ]]; then
     _DG_X_SBX+=(--perms 0700 --tmpfs "$HOME")
   fi
-  d="$(dirname -- "$claude_real")"
+  # The harness: a native (ELF) binary is mounted alone; a script (an npm
+  # install's cli.js) needs its package directory. Never a directory that is
+  # HOME or holds it: a `claude` sitting in ~/bin or ~ would mount all of it.
+  local magic=''
+  LC_ALL=C read -r -N 4 magic < "$claude_real" 2>/dev/null || true
+  if [[ "$magic" == $'\x7fELF' ]]; then
+    d="$claude_real"
+  else
+    d="$(dirname -- "$claude_real")"
+    if [[ "${HOME:-}" == /?* && "$(readlink -f -- "$HOME" 2>/dev/null || printf '%s' "$HOME")/" == "$d"/* ]] ||
+       [[ "$d" == / ]]; then
+      die "--sandbox bwrap: claude ($claude_real) no es un binario y su directorio contiene tu HOME; no lo monto en el sandbox"
+    fi
+  fi
   _DG_X_SBX+=(--ro-bind "$d" "$d" --ro-bind "$stubs" "$stubs" --bind "$wroot" "$wroot")
   for p in "$@"; do
     _DG_X_SBX+=(--ro-bind "$p" "$p")

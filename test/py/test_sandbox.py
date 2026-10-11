@@ -416,5 +416,22 @@ class SandboxFlagsTest(unittest.TestCase):
         self.assertIn(b"HOME", proc.stderr)
 
 
+    @unittest.skipIf(BWRAP_PROBLEM, f"bwrap no usable: {BWRAP_PROBLEM}")
+    def test_a_script_harness_in_home_does_not_mount_home(self):
+        # A non-ELF `claude` is mounted with its directory; when that directory
+        # is HOME itself, the run refuses instead of mounting the home.
+        self.key_file.chmod(0o600)
+        home = self.tmp / "home"
+        shutil.copy(self.tmp / "bin" / "claude", home / "claude")
+        env = {"PATH": f"{home}:/usr/bin:/bin", "HOME": str(home),
+               "DELEGATE_PROVIDERS_DIR": str(self.tmp / "providers.d"),
+               "DELEGATE_MCP_DIR": str(self.tmp / "mcp.d")}
+        proc = subprocess.run([str(DELEGATE), "fake", "--sandbox", "bwrap", "--dir",
+                               str(self.repo), "--", "x"],
+                              capture_output=True, env=env, timeout=30)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(b"HOME", proc.stderr)
+        self.assertNotIn(b"home_canary_readable", proc.stdout)
+
 if __name__ == "__main__":
     unittest.main()
