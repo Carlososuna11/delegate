@@ -60,8 +60,13 @@ HOST_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9_.-]{0,252}"
 MIRROR_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 # What the client accepts as the mirror path the remote reports: absolute,
 # plain characters only (it goes inside git's own single quotes on the
-# remote command line), ending in .git, no '..' segment.
-MIRROR_PATH_RE = re.compile(r"\A(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)+\.git\Z")
+# remote command line), ending in .git, no '.' or '..' segment.
+MIRROR_PATH_RE = re.compile(r"\A(?:/[A-Za-z0-9_.][A-Za-z0-9_.-]*)+\.git\Z")
+
+
+def _mirror_path_ok(path) -> bool:
+    return (isinstance(path, str) and bool(MIRROR_PATH_RE.match(path))
+            and not any(seg in (".", "..") for seg in path.split("/")))
 
 SSH_OPTIONS = (
     "-T",
@@ -213,9 +218,9 @@ def _remote_mirror(host: str, name: str) -> str:
                           "(ver scripts/install-remote.sh)", 1)
     obj = _json_object(out) if rc == 0 else None
     path = obj.get("path") if obj else None
-    if not isinstance(path, str) or not MIRROR_PATH_RE.match(path) \
-            or "/../" in path or "/./" in path:
-        raise RemoteError(f"{host} no devolvió la ruta del mirror (código {rc})", 1)
+    if not _mirror_path_ok(path):
+        raise RemoteError(f"{host} no devolvió una ruta de mirror válida (código {rc}, "
+                          f"ruta {path!r})", 1)
     return path
 
 
@@ -555,7 +560,7 @@ def fetch(run_id: str, host: str | None = None) -> tuple[dict, int]:
         raise RemoteError(f"la corrida {run_id} es de {pending.get('host')}, no de {host}", 2)
     check_host(pending.get("host"))
     mirror = pending.get("mirror")
-    if not isinstance(mirror, str) or not MIRROR_PATH_RE.match(mirror):
+    if not _mirror_path_ok(mirror):
         raise RemoteError(f"el registro pendiente de {run_id} está dañado", 1)
     previous = os.umask(0o077)
     try:

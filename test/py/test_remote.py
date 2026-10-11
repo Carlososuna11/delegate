@@ -222,6 +222,19 @@ class RemoteTest(unittest.TestCase):
         self.assertIsNone(out["branch"])
         self.assertFalse([c for c in self.calls() if "upload-pack" in c["cmd"]])
 
+    def test_mirror_root_under_a_dot_directory(self):
+        root = self.rhome / ".cache" / "mirrors"
+        code, out, err = self.run_remote(remote_env={"DELEGATE_MIRROR_ROOT": str(root)})
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(list(root.glob("*.git"))), 1)
+
+    def test_mirror_path_check(self):
+        for ok in ("/home/u/delegate/repos/a-1.git", "/home/u/.cache/r/a.git"):
+            self.assertTrue(remote._mirror_path_ok(ok), ok)
+        for bad in ("home/a.git", "/a/../b.git", "/a/./b.git", "/a/b", "/a/b'c.git",
+                    "/a/b c.git", "/a/$(x).git", None, 3):
+            self.assertFalse(remote._mirror_path_ok(bad), bad)
+
     def test_caller_chosen_run_id_is_used(self):
         run_id = "20260101-000000-abcdef"
         code, out, err = self.run_remote(self.request(run_id=run_id))
