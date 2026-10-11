@@ -57,6 +57,7 @@ last=''
   printf 'MODEL:%s\n' "${ANTHROPIC_MODEL:-}"
   printf 'SMALL:%s\n' "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}"
   printf 'SUBAGENT:%s\n' "${CLAUDE_CODE_SUBAGENT_MODEL:-}"
+  printf 'CTX:%s\n' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-unset}"
 } > "$log"
 env > "$env_log"
 exit 0
@@ -393,6 +394,23 @@ test_model_flag_overrides_provider_model() {
   local log; log="$(claude_log)"
   assert_contains "$log" "MODEL:override-model" "--model reaches the child"
   assert_contains "$log" "SMALL:test-model-small" "the small model still comes from the provider"
+}
+
+test_context_tokens_reach_the_child_only_for_the_provider_model() {
+  setup_runnable
+  write_provider alpha $'context_tokens\t983616'
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  assert_eq 0 "$RC" "run with context_tokens succeeds"
+  assert_contains "$(claude_log)" "CTX:983616" "the provider's window reaches the child"
+  dg_run alpha --dir "$TMP/work" --model other-model "haz algo"
+  assert_eq 0 "$RC" "run with --model succeeds"
+  assert_contains "$(claude_log)" "CTX:unset" "a --model override does not inherit the window"
+}
+
+test_no_context_tokens_without_the_key() {
+  setup_runnable
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  assert_contains "$(claude_log)" "CTX:unset" "no window is invented"
 }
 
 test_provider_model_used_without_the_flag() {

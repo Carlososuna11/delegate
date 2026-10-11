@@ -203,7 +203,15 @@ que `--edit` y `--bash`.
 Un archivo por proveedor en `providers.d/`, formato `clave<TAB>valor`.
 
 **En config:** `endpoint`, `auth_env`, `key_dir`, `key_pattern`, `default_account`,
-`model`, `small_model`, `timeout`, `caps`, `residency`.
+`model`, `small_model`, `context_tokens`, `timeout`, `caps`, `residency`.
+
+`context_tokens` es la ventana de contexto real de `model`, tal como la documenta el
+proveedor, y llega al hijo como `CLAUDE_CODE_MAX_CONTEXT_TOKENS` solo cuando la corrida
+usa ese `model` (un `--model` no la hereda). Sin ella, un modelo que el catálogo del
+harness no conoce se asume de 200k y se auto-compacta ahí, con un aviso. qwen lleva
+983616: el valor de la guía de Claude Code de Alibaba para el Token Plan (el máximo de
+entrada en modo thinking de una ventana de 1M); no se usa `[1m]` porque esa entrada no
+llega al millón.
 
 **En el script, no configurable:** validación de argumentos y config, el lattice de
 permisos locales, el enforcement de `caps`, `--bare`, la restricción de setting-sources,

@@ -402,6 +402,16 @@ test_rejects_a_timeout_out_of_range() {
   done
 }
 
+test_context_tokens_is_validated() {
+  local v
+  for v in '999' '0' '0983616' '10000001' '1e6' '983616k' '-1000' '98 3616' '1,000,000'; do
+    assert_reject_value context_tokens "$v" "context_tokens '$v'"
+  done
+  for v in '1000' '983616' '1000000' '10000000'; do
+    assert_accept_value context_tokens "$v" "context_tokens '$v'"
+  done
+}
+
 test_rejects_an_invalid_caps_element() {
   local v
   for v in 'nope' 'Read' 'read,nope' 'read, bash' 'edit,bash,all' 'read,edit,write' 'rwx'; do

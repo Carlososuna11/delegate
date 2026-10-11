@@ -1089,6 +1089,12 @@ WRAP
   _DG_X_ENDPOINT="${CFG[endpoint]}"
   _DG_X_MODEL="$model"
   _DG_X_SMALL="${CFG[small_model]}"
+  # The model's real context window, from the provider file, only for the
+  # model it describes: a --model override may be a different window.
+  _DG_X_CTX=()
+  if [[ -n "${CFG[context_tokens]:-}" && "$model" == "${CFG[model]}" ]]; then
+    _DG_X_CTX=("CLAUDE_CODE_MAX_CONTEXT_TOKENS=${CFG[context_tokens]}")
+  fi
   _DG_X_AUTHENV="${CFG[auth_env]}"
   _DG_X_KEY="$key"
   _DG_X_ARGS=("${claude_args[@]}")
@@ -1150,6 +1156,7 @@ dg_exec_child() {
     "ANTHROPIC_DEFAULT_SONNET_MODEL=$_DG_X_MODEL"
     "ANTHROPIC_DEFAULT_HAIKU_MODEL=$_DG_X_SMALL"
     "CLAUDE_CODE_SUBAGENT_MODEL=$_DG_X_SMALL"
+    ${_DG_X_CTX[@]+"${_DG_X_CTX[@]}"}
     # Last, so nothing above can shadow it.
     "${_DG_X_AUTHENV}=$_DG_X_KEY"
   )
