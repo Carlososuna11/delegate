@@ -349,7 +349,8 @@ Petición (claves desconocidas o repetidas se rechazan): `v` (1), `provider`, `r
 nunca una cadena de shell), `scope` (globs relativos a la raíz: `*` no cruza `/`,
 `**` cruza segmentos, una ruta sin comodín cubre todo lo que tiene debajo),
 `snapshot` (`false`), `wait` (`true`), `run_id` (lo elige quien llama, con la forma
-de siempre; si ya existe, exit 3 y no se crea nada).
+de siempre; si ya existe o lo reservó un cliente remoto, exit 3 y no se crea nada;
+con `--remote` se rechaza: el id lo elige el cliente).
 
 Salida: exit 0 solo con `completed`; 1 con cualquier otro status (el JSON dice cuál);
 2 si la petición o los argumentos son inválidos, y entonces no hay corrida ni stdout.
@@ -528,8 +529,10 @@ Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_
 `delegate-run --remote caracas < peticion.json` corre la misma petición en otro host.
 La petición es la de siempre, con `repo` local. El cliente:
 
-1. Valida la petición, elige el `run_id` y resuelve la base en el repo **local** con
-   las reglas de siempre (árbol sucio rechazado, `snapshot` congela el estado local).
+1. Valida la petición, elige un `run_id` nuevo (reservado con un archivo exclusivo en
+   `state/remote/`; una petición que trae `run_id` se rechaza) y resuelve la base en
+   el repo **local** con las reglas de siempre (árbol sucio rechazado, `snapshot`
+   congela el estado local).
 2. `ssh host delegate-run mirror <nombre>`: el host crea (la primera vez) o encuentra
    su mirror bare en `~/delegate/repos/<nombre>.git` (`DELEGATE_MIRROR_ROOT`). El
    nombre es `<basename>-<10 hex de la ruta absoluta>`.
@@ -537,15 +540,18 @@ La petición es la de siempre, con `repo` local. El cliente:
    forzado, nunca una rama del usuario.
 4. `ssh host delegate-run` con la petición por stdin: `repo` es el mirror, `base` el
    sha completo, `run_id` el del cliente.
-5. Trae `delegate/<run_id>` con un fetch sin `+` y verifica que sea un commit sobre
-   la base (si no, la borra y la corrida queda `infra_failed`). Guarda una copia del
+5. Trae `delegate/<run_id>` a una ref privada (`refs/delegate/fetch/<run_id>`, que no
+   puede existir antes), verifica que sea un commit sobre la base y recién ahí crea la
+   rama con un `update-ref` que solo crea y no sigue symrefs: una rama local existente
+   nunca se mueve. Si algo no cuadra, la corrida queda `infra_failed`. Guarda una copia del
    `result.json` en `runs/<run_id>/` con `host`, `remote_artifacts` y
    `remote_worktree`: `status`, `list`, `stats` (`by_host`), `cost` y `gc` la ven.
 
 **Corte de conexión:** nunca se reintenta a ciegas. Se consulta `delegate-run status
 <run_id>` con backoff; solo una corrida que el host no conoce (dos veces seguidas) se
 reenvía, hasta 3 veces, y un `run_id` repetido el host lo rechaza (exit 3), así que no
-hay duplicados. Sin contacto durante `DELEGATE_REMOTE_GIVEUP` (900 s) sale con 4 y
+hay duplicados. Un resultado con otro proveedor o base no se adopta, y `unreadable`
+se cree solo tras 3 consultas seguidas (así se ve también una corrida que arranca). Sin contacto durante `DELEGATE_REMOTE_GIVEUP` (900 s) sale con 4 y
 deja el registro en `state/remote/<run_id>.json`: `delegate-run fetch <run_id>` la
 recoge después. `--detach` devuelve el `run_id` apenas el host registra la corrida y
 corta la sesión a propósito (el runner ignora HUP y un stdout cerrado).
@@ -565,7 +571,8 @@ account <proveedor> add` ahí), nunca las de la laptop, y ninguna credencial de
 producción ni de Claude.
 
 Instalación: `scripts/install-remote.sh [host] [rev]` manda un `git bundle` del commit
-(nada sin commit, ni config, ni keys) por scp, lo deja en `~/delegate/src` (separado
+(nada sin commit, ni config, ni keys) por scp a un directorio de `mktemp` en el host,
+lo deja en `~/delegate/src` (separado
 de `~/delegate/repos`) y enlaza `delegate`, `dlg` y `delegate-run` en
 `~/.local/bin`, sin pisar un archivo que no sea un enlace. El ssh no interactivo de
 caracas encuentra `node`, `claude` y `~/.local/bin` por el bloque de arriba de su

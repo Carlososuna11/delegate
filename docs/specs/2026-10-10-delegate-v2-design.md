@@ -268,7 +268,10 @@ Uso y reglas en `CLAUDE.md`, "delegate-run remoto (Fase C)".
 - **El `run_id` lo elige el cliente** y viaja en la petición (`run_id`, opcional,
   misma forma). Es lo que permite preguntar `status` después de un corte, y el
   rechazo de un `run_id` existente (antes de escribir nada) hace imposible un
-  duplicado al reenviar.
+  duplicado al reenviar. Con `--remote` siempre es nuevo (una petición que lo trae
+  se rechaza) y se reserva con un archivo exclusivo: un id elegido a mano podía
+  nombrar una corrida vieja del host, y tras un corte `status` la habría devuelto
+  como propia. Además, un resultado con otro proveedor o base no se adopta.
 - **El host decide la ruta del mirror** (`delegate-run mirror <nombre>` responde la
   ruta): el cliente no conoce el HOME del host, y el `repo` de la petición remota
   siempre es un mirror, nunca una ruta elegida desde la laptop. El cliente valida la
@@ -283,8 +286,12 @@ Uso y reglas en `CLAUDE.md`, "delegate-run remoto (Fase C)".
 - **`--detach` es un corte deliberado**: el cliente manda la petición, espera a que
   `status` la vea y mata su ssh. No hace falta demonizar nada en el host: el runner
   ya sobrevive al corte (HUP ignorado, `_emit` y los avisos toleran un pipe cerrado).
-- **La rama traída se verifica**: exactamente un commit sobre la base pedida, sin
-  merge; si no, se borra y la corrida queda `infra_failed`. El fetch nunca fuerza.
+- **La rama traída se verifica antes de existir**: el fetch cae en una ref privada
+  que no puede existir antes (un fetch sin `+` igual avanza una rama por
+  fast-forward, y escribe a través de un symref); solo un commit exacto sobre la
+  base se publica, con un `update-ref` que solo crea y no dereferencia.
+- **Copia local atómica**: se arma en un directorio temporal y se renombra; un corte
+  a medias no deja una copia rota que bloquee `fetch`.
 - **Copia local con `host`** en `runs/<run_id>/`, y el registro pendiente aparte
   (`state/remote/<run_id>.json`) hasta que la corrida termina: así `status` y
   `stats` no ven como `abandoned` una corrida que sigue viva en el host.
@@ -294,6 +301,11 @@ Uso y reglas en `CLAUDE.md`, "delegate-run remoto (Fase C)".
 
 Límites: los logs (`stdout.log`, checks) quedan en el host; el mirror crece hasta el
 `gc` del host; un `gc` del host antes del `fetch` pierde la corrida para la laptop.
+Revisión adversarial (Codex `gpt-6-astra` xhigh): 8 hallazgos, los 8 corregidos con
+tests (fetch que podía avanzar una rama existente, adopción de una corrida ajena tras
+un corte, refs y temporales predecibles en el instalador, reserva no atómica del id,
+copia local no atómica, `unreadable` transitorio tomado como final, y un ssh falso
+que no cortaba de verdad).
 Smoke real contra caracas con el `delegate` falso (transporte, mirror, bwrap, checks,
 `--detach` con corte real de ssh y `fetch`): verde. El smoke con el modelo real queda
 pendiente de la key de DeepSeek en caracas.
