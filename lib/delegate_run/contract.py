@@ -5,8 +5,10 @@ it goes through the spec first.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -28,6 +30,13 @@ INVALID_RESULT = "invalid_result"  # the child's JSON output could not be parsed
 STATUSES = (COMPLETED, CHECKS_FAILED, TASK_FAILED, REJECTED, TIMED_OUT,
             CANCELLED, BUSY, INFRA_FAILED, INVALID_RESULT)
 RUNNING = "running"              # written while the run is alive; never final
+# Derived by `status`/`list`, never written by the runner: result.json still
+# says RUNNING but no process holds the run lock, so the runner died (SIGKILL,
+# OOM, reboot) before it could write a terminal status.
+ABANDONED = "abandoned"
+# Derived: a run directory whose result.json is missing or cannot be parsed
+# and whose runner is not alive.
+UNREADABLE = "unreadable"
 
 GRANTS = ("edit", "bash")
 
@@ -70,6 +79,10 @@ class Result:
     worktree: str | None = None
     child_exit: int | None = None
     model: str | None = None
+    # The account name the request asked for; None means delegate chose its
+    # default or active account. delegate-run never opens a key file, so it
+    # cannot report a key fingerprint (see the spec).
+    account: str | None = None
     grants: list[str] = field(default_factory=list)
     changed_files: list[dict] = field(default_factory=list)   # {"path": str, "change": "A"|"M"|"D"|"R"|"?"}
     scope_violation: list[str] = field(default_factory=list)
@@ -103,10 +116,41 @@ def new_run_id(now: float | None = None) -> str:
     return f"{stamp}-{secrets.token_hex(3)}"
 
 
+RUN_ID_RE = re.compile(r"\A[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\Z")
+
+
 def run_dir(run_id: str) -> Path:
-    if not run_id or "/" in run_id or run_id.startswith("."):
+    # Exact shape only: a run_id names a directory, a worktree and a branch,
+    # and arrives from argv in `status`, `cancel` and Fase C's ssh calls.
+    if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
         raise ValueError(f"run_id inválido: {run_id!r}")
     return state_root() / "runs" / run_id
+
+
+def lock_path(rd: Path) -> Path:
+    """The run lock: held (LOCK_EX) by the runner for its whole life."""
+    return rd / "lock"
+
+
+def runner_alive(rd: Path) -> bool:
+    """True while some process holds the run lock, i.e. the runner is alive.
+
+    flock is released by the kernel when the holder dies, however it dies, so
+    this cannot be fooled by a stale pid file.
+    """
+    try:
+        fd = os.open(lock_path(rd), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return False
 
 
 def write_json_atomic(path: Path, obj) -> None:
@@ -117,6 +161,8 @@ def write_json_atomic(path: Path, obj) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:
