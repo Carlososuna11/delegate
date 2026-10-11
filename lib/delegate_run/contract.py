@@ -46,6 +46,10 @@ class RequestError(ValueError):
     """A request that must be refused before anything runs. Message is for humans."""
 
 
+class RunExists(Exception):
+    """The request named a run_id that already has a run directory: no new run."""
+
+
 @dataclass(frozen=True)
 class Request:
     provider: str
@@ -60,6 +64,7 @@ class Request:
     scope: tuple[str, ...] = ()  # fnmatch globs, relative to the repo root; empty = anything
     snapshot: bool = False       # allow a dirty tree by committing it to a temp ref
     wait: bool = True            # wait for a free slot instead of returning BUSY
+    run_id: str | None = None    # chosen by the caller (remote client); None = generate
 
 
 @dataclass

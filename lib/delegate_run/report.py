@@ -158,6 +158,8 @@ def list_runs(limit: int = 20) -> list[dict]:
             "provider": result.get("provider"),
             "base": result.get("base"),
             "branch": result.get("branch"),
+            # Set on the local copy of a Fase C run; None for a local run.
+            "host": result.get("host"),
             "started_at": result.get("started_at"),
             "finished_at": result.get("finished_at"),
         }, (started, run_id)))
@@ -531,6 +533,7 @@ def stats(days: int = 7, provider: str | None = None, *,
     raw: dict[str, dict] = {}
     by_provider: dict[str, dict] = {}
     running = 0
+    hosts: dict[str, int] = {}
 
     for run_id in reversed(_run_ids()):
         result, alive = _observed(run_id)
@@ -542,6 +545,9 @@ def stats(days: int = 7, provider: str | None = None, *,
         if alive:
             running += 1
             continue
+        host = result.get("host")
+        host = host if isinstance(host, str) and host else "local"
+        hosts[host] = hosts.get(host, 0) + 1
         prov = result.get("provider") or "unknown"
         model = result.get("model") or "unknown"
         b = raw.setdefault(f"{prov}/{model}", _raw_bucket(prov, model))
@@ -561,6 +567,9 @@ def stats(days: int = 7, provider: str | None = None, *,
         "provider": provider,
         "runs": sum(g["runs"] for g in groups.values()),
         "running": running,
+        # Where the runs ran: "local", or the host of a Fase C run whose
+        # result was fetched (its local copy carries `host`).
+        "by_host": dict(sorted(hosts.items())),
         "by_provider_model": groups,
         "by_provider": providers,
         "cost_usd_estimate": {
@@ -676,6 +685,9 @@ def format_stats(out: dict) -> str:
     lines = [f"delegate-run stats: últimos {out['days']} días{scope}, "
              f"{out['runs']} corridas terminadas"
              + (f" ({out['running']} en curso, no cuentan)" if out["running"] else "")]
+    hosts = out.get("by_host") or {}
+    if set(hosts) - {"local"}:
+        lines.append("Dónde corrieron: " + ", ".join(f"{h} {n}" for h, n in hosts.items()))
     groups = out["by_provider_model"]
     if not groups:
         lines.append("sin corridas en el período")
@@ -799,8 +811,8 @@ def _gc_one(run_id: str, result: dict) -> dict:
         repo = None
 
     # gc only ever removes what the runner itself creates: the worktree at
-    # state_root()/worktrees/<run_id>, the branch delegate/<run_id> and the ref
-    # refs/delegate/snapshot/<run_id>. A result.json naming anything else is
+    # state_root()/worktrees/<run_id>, the branch delegate/<run_id> and the refs
+    # refs/delegate/snapshot/<run_id> and refs/delegate/base/<run_id>. A result.json naming anything else is
     # not followed, so an edited or corrupt file cannot point gc at the
     # user's own checkout or `main`.
     expected_wt = contract.state_root() / "worktrees" / run_id
@@ -815,7 +827,10 @@ def _gc_one(run_id: str, result: dict) -> dict:
 
     _remove_worktree(repo, expected_wt, errors)
     if repo:
-        for ref in (f"refs/heads/{branch}", f"refs/delegate/snapshot/{run_id}"):
+        # refs/delegate/base/<run_id> exists only in a Fase C mirror: the
+        # client pushed the base there so the remote run could resolve it.
+        for ref in (f"refs/heads/{branch}", f"refs/delegate/snapshot/{run_id}",
+                    f"refs/delegate/base/{run_id}"):
             # A symbolic ref here (a delegate with bash can write one) would
             # make `update-ref -d` delete its target, `main` included.
             # --no-deref deletes the name itself, whatever it holds.

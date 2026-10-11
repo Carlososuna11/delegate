@@ -134,8 +134,9 @@ class ListRunsTests(ReportTestBase):
                                      started_at=10.0, finished_at=20.0))
         row = report.list_runs()[0]
         self.assertEqual(set(row), {"run_id", "status", "alive", "provider", "base",
-                                    "branch", "started_at", "finished_at"})
+                                    "branch", "host", "started_at", "finished_at"})
         self.assertEqual(row["provider"], "qwen")
+        self.assertIsNone(row["host"])
         self.assertEqual(row["started_at"], 10.0)
 
     def test_lists_malformed_missing_and_running_results(self):

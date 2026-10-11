@@ -14,14 +14,14 @@ import json
 import os
 import re
 
-from .contract import GRANTS, SCHEMA_VERSION, Request, RequestError
+from .contract import GRANTS, RUN_ID_RE, SCHEMA_VERSION, Request, RequestError
 from .scope import ScopeError, compile_glob
 
 # Every key a request may carry. Anything else is refused by name so a typo
 # never silently becomes a default.
 _KNOWN_KEYS = frozenset({
     "v", "provider", "account", "repo", "base", "grants", "mcp",
-    "timeout", "task", "checks", "scope", "snapshot", "wait",
+    "timeout", "task", "checks", "scope", "snapshot", "wait", "run_id",
 })
 
 # Keys the dataclass has no default for: they must be present.
@@ -301,6 +301,20 @@ def _check_scope(obj: dict) -> tuple[str, ...]:
     return tuple(raw)
 
 
+def _check_run_id(obj: dict) -> str | None:
+    """An id chosen by the caller (Fase C: the client must know it to ask
+    `status` after a dropped connection). Same shape as a generated one; the
+    runner refuses it if a run with that id already exists."""
+    run_id = obj.get("run_id")
+    if run_id is None:
+        return None
+    if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
+        raise RequestError(
+            "'run_id' debe tener la forma YYYYMMDD-HHMMSS-<6 hex>, "
+            f"recibido {run_id!r}")
+    return run_id
+
+
 def parse_request(raw: bytes | str) -> Request:
     """Return a validated Request or raise RequestError. Never runs anything."""
     obj = _load(raw)
@@ -328,4 +342,5 @@ def parse_request(raw: bytes | str) -> Request:
         scope=_check_scope(obj),
         snapshot=_flag(obj, "snapshot", False),
         wait=_flag(obj, "wait", True),
+        run_id=_check_run_id(obj),
     )

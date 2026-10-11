@@ -480,13 +480,25 @@ def _wgit(worktree: Path, gitdir: str, args, extra: dict | None = None,
     return _git(worktree, [*pin, *args], env=_hardened_env(pin, extra), text=text)
 
 
-def _toplevel(repo: str) -> Path:
+def _toplevel(repo: str) -> tuple[Path, bool]:
+    """(root, bare): the work tree's top level, or a bare repository itself.
+
+    A bare repository is what Fase C runs against (the mirror on the remote
+    host): it has no working tree, so there is nothing dirty to check and the
+    base must name a commit it holds.
+    """
     if not os.path.isdir(repo):
         raise _Refused(f"'repo' no es un directorio: {repo}")
+    proc = _git(repo, ["rev-parse", "--is-bare-repository"], check=False)
+    if proc.returncode == 0 and proc.stdout.strip() == "true":
+        gitdir = _git(repo, ["rev-parse", "--absolute-git-dir"], check=False)
+        if gitdir.returncode != 0 or not gitdir.stdout.strip():
+            raise _Refused(f"no se pudo leer el repositorio bare {repo}")
+        return Path(gitdir.stdout.strip()), True
     proc = _git(repo, ["rev-parse", "--show-toplevel"], check=False)
     if proc.returncode != 0 or not proc.stdout.strip():
         raise _Refused(f"'repo' no es un árbol de trabajo de git: {repo}")
-    return Path(proc.stdout.strip())
+    return Path(proc.stdout.strip()), False
 
 
 def _rev(repo: Path, rev: str) -> str | None:
@@ -567,12 +579,30 @@ def _snapshot(repo: Path, head: str, run_id: str, rd: Path) -> str:
     return commit
 
 
-def _resolve_base(repo: Path, req: Request, run_id: str, rd: Path) -> str:
+_FULL_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
+
+def _resolve_base(repo: Path, req: Request, run_id: str, rd: Path,
+                  bare: bool = False) -> str:
     """The commit to run from. Refuses a dirty tree unless snapshot is asked.
 
     The working tree only matters when the base IS the checked-out commit:
     running from another commit never reads it, so its state is irrelevant.
+    A bare repository has no working tree: the base must be a full commit id
+    it holds (the remote client pushes it there first), never a name such as
+    HEAD or a branch, which would mean whatever the mirror happens to hold.
     """
+    if bare:
+        if req.snapshot:
+            raise _Refused("snapshot=true no aplica a un repositorio bare: no tiene "
+                           "árbol de trabajo")
+        if not _FULL_SHA_RE.match(req.base):
+            raise _Refused("con un repositorio bare la base tiene que ser el id completo "
+                           f"de un commit, recibido {req.base!r}")
+        sha = _rev(repo, req.base)
+        if sha != req.base:
+            raise _Refused(f"el commit base {req.base} no está en el repositorio")
+        return sha
     sha = _rev(repo, req.base)
     if sha is None:
         raise _Refused(f"no se pudo resolver la base {req.base!r} a un commit")
@@ -730,9 +760,22 @@ def _decide_sandbox(result: Result) -> bool:
     if mode == "bwrap":
         raise _Infra(f"DELEGATE_SANDBOX=bwrap, pero {why}")
     result.sandbox = "none"
-    sys.stderr.write(f"delegate-run: aviso: la corrida va SIN sandbox del sistema ({why}); "
-                     "DELEGATE_SANDBOX=bwrap la haría fallar en vez de seguir\n")
+    _warn(f"la corrida va SIN sandbox del sistema ({why}); "
+          "DELEGATE_SANDBOX=bwrap la haría fallar en vez de seguir")
     return False
+
+
+def _warn(message: str) -> None:
+    """A warning on stderr that never fails the run.
+
+    Over ssh (Fase C) the caller may be gone: writing to a closed pipe raises
+    EPIPE, and a warning nobody reads must not turn the run into infra_failed.
+    """
+    try:
+        sys.stderr.write(f"delegate-run: aviso: {message}\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def _sandbox_ro(worktree: Path, gitdir: str) -> list[str]:
@@ -944,9 +987,9 @@ def _run(req: Request, result: Result, run: _Run) -> None:
     rd = run.rd
     sandboxed = _decide_sandbox(result)
     _PINNED_GIT = _resolve("git")
-    repo = _toplevel(req.repo)
+    repo, bare = _toplevel(req.repo)
     run.check_stop()
-    base = _resolve_base(repo, req, result.run_id, rd)
+    base = _resolve_base(repo, req, result.run_id, rd, bare)
     result.base = base
 
     worktree = contract.state_root() / "worktrees" / result.run_id
@@ -1019,7 +1062,18 @@ def execute(req: Request) -> Result:
         os.umask(previous)
 
 
-def _new_run_dir() -> tuple[str, Path]:
+def _new_run_dir(requested: str | None = None) -> tuple[str, Path]:
+    if requested is not None:
+        # The caller chose the id so it can ask `status` after a dropped
+        # connection. An id already used is never reused or overwritten: the
+        # request is refused before anything is written (RunExists).
+        rd = contract.run_dir(requested)
+        rd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            rd.mkdir(mode=0o700)
+        except FileExistsError:
+            raise contract.RunExists(f"ya existe una corrida con run_id {requested}") from None
+        return requested, rd
     for _ in range(10):
         run_id = contract.new_run_id()
         rd = contract.run_dir(run_id)
@@ -1034,7 +1088,7 @@ def _new_run_dir() -> tuple[str, Path]:
 
 def _execute(req: Request) -> Result:
     global _PINNED_GIT
-    run_id, rd = _new_run_dir()
+    run_id, rd = _new_run_dir(req.run_id)
     # The run lock is taken before anything else is written, and held until
     # result.json is terminal: `status`, `cancel` and `gc` read liveness from
     # it, and the kernel drops it however the runner dies.

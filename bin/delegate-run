@@ -12,6 +12,9 @@ Códigos de salida:
   0  la corrida terminó en `completed` (o el subcomando funcionó)
   1  la corrida terminó con otro status (el JSON de stdout dice cuál)
   2  petición o argumentos inválidos: no se creó ninguna corrida, stdout vacío
+  3  la petición trae un run_id que ya existe: no se creó ninguna corrida
+  4  (--remote, fetch) no se pudo hablar con el host: la corrida puede seguir
+     viva; `delegate-run fetch <run_id>` la recoge después
 """
 import json
 import os
@@ -25,15 +28,18 @@ _LIB = os.path.join(os.path.dirname(os.path.dirname(_SELF)), "lib")
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 
-from delegate_run import contract, report, request, runner  # noqa: E402
+from delegate_run import contract, remote, report, request, runner  # noqa: E402
 
 USAGE = """uso: delegate-run < peticion.json
-       delegate-run status <run_id>
+       delegate-run --remote <host> [--detach] < peticion.json
+       delegate-run fetch <run_id> [--remote <host>]
+       delegate-run status <run_id> [--remote <host>]
        delegate-run list [--limit N]
        delegate-run cancel <run_id>
        delegate-run cost [--days N]
        delegate-run stats [--days N] [--provider P] [--json]
        delegate-run gc [--days N] [--dry-run]
+       delegate-run mirror <nombre>       (lado remoto; lo llama --remote)
 """
 
 
@@ -99,14 +105,39 @@ def _run_id(rest, command):
     return rest[0]
 
 
+def _run_id_and_options(rest, command, allowed):
+    """`<run_id> [options]`: the run_id first, then the options."""
+    if not rest:
+        raise _Usage(f"{command} necesita un run_id")
+    return _run_id(rest[:1], command), _options(rest[1:], allowed)
+
+
 def _cmd_run():
     raw = sys.stdin.buffer.read()
     try:
         req = request.parse_request(raw)
     except contract.RequestError as exc:
         return _error(str(exc))
-    result = runner.execute(req)
+    try:
+        result = runner.execute(req)
+    except contract.RunExists as exc:
+        return _error(str(exc), remote.EXIT_RUN_EXISTS)
     return _emit(result.to_json(), 0 if result.status == contract.COMPLETED else 1)
+
+
+def _remote_outcome(call):
+    try:
+        out, code = call()
+    except remote.RemoteError as exc:
+        return _error(str(exc), exc.code)
+    return _emit(out, code)
+
+
+def _cmd_remote(args):
+    opts = _options(args, {"--remote": str, "--detach": bool})
+    host = opts["--remote"]
+    raw = sys.stdin.buffer.read()
+    return _remote_outcome(lambda: remote.run_remote(raw, host, opts.get("--detach", False)))
 
 
 def main(argv):
@@ -117,12 +148,32 @@ def main(argv):
         if command in ("-h", "--help", "help"):
             sys.stdout.write(USAGE)
             return 0
+        if command == "--remote":
+            return _cmd_remote(argv)
         if command == "status":
-            run_id = _run_id(rest, command)
+            run_id, opts = _run_id_and_options(rest, command, {"--remote": str})
+            if "--remote" in opts:
+                try:
+                    out, code = remote.remote_status(run_id, opts["--remote"])
+                except remote.RemoteError as exc:
+                    return _error(str(exc), exc.code)
+                try:
+                    sys.stdout.buffer.write(out)
+                    sys.stdout.flush()
+                except BrokenPipeError:
+                    pass
+                return code
             try:
                 return _emit(report.status(run_id))
             except FileNotFoundError as exc:
                 return _error(str(exc), 1)
+        if command == "fetch":
+            run_id, opts = _run_id_and_options(rest, command, {"--remote": str})
+            return _remote_outcome(lambda: remote.fetch(run_id, opts.get("--remote")))
+        if command == "mirror":
+            if len(rest) != 1:
+                raise _Usage("mirror necesita exactamente un nombre")
+            return _remote_outcome(lambda: (remote.mirror(rest[0]), 0))
         if command == "list":
             opts = _options(rest, {"--limit": int})
             return _emit(report.list_runs(opts.get("--limit", 20)))
