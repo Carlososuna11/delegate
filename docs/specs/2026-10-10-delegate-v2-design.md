@@ -205,17 +205,40 @@ Límites conocidos:
 
 - Un SIGKILL al runner no se puede atrapar: el hijo sigue hasta el `--timeout` de
   `delegate` y la corrida queda `abandoned`.
-- Con `bash`, el delegado alcanza el `.git` compartido (refs, config) y cualquier
-  archivo del usuario; con `edit`, lo que permita el harness. El diff mide el
-  worktree, no la máquina. Los archivos ignorados no se miden ni se commitean.
+- Sin sandbox (`sandbox: "none"`), con `bash` el delegado alcanza el `.git`
+  compartido (refs, config) y cualquier archivo del usuario; con `edit`, lo que
+  permita el harness. Con bubblewrap (ver abajo) el gitdir es de solo lectura y del
+  home no se ve nada. El diff mide el worktree, no la máquina. Los archivos ignorados
+  no se miden ni se commitean.
 - Desde Claude Code 2.1.295 el harness ya no expone `Write` (`No such tool available:
   Write`) y `Edit` crea archivos nuevos cuando la ruta no existe. `delegate --edit` sigue
   otorgando `Write` por compatibilidad, pero el prompt le indica al modelo que cree
   archivos con `Edit`. Verificado con una corrida real que creó un archivo nuevo.
 - Con los filtros anulados después del hijo, un archivo LFS que el delegado modifique
   queda en la rama como contenido crudo, no como puntero.
-- La limpieza de procesos no es contención del kernel: un proceso que cambie de grupo
-  de procesos en cada fork todavía puede escaparse. Cerrarlo exige un cgroup.
+- Sin sandbox, la limpieza de procesos no es contención del kernel: un proceso que
+  cambie de grupo de procesos en cada fork todavía puede escaparse. Con bubblewrap
+  vive en un namespace de pid propio y muere cuando sale el harness.
+- Con sandbox siguen abiertos: la red (internet y servicios TCP de `localhost`;
+  restringirla al proveedor exige un proxy), la key en el environment del harness,
+  y los **checks**, que corren afuera con los permisos del usuario.
+
+### Sandbox (bubblewrap)
+
+Agregado después de cerrar la fase: el límite real pasa a ser el kernel, y los
+guardias de Bash y git quedan como defensa en profundidad. `DELEGATE_SANDBOX`
+(`auto`, `bwrap`, `off`) y el campo `sandbox` de `result.json`; detalle en
+`CLAUDE.md`, "Sandbox".
+
+- **La key queda fuera del sistema de archivos del sandbox.** `delegate` corre afuera,
+  lee la key de su archivo y solo su hijo entra a bubblewrap (`delegate --sandbox
+  bwrap`). Meter a `delegate` entero obligaba a montar el archivo de la key (y para
+  resolver la cuenta, el `key_dir` con las de otras cuentas).
+- **El gitdir en solo lectura**, montado después del worktree: el runner pasa el
+  común y el del worktree con `--sandbox-ro`. git lee; ninguna escritura llega al
+  repo del usuario.
+- **Seccomp contra los sockets unix**: la red compartida trae el espacio de sockets
+  abstractos del host, y por ahí se alcanzaba el X11 del usuario.
 
 ### Cómo verifica quien llama
 

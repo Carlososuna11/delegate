@@ -429,13 +429,66 @@ Reglas que el código cumple y los tests prueban:
   null si decidió delegate), no una huella.
 
 **Límites:** un SIGKILL al runner deja vivo al hijo hasta el `--timeout` de delegate y la
-corrida queda `abandoned`; `gc` la recoge pasadas 5 horas. Con `bash` el delegado
-alcanza el `.git` compartido (refs, config) y cualquier archivo del usuario: el diff y
-el scope miden el worktree, no la máquina. Los archivos ignorados por `.gitignore` ni se
-miden ni se commitean. Con los filtros anulados, un archivo LFS que el delegado modifique
-entra a la rama como contenido crudo, no como puntero. La limpieza de procesos no es
-contención del kernel: un proceso que cambie de grupo en cada fork todavía puede
-escaparse (haría falta un cgroup).
+corrida queda `abandoned`; `gc` la recoge pasadas 5 horas. Los archivos ignorados por
+`.gitignore` ni se miden ni se commitean. Con los filtros anulados, un archivo LFS que
+el delegado modifique entra a la rama como contenido crudo, no como puntero. **Sin
+sandbox** (`sandbox: "none"`): con `bash` el delegado alcanza el `.git` compartido
+(refs, config) y cualquier archivo del usuario, y la limpieza de procesos no es
+contención del kernel (un proceso que cambie de sesión en cada fork puede escaparse).
+Con sandbox esas dos cosas se cierran; lo que queda abierto está en "Sandbox".
+
+## Sandbox (bubblewrap)
+
+`delegate-run` corre al hijo de `delegate` (el harness y todo lo que lance) dentro de
+bubblewrap cuando está disponible. `DELEGATE_SANDBOX`: `auto` (default: bwrap si
+funciona; si no, sigue sin sandbox, lo avisa por stderr y deja `sandbox: "none"` en
+`result.json`), `bwrap` (sin bwrap usable la corrida es `infra_failed`, nunca un
+downgrade callado) u `off`. `result.json` trae `sandbox`: `bwrap`, `none` o `null` si
+la corrida terminó antes de decidirlo. Por debajo es `delegate --sandbox bwrap
+--sandbox-ro <gitdir>`, que también sirve fuera del runner.
+
+**Diseño de la key:** `delegate` corre **afuera** del sandbox, lee la key de su archivo
+600 como siempre, y solo su hijo entra. El `key_dir` nunca se monta (ni las keys de
+otras cuentas); la key cruza únicamente en el environment del hijo, igual que antes.
+
+Lo que ve el hijo:
+- `/usr` (y los symlinks `/bin`, `/lib*`) y `/etc` en solo lectura, `/proc` propio,
+  `/dev` mínimo, y del `/run` solo el archivo al que apunta `/etc/resolv.conf`.
+- `/tmp` y `HOME` como tmpfs privados: del home real no hay nada salvo lo que se monta
+  encima (el directorio del binario de `claude`, en solo lectura).
+- El worktree en escritura; el gitdir del repo (común y del worktree) en solo lectura,
+  montado **después**: git lee historia, pero ni una ref, ni la config, ni un hook del
+  repo del usuario se pueden escribir (un `git commit` adentro falla, y el runner hace
+  el suyo afuera). El directorio de stubs, en solo lectura.
+- Namespaces propios de usuario, montaje, pid, ipc, uts y cgroup; `--disable-userns`,
+  `--new-session` (sin TIOCSTI a la terminal) y `--die-with-parent`. Con el namespace
+  de pid, cuando el harness sale muere todo lo que dejó, también una cadena que cambia
+  de sesión en cada fork: probado sin el runner, con un control sin sandbox donde la
+  misma cadena sobrevive.
+- Seccomp: `socket(AF_UNIX)` y `socketpair` de datagramas fallan con `EAFNOSUPPORT`,
+  `io_uring_setup` con `ENOSYS`, y una arquitectura ajena mata al proceso. La red es
+  compartida y con ella el espacio de sockets unix **abstractos** del host: sin el
+  filtro, el sandbox se conectaba a `@/tmp/.X11-unix/X0`, y un X que admite al usuario
+  por uid (`SI:localuser`) lo aceptaba, que es teclear en una terminal de afuera.
+  Verificado con `xdpyinfo`. Filtro solo para x86_64 y aarch64; en otra arquitectura
+  `--sandbox bwrap` se rechaza.
+
+Lo que **no** cierra:
+- **La red no está restringida.** El hijo alcanza internet y cualquier servicio TCP de
+  `localhost` (una base local, un servidor de desarrollo). Restringirla al host del
+  proveedor exige un proxy y `--unshare-net`: trabajo futuro.
+- La key está en el environment del harness, dentro del sandbox: con `bash` el modelo
+  la lee de `/proc/self/environ` y, con la red abierta, puede mandarla a donde quiera.
+- **Los checks corren afuera**, con los permisos del usuario, y ejecutan código que
+  escribió el modelo (un `package.json`, un test). El sandbox confina al delegado, no
+  a lo que el runner corre después: trabajo futuro, correrlos con el mismo perfil.
+- `/usr` y `/etc` completos son legibles; las herramientas instaladas en el home
+  (nvm, cargo, `~/.local/bin`) no existen adentro, así que con `bash` un `npm test`
+  puede no correr ahí.
+- El worktree y el gitdir completo (todas las ramas y objetos del repo) son legibles.
+- Un bug del kernel en lo que sigue expuesto (namespaces, syscalls permitidas).
+- En una máquina sin bwrap (`sudo apt install bubblewrap`) y con `auto`, nada de esto
+  aplica: `sandbox: "none"` es la señal.
 
 Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_id>/`
 (`request.json`, `result.json`, `stdout.log`, `stderr.log`, `patch.diff`, `checks/`,
@@ -558,6 +611,14 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   o HUP entre el temporal y su borrado; un SIGKILL sí puede dejar uno con nombre de
   punto en `key_dir`, que es 700. `dg_account_load` rechaza, sin imprimir la key, lo
   mismo que `validate`, y un FIFO sin bloquearse.
+- Con bwrap usable, dentro del sandbox el hijo no lee un canario en `HOME`, ni el
+  archivo de la key, ni un archivo cualquiera fuera de los montajes; no escribe la
+  config, una ref, un hook ni el `HEAD` del gitdir; sí escribe el worktree y eso llega
+  a la rama; no crea sockets unix; no hereda descriptores aparte de 0, 1 y 2; y una
+  cadena que cambia de sesión en cada fork muere con el sandbox (con su control sin
+  sandbox, donde sobrevive). `auto` sin bwrap queda en `none`; `bwrap` sin bwrap es
+  `infra_failed` sin lanzar al hijo; un flag de sandbox inválido sale con 2 antes de
+  leer la key.
 
 ## Lo que NO se construye
 

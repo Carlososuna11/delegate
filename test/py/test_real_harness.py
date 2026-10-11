@@ -61,7 +61,7 @@ class RealHarnessSmoke(unittest.TestCase):
         out = json.loads(proc.stdout)
         detail = json.dumps({k: out.get(k) for k in
                              ("status", "error", "child_exit", "changed_files",
-                              "scope_violation", "checks", "model", "usage")},
+                              "scope_violation", "checks", "model", "usage", "sandbox")},
                             ensure_ascii=False)
         self.assertEqual(out["status"], "completed", detail)
         self.assertEqual(proc.returncode, 0)
@@ -70,6 +70,9 @@ class RealHarnessSmoke(unittest.TestCase):
         self.assertEqual(git("show", f"{out['branch']}:README.md").strip(), "hola test repo")
         self.assertEqual(git("status", "--porcelain"), "")
         self.assertIsNotNone(out["usage"], "the harness JSON carried no usage")
+        # On a machine where bwrap works, the default (auto) must have used it.
+        if os.environ.get("DELEGATE_SANDBOX", "auto") in ("auto", "bwrap") and shutil.which("bwrap"):
+            self.assertEqual(out["sandbox"], "bwrap", detail)
         print("\nreal smoke:", detail)
 
 

@@ -379,5 +379,42 @@ class SandboxConfinementTest(unittest.TestCase):
         self.assertFalse(probes["gitdir_writes"]["config"])
 
 
+class SandboxFlagsTest(unittest.TestCase):
+    """bin/delegate refuses bad sandbox flags with 2, before reading the key."""
+
+    def setUp(self):
+        SandboxConfinementTest.setUp(self)
+        # A key that would make a refusal-after-read visible: unreadable.
+        self.key_file.chmod(0o000)
+
+    def _delegate(self, *flags, workdir=None):
+        env = {"PATH": f"{self.tmp / 'bin'}:/usr/bin:/bin", "HOME": str(self.tmp / "home"),
+               "DELEGATE_PROVIDERS_DIR": str(self.tmp / "providers.d"),
+               "DELEGATE_MCP_DIR": str(self.tmp / "mcp.d")}
+        return subprocess.run([str(DELEGATE), "fake", *flags, "--dir",
+                               str(workdir or self.repo), "--", "x"],
+                              capture_output=True, env=env, timeout=30)
+
+    def test_unknown_mode_is_refused(self):
+        proc = self._delegate("--sandbox", "maybe")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    def test_read_only_path_without_sandbox_is_refused(self):
+        proc = self._delegate("--sandbox-ro", str(self.repo / ".git"))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    @unittest.skipIf(BWRAP_PROBLEM, f"bwrap no usable: {BWRAP_PROBLEM}")
+    def test_relative_or_missing_read_only_path_is_refused(self):
+        for path in ("repo/.git", str(self.tmp / "missing")):
+            proc = self._delegate("--sandbox", "bwrap", "--sandbox-ro", path)
+            self.assertEqual(proc.returncode, 2, (path, proc.stderr))
+
+    @unittest.skipIf(BWRAP_PROBLEM, f"bwrap no usable: {BWRAP_PROBLEM}")
+    def test_workdir_containing_home_is_refused(self):
+        proc = self._delegate("--sandbox", "bwrap", workdir=self.tmp)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn(b"HOME", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
