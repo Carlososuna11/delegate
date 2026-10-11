@@ -88,7 +88,7 @@ actual en una ref temporal y la usa de base.
   "run_id": "…",
   "status": "completed",
   "child_exit": 0,
-  "provider": "deepseek", "model": "…", "account_fingerprint": "ab12cd",
+  "provider": "deepseek", "model": "…", "account": null,
   "base": "<sha>", "branch": "delegate/<run_id>", "worktree": "…",
   "grants": ["edit", "bash"],
   "changed_files": [{"path": "src/a.ts", "change": "M"}],
@@ -97,7 +97,8 @@ actual en una ref temporal y la usa de base.
   "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
   "cost_usd_estimate": null,
   "report": "texto final del delegado",
-  "artifacts": "~/.local/state/delegate/runs/<run_id>"
+  "artifacts": "~/.local/state/delegate/runs/<run_id>",
+  "error": null, "started_at": 0.0, "finished_at": 0.0
 }
 ```
 
@@ -116,6 +117,69 @@ la tarifa) y se marca como estimación. `delegate-run cost [--days N]` suma los
 `delegate-run status <run_id>`, `delegate-run list`, `delegate-run cancel <run_id>`,
 `delegate-run gc --days N` (borra worktrees y ramas de corridas terminadas; nunca de
 una corrida viva).
+
+### Decisiones de implementación
+
+Lo que cambió respecto de lo de arriba al implementarlo, y por qué. El código y
+`CLAUDE.md` ("delegate-run") son la referencia de uso.
+
+- **Sin `account_fingerprint`.** Calcularla obliga a abrir la key, y el runner no la
+  abre nunca. El resultado trae `account`: el nombre pedido, o `null` si la eligió
+  `delegate` (cuenta por defecto o activa).
+- **Árbol sucio.** Cuenta como sucio también un árbol con solo archivos nuevos (con
+  `--untracked-files=all`, sin importar `status.showUntrackedFiles`). Solo importa
+  cuando la base es el commit actual: con otra base el árbol no se lee. El snapshot no
+  es `git stash create` (ignora los no rastreados): usa un índice temporal, incluye los
+  nuevos, respeta `.gitignore` y queda en `refs/delegate/snapshot/<run_id>`. Con otra
+  base que no sea `HEAD`, `snapshot` se rechaza.
+- **`rejected`** cubre también lo que el runner rechaza antes de lanzar al hijo (repo
+  que no es un árbol de git, base que no resuelve, árbol sucio); ahí `child_exit` es
+  `null`. Una petición mal formada no crea corrida: exit 2 y stdout vacío.
+- **`timed_out`** también cuando `delegate` sale con 124 (su propio `--timeout`);
+  **`task_failed`** también cuando el JSON del harness dice `is_error: true` con exit 0.
+- **Orden del ciclo.** Los cambios se miden y se congelan en un árbol (`write-tree`)
+  **antes** de los checks, y ese árbol es el que se commitea: lo que escriba un check
+  no llega a la rama. El commit es plumbing (`commit-tree` y un `update-ref` que solo
+  crea), sin hooks ni firma, y sin cambios no hay rama.
+- **Scope.** Globs por segmentos, no `fnmatch` (donde `src/*.ts` calzaba
+  `src/x/y.ts`): `*` y `?` no cruzan `/`, `**` sí, y una ruta sin comodín cubre lo que
+  tiene debajo. El diff es `-z` y `--no-renames`, así que los dos extremos de un rename
+  pasan por el scope y un nombre con salto de línea es una sola ruta.
+- **Procesos.** El grupo no alcanza: `delegate` corre el harness bajo `timeout`, que se
+  muda a otro grupo, y un nieto puede hacer `setsid`. El runner se hace subreaper
+  (`prctl`), deja al líder como zombie (`waitid` con `WNOWAIT`) para que su pid no se
+  recicle mientras limpia, y manda TERM, gracia y KILL al árbol completo más la sesión.
+  También limpia lo que quede después de una salida limpia.
+- **Cancelación** por un archivo marcador en el directorio de la corrida, que el runner
+  sondea; no se manda ninguna señal entre procesos por un pid guardado. TERM e INT al
+  runner cuentan como cancelación y HUP se ignora (Fase C: un corte de ssh no mata la
+  corrida).
+- **Vida de la corrida.** Un `flock` por corrida, tomado antes de escribir nada y
+  soltado después del `result.json` final. `status` y `list` derivan `abandoned`
+  (dice `running` y nadie tiene el lock) y `unreadable`; `gc` toma ese lock exclusivo
+  antes de decidir, y recoge una abandonada solo pasadas 5 horas (timeout máximo más
+  una hora), cuando el `--timeout` de `delegate` ya cortó lo que dejó.
+- **Checks** con un environment construido (`HOME`, `PATH` filtrado, locale, `TMPDIR`) y
+  un `PATH` sin entradas relativas ni dentro del worktree: corren código del modelo, y
+  los tokens de quien llama no tienen por qué verlo.
+- **Costo.** `total_cost_usd` del harness se ignora: pone precio de Anthropic a modelos
+  que no lo son (el harness mismo marca `costBasis: unknown`). Se estima por modelo con
+  `prices.tsv`; un modelo sin fila o un conteo ausente dejan `null`. El
+  `prices.tsv` de `~/.local/state/delegate/` gana sobre el del repo, que va sin precios.
+- **Perilla de tests.** `DELEGATE_RUN_WALL` reemplaza `timeout + 30 s`;
+  `DELEGATE_RUN_GRACE` y `DELEGATE_RUN_SLACK` acortan la gracia y el margen.
+
+Límites conocidos:
+
+- Un SIGKILL al runner no se puede atrapar: el hijo sigue hasta el `--timeout` de
+  `delegate` y la corrida queda `abandoned`.
+- Con `bash`, el delegado alcanza el `.git` compartido (refs, config) y cualquier
+  archivo del usuario; con `edit`, lo que permita el harness. El diff mide el
+  worktree, no la máquina. Los archivos ignorados no se miden ni se commitean.
+- Con Claude Code 2.1.295 el harness responde `No such tool available: Write` aunque
+  `delegate --edit` lo otorga: una corrida con `edit` y sin `bash` puede editar archivos
+  existentes pero no crear nuevos. Es un defecto de `delegate` frente a esa versión del
+  harness, no de `delegate-run`; el smoke real usa una edición por eso.
 
 ### Cómo verifica quien llama
 
@@ -136,7 +200,7 @@ Solo la interfaz, para que la fase B no la cierre:
 ## Tests
 
 - Fase A: un test por fila de la tabla, que falla contra `main`.
-- Fase B: tests de Python con `unittest` y un `claude` falso (como `test/isolation.test.sh`) que simula éxito, fallo, timeout que ignora SIGTERM, JSON roto, edición fuera de scope y archivos no rastreados.
+- Fase B: tests de Python con `unittest` y un `delegate` falso (`test/py/fake_delegate.py`) que simula éxito, fallo, rechazo, timeout que ignora SIGTERM, un nieto con `setsid` que sobrevive, JSON roto, edición fuera de scope, renombres, nombres con salto de línea y archivos no rastreados. `test/py/test_cli.py` maneja `bin/delegate-run` de punta a punta.
 - Una suite chica contra el harness real, opcional (`DELEGATE_REAL_HARNESS=1`), que prueba que el piso de solo lectura deniega escribir y que `--` corta el parseo.
 
 ## Review

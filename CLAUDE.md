@@ -95,8 +95,8 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
 
    **Límite:** un SIGKILL al proceso de la corrida no se puede atrapar. El hijo
    (`timeout` y el harness) sigue vivo hasta su timeout, y el directorio de stubs
-   queda en disco. Supervisar por grupo de procesos o cgroup le toca a `delegate-run`
-   (Fase B), no a este CLI.
+   queda en disco. Bajo `delegate-run` ese caso queda cubierto mientras el runner
+   viva: es subreaper y limpia el árbol completo (ver "delegate-run").
 6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
    y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
    variables de entorno, ni reescribir lo que la corrida fija. Una entrada declara
@@ -310,15 +310,95 @@ en un archivo de metadata no secreto, para no depender de estado global mutable.
 - Ningún comando imprime el contenido de una key. Lo más que muestra es una huella
   (prefijo de sha256).
 
+## delegate-run (Fase B)
+
+`bin/delegate-run` (Python 3 de la biblioteca estándar, `lib/delegate_run/`) envuelve a
+`delegate`, no lo reemplaza: corre una tarea que **edita** en un worktree aislado,
+mide él mismo qué cambió, corre los checks que pidió quien llama y deja el resultado en
+una rama. Diseño y decisiones: `docs/specs/2026-10-10-delegate-v2-design.md`, "Fase B".
+
+```
+delegate-run < peticion.json          # resultado JSON por stdout
+delegate-run status <run_id>          # el result.json tal como se ve ahora
+delegate-run list [--limit N]
+delegate-run cancel <run_id>          # espera a que la corrida escriba su status final
+delegate-run cost [--days N]
+delegate-run gc [--days N] [--dry-run]
+```
+
+Petición (claves desconocidas o repetidas se rechazan): `v` (1), `provider`, `repo`
+(ruta absoluta), `task`, y opcionales `base` (`HEAD`), `account`, `grants` (`edit`,
+`bash`), `mcp` (solo lectura), `timeout` (60–14400, 1800), `checks` (lista de argv,
+nunca una cadena de shell), `scope` (globs relativos a la raíz: `*` no cruza `/`,
+`**` cruza segmentos, una ruta sin comodín cubre todo lo que tiene debajo),
+`snapshot` (`false`), `wait` (`true`).
+
+Salida: exit 0 solo con `completed`; 1 con cualquier otro status (el JSON dice cuál);
+2 si la petición o los argumentos son inválidos, y entonces no hay corrida ni stdout.
+`status`: `completed`, `checks_failed`, `task_failed` (exit distinto de 0, o
+`is_error` del harness), `rejected` (delegate salió con 2 —`child_exit` 2— o el runner
+rechazó repo, base o árbol sucio —`child_exit` null—), `timed_out` (el reloj del
+runner o el `--timeout` de delegate, exit 124), `cancelled`, `busy`, `infra_failed`,
+`invalid_result`. `status`/`list` derivan además `abandoned` (dice `running` y nadie
+tiene el lock) y `unreadable`.
+
+**Quien llama acepta un resultado solo si** `status` es `completed`, `scope_violation`
+está vacío, lee el diff de `delegate/<run_id>` él mismo y vuelve a correr los checks
+antes de integrar. `report` es lo que dice el modelo: evidencia, no autorización.
+`scope_violation` no cambia el `status`; hay que mirar los dos.
+
+Reglas que el código cumple y los tests prueban:
+
+- Un árbol sucio, **incluidos los archivos nuevos**, se rechaza cuando la base es el
+  commit actual. `snapshot: true` lo congela con un índice temporal en
+  `refs/delegate/snapshot/<run_id>` sin tocar el índice ni el árbol del usuario. Con
+  otra base el árbol no se lee, así que no importa si está sucio.
+- Los cambios se miden contra la base con `-z` y sin detección de renombres: los dos
+  extremos de un rename pasan por el scope. Lo que el delegado haya commiteado da igual.
+- La rama es plumbing (`commit-tree` + `update-ref` que solo crea): sin hooks, sin firma,
+  autor `delegate <proveedor>`, padre la base. Lo que escriban los checks no llega a la
+  rama. Sin cambios no hay rama.
+- Los checks corren con un environment construido (sin tokens del que llama) y un `PATH`
+  sin entradas relativas ni dentro del worktree. Ejecutan código que escribió el modelo
+  con los permisos del usuario: el environment se limpia, los archivos no se confinan.
+- Procesos: el hijo corre en su propia sesión, el runner se hace subreaper y al terminar
+  (bien, por timeout o por cancelación) manda TERM a todo el árbol y a la sesión, espera
+  la gracia y manda KILL. TERM o INT al runner cuentan como cancelación; HUP se ignora.
+- Un lock por corrida (`flock`, lo suelta el kernel) dice si el runner vive. `gc` lo toma
+  exclusivo antes de decidir y nunca borra algo distinto de `worktrees/<run_id>`,
+  `delegate/<run_id>` y la ref del snapshot.
+- El costo sale de `prices.tsv` (el de `~/.local/state/delegate/` gana sobre el del
+  repo, que va sin precios). `total_cost_usd` del harness se ignora: pone precios de
+  Anthropic a modelos que no lo son. Sin precio o sin uso, `null`, nunca 0.
+- El runner nunca abre una key. Por eso el resultado trae `account` (la cuenta pedida, o
+  null si decidió delegate), no una huella.
+
+**Límites:** un SIGKILL al runner deja vivo al hijo hasta el `--timeout` de delegate y la
+corrida queda `abandoned`; `gc` la recoge pasadas 5 horas. Con `bash` el delegado
+alcanza el `.git` compartido (refs, config) y cualquier archivo del usuario: el diff y
+el scope miden el worktree, no la máquina. Los archivos ignorados por `.gitignore` ni se
+miden ni se commitean.
+
+Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_id>/`
+(`request.json`, `result.json`, `stdout.log`, `stderr.log`, `patch.diff`, `checks/`,
+`lock`), `worktrees/<run_id>/` y `slots/` (`DELEGATE_SLOTS`, 2 por defecto).
+
 ## Lenguaje
 
 Bash, sin dependencias de runtime. Esto es construir un environment y hacer `exec`.
+`delegate-run` es la excepción prevista: supervisar, medir un diff y escribir JSON
+atómico es justo el caso de Python, y no toca la key.
 
 Python convendría si creciera hacia clientes HTTP portables, transformación de salida
 JSON estructurada o manejo atómico de cuentas multiplataforma. Hoy un rewrite agregaría
 riesgo de migración sin fortalecer el manejo de la key, que es lo que importa.
 
 ## Tests
+
+`test/run.sh` corre todas las suites, incluida la de Python (`test/py.test.sh`:
+`python3 -m unittest discover -s test/py -t .`). `delegate-run` se prueba con un
+`delegate` falso (`test/py/fake_delegate.py`); el smoke contra el proveedor real corre
+solo con `DELEGATE_REAL_HARNESS=1`.
 
 Los invariantes son testeables y en los scripts originales no estaban testeados. Mínimo:
 
