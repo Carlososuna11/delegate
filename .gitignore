@@ -1,2 +1,6 @@
 # Artefactos locales
 providers.d/*.local.conf
+
+# Python
+__pycache__/
+*.pyc
