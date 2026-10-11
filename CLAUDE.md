@@ -330,8 +330,15 @@ delegate-run status <run_id>          # el result.json tal como se ve ahora
 delegate-run list [--limit N]
 delegate-run cancel <run_id>          # espera a que la corrida escriba su status final
 delegate-run cost [--days N]
+delegate-run stats [--days N] [--provider P] [--json]   # tabla legible; JSON con --json
 delegate-run gc [--days N] [--dry-run]
 ```
+
+`stats` da, por proveedor/modelo y por proveedor, corridas, estados, éxito al primer
+intento, duración p50/p90, turnos, tokens, costo conocido (y cuántas corridas no lo
+tienen), archivos por corrida y corridas fuera de scope. Qué mide cada columna y
+cómo compararlo con el gasto del modelo principal (`ccusage`):
+`docs/medir-delegacion.md`.
 
 Petición (claves desconocidas o repetidas se rechazan): `v` (1), `provider`, `repo`
 (ruta absoluta), `task`, y opcionales `base` (`HEAD`), `account`, `grants` (`edit`,
@@ -402,10 +409,22 @@ Reglas que el código cumple y los tests prueban:
   plantado no arrastra a `main`), no sigue un symlink en `worktrees/<run_id>` y no
   corre `git worktree prune` (barre registros ajenos).
 - El costo sale de `prices.tsv` (el de `~/.local/state/delegate/` gana sobre el del
-  repo, que va sin precios). `total_cost_usd` del harness se ignora: pone precios de
-  Anthropic a modelos que no lo son. Sin precio o sin uso, `null`, nunca 0. `cost`
-  recalcula una corrida sin costo con la misma regla, desde el `modelUsage` de su
-  `stdout.log`: si un modelo no tiene precio, sigue `null`.
+  repo). `total_cost_usd` del harness se ignora: pone precios de Anthropic a modelos
+  que no lo son. Sin precio o sin uso, `null`, nunca 0. `cost` y `stats` recalculan
+  una corrida sin costo con la misma regla, desde el `modelUsage` de su
+  `stdout.log` y a la hora en que arrancó: si un modelo no tiene precio, sigue
+  `null`.
+- `prices.tsv` lleva solo precios copiados de la página oficial, con su URL
+  (`source`) y la fecha en que se copiaron (`as_of`). Los cuatro precios son los de
+  hora pico; `peak_utc` (`mon-fri 01-04,06-10`) y `offpeak_factor` describen la
+  tarifa por franja (DeepSeek cobra la mitad fuera de pico). Sin hora de inicio se
+  usa el precio pico. `model` es la clave de `modelUsage` tal cual, con `[1m]`.
+  Qwen (Token Plan) no tiene fila: cobra créditos de una suscripción sin tasa por
+  token publicada. **Al cambiar una tarifa:** abre la página de `source`, corrige
+  los números y `as_of` en la fila (y el comentario de arriba), y corre
+  `test/py.test.sh`. Un modelo nuevo en `providers.d/` necesita su fila, o sus
+  corridas quedan sin costo. Las corridas ya terminadas guardan el costo con el que
+  se cerraron; solo las que quedaron en `null` se recalculan con la tabla nueva.
 - El runner nunca abre una key. Por eso el resultado trae `account` (la cuenta pedida, o
   null si decidió delegate), no una huella.
 

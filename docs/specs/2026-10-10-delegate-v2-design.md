@@ -98,9 +98,15 @@ actual en una ref temporal y la usa de base.
   "cost_usd_estimate": null,
   "report": "texto final del delegado",
   "artifacts": "~/.local/state/delegate/runs/<run_id>",
-  "error": null, "started_at": 0.0, "finished_at": 0.0
+  "error": null, "started_at": 0.0, "finished_at": 0.0,
+  "duration_seconds": 0.0, "num_turns": 3, "harness_seconds": 6.8
 }
 ```
+
+`duration_seconds` (derivado de `finished_at - started_at`), `num_turns` y
+`harness_seconds` (`num_turns` y `duration_ms` del JSON del harness; `null` si no los
+trae) se agregaron después, sin cambiar `v`: un lector de la v1 que ignore claves
+desconocidas sigue sirviendo.
 
 `status`: `completed` (exit 0 y todos los checks en 0), `checks_failed`, `task_failed`
 (exit distinto de 0), `rejected` (`delegate` salió con 2: flags o config), `timed_out`,
@@ -115,6 +121,8 @@ la tarifa) y se marca como estimación. `delegate-run cost [--days N]` suma los
 ### Otros subcomandos
 
 `delegate-run status <run_id>`, `delegate-run list`, `delegate-run cancel <run_id>`,
+`delegate-run stats [--days N] [--provider P] [--json]` (métricas por proveedor y
+modelo para decidir si delegar paga; ver `docs/medir-delegacion.md`),
 `delegate-run gc --days N` (borra worktrees y ramas de corridas terminadas; nunca de
 una corrida viva).
 
@@ -184,7 +192,9 @@ Lo que cambió respecto de lo de arriba al implementarlo, y por qué. El código
 - **Costo.** `total_cost_usd` del harness se ignora: pone precio de Anthropic a modelos
   que no lo son (el harness mismo marca `costBasis: unknown`). Se estima por modelo con
   `prices.tsv`; un modelo sin fila o un conteo ausente dejan `null`. El
-  `prices.tsv` de `~/.local/state/delegate/` gana sobre el del repo, que va sin precios.
+  `prices.tsv` de `~/.local/state/delegate/` gana sobre el del repo, que lleva solo
+  precios copiados de la página oficial, con `source` y `as_of` por fila, y la
+  tarifa por franja horaria cuando el proveedor la tiene.
   `cost` recalcula con la misma regla desde el `modelUsage` de `stdout.log`.
 - **JSON en ASCII** (`ensure_ascii`), en disco y en stdout: los nombres no UTF-8 viajan
   como `surrogateescape` y un surrogate suelto del harness no rompe el resultado final.
