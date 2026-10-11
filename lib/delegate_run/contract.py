@@ -95,11 +95,19 @@ class Result:
     started_at: float | None = None
     finished_at: float | None = None
     artifacts: str | None = None
+    # From the harness JSON; None when it did not say. Additive to schema v1.
+    num_turns: int | None = None
+    harness_seconds: float | None = None  # the harness's own duration_ms / 1000
     v: int = SCHEMA_VERSION
 
     def to_json(self) -> dict:
         d = dict(self.__dict__)
         d["checks"] = [c.__dict__ for c in self.checks]
+        # Wall time of the whole run (slot wait, child and checks); derived,
+        # so it can never disagree with the two timestamps.
+        d["duration_seconds"] = (self.finished_at - self.started_at
+                                 if self.started_at is not None
+                                 and self.finished_at is not None else None)
         return d
 
 

@@ -52,6 +52,8 @@ RESULT = {
         "cache_creation_input_tokens": 2,
     },
     "total_cost_usd": 0.0123,
+    "num_turns": 2,
+    "duration_ms": 1500,
     "modelUsage": {
         "small-model": {"inputTokens": 2, "outputTokens": 1,
                         "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},

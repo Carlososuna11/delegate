@@ -32,6 +32,7 @@ USAGE = """uso: delegate-run < peticion.json
        delegate-run list [--limit N]
        delegate-run cancel <run_id>
        delegate-run cost [--days N]
+       delegate-run stats [--days N] [--provider P] [--json]
        delegate-run gc [--days N] [--dry-run]
 """
 
@@ -73,6 +74,12 @@ def _options(args, allowed):
             continue
         if i + 1 >= len(args):
             raise _Usage(f"{name} necesita un valor")
+        if kind is str:
+            if not args[i + 1] or args[i + 1].startswith("-"):
+                raise _Usage(f"{name} necesita un valor")
+            out[name] = args[i + 1]
+            i += 2
+            continue
         try:
             value = int(args[i + 1])
         except ValueError:
@@ -128,6 +135,21 @@ def main(argv):
                 return _emit(report.cost(opts.get("--days", 7)))
             except ValueError as exc:  # a malformed prices.tsv
                 return _error(str(exc), 1)
+        if command == "stats":
+            opts = _options(rest, {"--days": int, "--provider": str, "--json": bool})
+            try:
+                out = report.stats(opts.get("--days", 7), opts.get("--provider"))
+            except ValueError as exc:  # a malformed prices.tsv
+                return _error(str(exc), 1)
+            if opts.get("--json"):
+                return _emit(out)
+            try:
+                # Bytes: the report has accents and the locale may be C.
+                sys.stdout.buffer.write(report.format_stats(out).encode("utf-8"))
+                sys.stdout.flush()
+            except BrokenPipeError:
+                pass
+            return 0
         if command == "gc":
             opts = _options(rest, {"--days": int, "--dry-run": bool})
             return _emit(report.gc(opts.get("--days", 14),

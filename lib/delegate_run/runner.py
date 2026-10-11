@@ -758,6 +758,9 @@ def _apply_harness_json(result: Result, rd: Path) -> bool:
             return sum(_count(u.get(k)) or 0 for k in ("inputTokens", "outputTokens"))
         result.model = max(models.items(), key=weight)[0]
     result.cost_usd_estimate = _estimate(result, models)
+    result.num_turns = _count(data.get("num_turns"))
+    duration_ms = _count(data.get("duration_ms"))
+    result.harness_seconds = None if duration_ms is None else duration_ms / 1000
     if data.get("is_error") is True:
         result.error = "el harness reportó is_error=true"
     return True
@@ -770,7 +773,7 @@ def _estimate(result: Result, model_usage) -> float | None:
     except ValueError:
         return None
     return _report.estimate_cost(result.provider, result.model, result.usage,
-                                 model_usage, prices)
+                                 model_usage, prices, at=result.started_at)
 
 
 # --- checks -----------------------------------------------------------------

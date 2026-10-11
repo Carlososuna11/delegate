@@ -333,9 +333,38 @@ class CliTest(unittest.TestCase):
         code, cost, _ = self.sub("cost", "--days", "1")
         self.assertEqual(code, 0)
         self.assertEqual(cost["runs"], 2)
-        # No price rows shipped: unknown, and said so.
+        # The fake's models have no price row: unknown, and said so.
         self.assertIsNone(cost["total_cost_usd_estimate"])
         self.assertIn("cota inferior", cost["note"])
+
+    def test_stats_json_and_table(self):
+        self.run_cli(self.request())
+        self.run_cli(self.request(), "fail")
+        code, out, _ = self.sub("stats", "--days", "1", "--json")
+        self.assertEqual(code, 0)
+        group = out["by_provider_model"]["deepseek/deepseek-chat"]
+        self.assertEqual(group["status"], {contract.COMPLETED: 1})
+        self.assertEqual(group["num_turns"]["median"], 2)
+        # The failed run has no harness JSON, so no model: the provider
+        # rollup is where its failure still counts.
+        self.assertEqual(out["by_provider_model"]["deepseek/unknown"]["status"],
+                         {contract.TASK_FAILED: 1})
+        rollup = out["by_provider"]["deepseek"]
+        self.assertEqual(rollup["runs"], 2)
+        self.assertEqual(rollup["first_try_success_rate"], 0.5)
+        self.assertIsNone(out["cost_usd_estimate"]["known_total"])
+        self.assertEqual(out["cost_usd_estimate"]["unknown_runs"], 2)
+        code, out, _ = self.sub("stats", "--provider", "qwen", "--json")
+        self.assertEqual((code, out["runs"]), (0, 0))
+        proc = subprocess.run([str(BIN), "stats"], capture_output=True, env=self.env,
+                              timeout=60)
+        self.assertEqual(proc.returncode, 0)
+        text = proc.stdout.decode("utf-8")
+        self.assertIn("deepseek/deepseek-chat", text)
+        self.assertIn("cota inferior", text)
+        for bad in (["--provider"], ["--provider", "--json"], ["--days", "x"], ["--nope"]):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.sub("stats", *bad)[0], 2)
 
     def test_list_shows_a_live_run_as_running(self):
         proc = self.start_cli(self.request(timeout=300), "sleep")

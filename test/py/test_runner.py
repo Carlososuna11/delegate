@@ -130,8 +130,13 @@ class RunnerTest(RunnerBase):
         # The main model, not the first key of modelUsage.
         self.assertEqual(result.model, "deepseek-chat")
         # The harness's total_cost_usd uses Anthropic prices: never trusted.
-        # The shipped price table is empty, so the estimate is unknown.
+        # The shipped price table has no row for these models: unknown.
         self.assertIsNone(result.cost_usd_estimate)
+        self.assertEqual(result.num_turns, 2)
+        self.assertEqual(result.harness_seconds, 1.5)
+        out = result.to_json()
+        self.assertAlmostEqual(out["duration_seconds"],
+                               result.finished_at - result.started_at)
 
     def test_cost_comes_from_the_price_table(self):
         header = ("provider\tmodel\tinput_per_mtok\toutput_per_mtok\t"

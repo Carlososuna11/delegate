@@ -208,10 +208,15 @@ class PricesTests(ReportTestBase):
         with self.assertRaises(ValueError):
             report.load_prices(path)
 
-    def test_shipped_table_loads_and_has_no_invented_prices(self):
-        rows = report.load_prices()
-        self.assertEqual(rows, {})
-        self.assertTrue(report.PRICES_PATH.is_file())
+    def test_shipped_table_says_where_every_price_comes_from(self):
+        rows = report.load_prices(report.PRICES_PATH)
+        self.assertIn(("deepseek", "deepseek-flash[1m]"), rows)
+        for key, row in rows.items():
+            with self.subTest(key=key):
+                self.assertTrue(row["source"].startswith("https://"))
+                self.assertRegex(row["as_of"], r"^\d{4}-\d{2}-\d{2}$")
+        # Qwen's Token Plan bills credits with no published per-token rate.
+        self.assertFalse([k for k in rows if k[0] == "qwen"])
 
 
 class CostTests(ReportTestBase):
@@ -576,3 +581,230 @@ class CostRepricingTests(ReportTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+HEADER_V2 = HEADER + "\tsource\tpeak_utc\toffpeak_factor"
+URL = "https://example.com/pricing"
+WED_PEAK = 1791358200.0       # Wednesday 2026-10-07 07:30 UTC
+WED_OFFPEAK = 1791374400.0    # Wednesday 2026-10-07 12:00 UTC
+WED_PEAK_END = 1791367200.0   # Wednesday 2026-10-07 10:00 UTC: end is exclusive
+SAT_MORNING = 1791617400.0    # Saturday 2026-10-10 07:30 UTC
+
+
+class PricesV2Tests(ReportTestBase):
+    def table(self, *rows):
+        p = Path(self.tmp.name) / "p.tsv"
+        p.write_text(HEADER_V2 + "\n" + "".join(r + "\n" for r in rows), encoding="utf-8")
+        return p
+
+    def test_parses_source_and_schedule(self):
+        p = self.table(f"ds\tflash\t0.3\t1.2\t0.006\t0.3\t2026-10-10\t{URL}"
+                       "\tmon-fri 01-04,06-10\t0.5",
+                       f"q\tm\t1\t1\t1\t1\t2026-10-10\t{URL}\t-\t-")
+        rows = report.load_prices(p)
+        flash = rows[("ds", "flash")]
+        self.assertEqual(flash["source"], URL)
+        self.assertEqual(flash["peak_utc"], (frozenset(range(5)), ((1, 4), (6, 10))))
+        self.assertEqual(flash["offpeak_factor"], 0.5)
+        self.assertIsNone(rows[("q", "m")]["peak_utc"])
+
+    def test_legacy_header_still_loads(self):
+        p = Path(self.tmp.name) / "p.tsv"
+        p.write_text(HEADER + "\nds\tm\t1\t1\t1\t1\t2026-01-01\n", encoding="utf-8")
+        row = report.load_prices(p)[("ds", "m")]
+        self.assertIsNone(row["source"])
+        self.assertIsNone(row["peak_utc"])
+
+    def test_rejects_bad_v2_rows(self):
+        base = "ds\tm\t1\t1\t1\t1\t2026-10-10\t"
+        for row in (base + "\t-\t-",                               # no source
+                    base + "http://x.example\t-\t-",               # not https
+                    base + f"{URL}\tmon-fri 01-04\t-",             # half a schedule
+                    base + f"{URL}\t-\t0.5",
+                    base + f"{URL}\tmon-fri 01-04\t0",             # factor out of (0, 1]
+                    base + f"{URL}\tmon-fri 01-04\t1.5",
+                    base + f"{URL}\tmon-fri 01-04\tnan",
+                    base + f"{URL}\tfri-mon 01-04\t0.5",           # reversed days
+                    base + f"{URL}\tmonday 01-04\t0.5",
+                    base + f"{URL}\tmon-fri 04-01\t0.5",           # reversed hours
+                    base + f"{URL}\tmon-fri 01-25\t0.5",
+                    base + f"{URL}\tmon-fri\t0.5",
+                    base + f"{URL}\t-"):                            # column missing
+            with self.subTest(row=row):
+                with self.assertRaises(ValueError):
+                    report.load_prices(self.table(row))
+
+
+class PeakPricingTests(unittest.TestCase):
+    ROW = {"input_per_mtok": 0.3, "output_per_mtok": 1.2, "cache_read_per_mtok": 0.006,
+           "cache_write_per_mtok": 0.3, "as_of": "2026-10-10", "source": URL,
+           "peak_utc": (frozenset(range(5)), ((1, 4), (6, 10))), "offpeak_factor": 0.5}
+    PRICES = {("deepseek", "deepseek-flash[1m]"): ROW}
+    USAGE = {"input": 1_000_000, "output": 1_000_000, "cache_read": 1_000_000,
+             "cache_write": 0}
+    PEAK = 0.3 + 1.2 + 0.006
+
+    def cost(self, at):
+        return report.estimate_cost("deepseek", "deepseek-flash[1m]", self.USAGE, None,
+                                    self.PRICES, at=at)
+
+    def test_peak_window_on_a_weekday(self):
+        self.assertAlmostEqual(self.cost(WED_PEAK), self.PEAK)
+
+    def test_off_peak_is_the_factor(self):
+        self.assertAlmostEqual(self.cost(WED_OFFPEAK), self.PEAK / 2)
+        self.assertAlmostEqual(self.cost(WED_PEAK_END), self.PEAK / 2)
+
+    def test_weekend_is_off_peak_all_day(self):
+        self.assertAlmostEqual(self.cost(SAT_MORNING), self.PEAK / 2)
+
+    def test_unknown_time_is_priced_at_peak(self):
+        # Never under-estimate: without a start time the higher price applies.
+        self.assertAlmostEqual(self.cost(None), self.PEAK)
+
+    def test_per_model_breakdown_uses_the_time_too(self):
+        per = {"inputTokens": 1_000_000, "outputTokens": 0, "cacheReadInputTokens": 0,
+               "cacheCreationInputTokens": 0}
+        got = report.estimate_cost("deepseek", None, None, {"deepseek-flash[1m]": per},
+                                   self.PRICES, at=SAT_MORNING)
+        self.assertAlmostEqual(got, 0.15)
+
+
+class StatsTests(ReportTestBase):
+    """Synthetic result.json fixtures; nothing runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.prices = Path(self.tmp.name) / "fixture-prices.tsv"
+        self.prices.write_text(
+            HEADER_V2 + "\n"
+            f"deepseek\tflash\t1\t2\t0.1\t1\t2026-10-10\t{URL}\t-\t-\n",
+            encoding="utf-8")
+        self.now = time.time()
+        self.seq = 0
+
+    def add(self, provider="deepseek", model="flash", status=contract.COMPLETED,
+            age_days=0.0, seconds=100.0, usage="default", files=1, scope=(),
+            cost=None, turns=None):
+        self.seq += 1
+        run_id = f"20260101-0000{self.seq:02d}-{self.seq:06x}"
+        started = self.now - age_days * 86400 - 1000
+        if usage == "default":
+            usage = {"input": 1_000_000, "output": 500_000, "cache_read": 2_000_000,
+                     "cache_write": 0}
+        r = self.result(run_id, provider=provider, model=model, status=status,
+                        started_at=started, finished_at=started + seconds, usage=usage,
+                        changed_files=[{"path": f"f{i}", "change": "M"} for i in range(files)],
+                        scope_violation=list(scope), cost_usd_estimate=cost)
+        if turns is not None:
+            r["num_turns"] = turns
+        write_run(run_id, result=r)
+        return run_id
+
+    def stats(self, **kw):
+        return report.stats(prices_path=self.prices, **kw)
+
+    def test_mixed_providers_statuses_and_rates(self):
+        self.add(seconds=60, turns=4)
+        self.add(seconds=120, status=contract.CHECKS_FAILED, files=3, turns=6)
+        self.add(seconds=600, status=contract.TIMED_OUT, scope=("x.txt",))
+        self.add(provider="qwen", model="qwen3.8-max", seconds=300)
+        out = self.stats(days=7)
+        self.assertEqual(out["runs"], 4)
+        ds = out["by_provider_model"]["deepseek/flash"]
+        self.assertEqual(ds["runs"], 3)
+        self.assertEqual(ds["status"], {contract.CHECKS_FAILED: 1, contract.COMPLETED: 1,
+                                        contract.TIMED_OUT: 1})
+        self.assertAlmostEqual(ds["first_try_success_rate"], 1 / 3)
+        self.assertAlmostEqual(ds["duration_seconds"]["median"], 120)
+        self.assertAlmostEqual(ds["duration_seconds"]["p90"], 600)
+        self.assertEqual(ds["num_turns"], {"median": 5, "known_runs": 2})
+        self.assertAlmostEqual(ds["files_changed_per_run"], 5 / 3)
+        self.assertEqual(ds["scope_violation_runs"], 1)
+        self.assertEqual(ds["tokens"]["input"], {"total": 3_000_000, "per_run": 1_000_000})
+        # 1 + 1 + 0.2 = 2.2 per run at the fixture prices.
+        self.assertAlmostEqual(ds["cost_usd_estimate"]["known_total"], 6.6)
+        self.assertAlmostEqual(ds["cost_usd_estimate"]["per_run"], 2.2)
+        self.assertEqual(out["by_provider"]["deepseek"]["runs"], 3)
+        qw = out["by_provider_model"]["qwen/qwen3.8-max"]
+        self.assertEqual(qw["first_try_success_rate"], 1.0)
+
+    def test_unknown_model_price_is_never_zero(self):
+        self.add()
+        self.add(provider="qwen", model="qwen3.8-max")
+        out = self.stats(days=7)
+        qw = out["by_provider_model"]["qwen/qwen3.8-max"]["cost_usd_estimate"]
+        self.assertEqual(qw, {"known_total": None, "known_runs": 0, "per_run": None,
+                              "unknown_runs": 1})
+        self.assertAlmostEqual(out["cost_usd_estimate"]["known_total"], 2.2)
+        self.assertEqual(out["cost_usd_estimate"]["unknown_runs"], 1)
+        self.assertIn("cota inferior", report.format_stats(out))
+
+    def test_unknown_usage(self):
+        self.add(usage=None)
+        self.add(usage={"input": 10, "output": None, "cache_read": 0, "cache_write": 0})
+        self.add()
+        ds = self.stats(days=7)["by_provider_model"]["deepseek/flash"]
+        self.assertEqual(ds["runs_with_unknown_usage"], 2)
+        # Averages over the one run whose usage is known, not over three.
+        self.assertEqual(ds["tokens"]["input"], {"total": 1_000_000, "per_run": 1_000_000})
+        self.assertEqual(ds["cost_usd_estimate"]["unknown_runs"], 2)
+
+    def test_all_usage_unknown_is_null(self):
+        self.add(usage=None)
+        ds = self.stats(days=7)["by_provider_model"]["deepseek/flash"]
+        self.assertEqual(ds["tokens"]["output"], {"total": None, "per_run": None})
+        out = self.stats(days=7)
+        self.assertIsNone(out["cost_usd_estimate"]["known_total"])
+
+    def test_recorded_cost_wins_over_the_table(self):
+        self.add(cost=0.5)
+        ds = self.stats(days=7)["by_provider_model"]["deepseek/flash"]
+        self.assertAlmostEqual(ds["cost_usd_estimate"]["known_total"], 0.5)
+
+    def test_days_filter(self):
+        self.add(age_days=1)
+        self.add(age_days=10)
+        self.add(age_days=40)
+        self.assertEqual(self.stats(days=7)["runs"], 1)
+        self.assertEqual(self.stats(days=30)["runs"], 2)
+        self.assertEqual(self.stats(days=0)["runs"], 0)
+
+    def test_provider_filter(self):
+        self.add()
+        self.add(provider="qwen", model="qwen3.8-max")
+        out = self.stats(days=7, provider="qwen")
+        self.assertEqual(list(out["by_provider_model"]), ["qwen/qwen3.8-max"])
+        self.assertEqual(out["provider"], "qwen")
+
+    def test_live_runs_are_left_out(self):
+        run_id = self.add(status=contract.RUNNING)
+        hold_lock(self, contract.run_dir(run_id))
+        out = self.stats(days=7)
+        self.assertEqual((out["runs"], out["running"]), (0, 1))
+
+    def test_abandoned_run_counts_as_abandoned(self):
+        self.add(status=contract.RUNNING)
+        ds = self.stats(days=7)["by_provider_model"]["deepseek/flash"]
+        self.assertEqual(ds["status"], {contract.ABANDONED: 1})
+        self.assertEqual(ds["first_try_success_rate"], 0)
+
+    def test_num_turns_falls_back_to_the_harness_json(self):
+        run_id = self.add()
+        (contract.run_dir(run_id) / "stdout.log").write_text(
+            json.dumps({"num_turns": 7}), encoding="utf-8")
+        ds = self.stats(days=7)["by_provider_model"]["deepseek/flash"]
+        self.assertEqual(ds["num_turns"], {"median": 7, "known_runs": 1})
+
+    def test_empty_state(self):
+        out = self.stats(days=7)
+        self.assertEqual(out["runs"], 0)
+        self.assertIsNone(out["cost_usd_estimate"]["known_total"])
+        self.assertIn("sin corridas", report.format_stats(out))
+
+    def test_percentile_is_nearest_rank(self):
+        self.assertIsNone(report._percentile([], 0.9))
+        self.assertEqual(report._percentile([5], 0.9), 5)
+        self.assertEqual(report._percentile(list(range(1, 11)), 0.9), 9)
+        self.assertEqual(report._percentile(list(range(1, 12)), 0.9), 10)
