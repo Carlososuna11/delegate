@@ -110,7 +110,9 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
      `BASH_ENV`, `ENV`, `PATH`, `HOME`, `PYTHONPATH`, todo `GIT_*` (con
      `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` una entrada http
      configuraba `diff.external` y el `git diff` del piso lo corría), `PAGER`,
-     `EDITOR` y compañía. Como el environment del hijo se
+     `EDITOR`, `GCONV_PATH` y compañía. También los que desvían o debilitan el TLS del
+     hijo, que lleva la key del proveedor: `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` (y
+     en minúsculas), `NODE_EXTRA_CA_CERTS` y `NODE_TLS_REJECT_UNAUTHORIZED`. Como el environment del hijo se
      construye desde una allowlist, el passthrough es el **único** canal por el que algo
      de este shell cruza, y un nombre de estos lo convierte en ejecución de código.
      Las credenciales **no** están en esa lista a propósito: reenviar un token es para lo
@@ -140,14 +142,19 @@ que un `>` no es una vía de escritura. De ahí salen tres consecuencias:
   wrapper primero en el `PATH`, que:
   - ignora la config de sistema y la global;
   - anula `core.fsmonitor`, `core.pager`, `core.hooksPath` y `diff.external`;
-  - anula cada filtro `clean`/`smudge`/`process` que nombre la config del repo: los
-    lista con `git config` y los vacía con `-c`;
+  - anula cada filtro `clean`/`smudge`/`process` y cada driver de diff
+    (`command`, `textconv`) que nombre la config del repo: los lista con
+    `git config` y los vacía con `-c`;
   - apaga `log.showSignature` y apunta los tres `gpg.*.program` a `/bin/false`;
-  - agrega `--no-ext-diff`/`--no-textconv` **después** de las opciones del llamador
-    (antes de un `--`), porque git se queda con la última y `git diff --no-index`
-    acepta abreviaturas como `--textcon`;
-  - rechaza `--ext-diff` y `--textconv` escritas completas y `--output` en cualquier
-    prefijo.
+  - pone `--no-ext-diff`, `--no-textconv` y `--ignore-submodules=all` **justo
+    después** del subcomando, antes de todo lo del llamador. Al final quedaban como
+    valor de una opción que lo lleva aparte: `git diff --line-prefix` (o
+    `--src-prefix`, `--dst-prefix`, `--word-diff-regex`) se tragaba el
+    `--no-ext-diff` y corría el driver del repo;
+  - rechaza toda forma y abreviatura de lo que las deshace (`--ext*`, `--textc*`,
+    `--ignore-su*`, `--sub*`), porque `git diff --no-index` acepta prefijos, y
+    `--output` en cualquier prefijo. Los submódulos se ignoran: su contenido lo lee
+    un git con la config del submódulo, que nada de esto anula.
 
   Es defensa en profundidad, no un límite: es una lista de mecanismos **conocidos** de
   git 2.43, y una versión de git que agregue otro helper configurable lo deja pasar. El
@@ -462,11 +469,13 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   un `--`, y `--append-system-prompt` sigue siendo la última opción.
 - En el piso, el `git` del hijo no corre ningún helper que nombre la config del
   repo o la global (`diff.external`, `textconv`, `core.fsmonitor`, `core.pager`,
-  un filtro `clean` o `process` en el `.git/config` del repo, `gpg.program` con
-  `log.showSignature` o `--show-signature` sobre un commit firmado), tampoco con
-  abreviaturas (`--textcon`, `--ext-dif` con
-  `--no-index`); rechaza `--ext-diff`, `--textconv` y todo prefijo de `--output`; con
-  `--bash`, el `git` es el de la máquina.
+  un filtro `clean` o `process` o el `command` de un driver en el `.git/config` del
+  repo, `gpg.program` con `log.showSignature` o `--show-signature` sobre un commit
+  firmado), tampoco con abreviaturas (`--textcon`, `--ext-dif` con `--no-index`) ni
+  con una opción que se trague el flag siguiente (`--line-prefix`, `--src-prefix`,
+  `--dst-prefix`, `--word-diff-regex`); rechaza `--ext*`, `--textc*`,
+  `--ignore-su*`, `--sub*` y todo prefijo de `--output`; con `--bash`, el `git` es
+  el de la máquina.
 - Un `env_passthrough` con cualquier nombre `GIT_*` se rechaza con 2.
 - Un rechazo de `dg_perm_resolve` o de `dg_mcp_resolve` justo después de un grant
   no deja ningún global del grant, probado en el **mismo** shell: inspeccionar

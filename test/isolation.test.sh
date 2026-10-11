@@ -176,7 +176,11 @@ if [[ "$mode" == probe-git ]]; then
              "diff --out $dump/git_out" "diff --o=$dump/git_out" \
              'diff --no-index --textcon f .gitattributes' \
              'diff --no-index --ext-dif f .gitattributes' 'log -p --textcon -- f' \
-             'log -1 sig' 'show -s sig' 'log --show-signature -1 sig'; do
+             'log -1 sig' 'show -s sig' 'log --show-signature -1 sig' \
+             'diff --line-prefix' 'diff --src-prefix' 'diff --dst-prefix' \
+             'diff --word-diff-regex' 'log -p -1 --line-prefix' 'show --src-prefix' \
+             'diff --ignore-submodules=none' 'diff --ignore-su=none' \
+             'diff --submodule=diff' 'status --ignore-submodules=none'; do
     rc=0
     # shellcheck disable=SC2086
     git $cmd >/dev/null 2>&1 || rc=$?
@@ -1105,6 +1109,9 @@ hostile_repo() {
   git -C "$repo" config gpg.x509.program "$helper"
   git -C "$repo" config diff.external "$helper"
   git -C "$repo" config diff.evil.textconv "$helper"
+  # An external diff driver of the repository's own: `git diff` runs it
+  # through the attribute unless --no-ext-diff is in effect.
+  git -C "$repo" config diff.evil.command "$helper"
   git -C "$repo" config core.fsmonitor "$helper"
   git -C "$repo" config core.pager "$helper"
   # Global config: only GIT_CONFIG_GLOBAL keeps this one out.
@@ -1153,7 +1160,9 @@ test_git_on_the_read_only_floor_runs_no_helper_the_repository_configures() {
   for refused in 'diff --ext-diff' 'diff --textconv' 'log -p --ext-diff' \
                  "diff --output=$TMP/dump/git_out" "diff --output $TMP/dump/git_out" \
                  "diff --outp=$TMP/dump/git_out" "diff --out $TMP/dump/git_out" \
-                 "diff --o=$TMP/dump/git_out"; do
+                 "diff --o=$TMP/dump/git_out" 'diff --ignore-submodules=none' \
+                 'diff --ignore-su=none' 'diff --submodule=diff' \
+                 'status --ignore-submodules=none'; do
     assert_not_contains "$probe" "$refused|0" "refused: git $refused"
   done
   [[ ! -e "$TMP/dump/git_out" ]] || fail "git --output wrote a file from the floor"

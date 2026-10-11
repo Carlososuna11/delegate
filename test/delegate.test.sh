@@ -683,7 +683,12 @@ test_env_passthrough_of_a_code_carrying_name_is_refused() {
   # delegated run into code execution inside it. The name comes from the entry
   # file; the value comes from this shell.
   local name
-  for name in NODE_OPTIONS LD_PRELOAD BASH_ENV PATH GIT_SSH_COMMAND PYTHONPATH; do
+  # And the ones that redirect or weaken the child's TLS traffic, which
+  # carries the provider key: a proxy, an extra CA, verification off. GCONV_PATH
+  # loads a shared object of its choosing in glibc's iconv.
+  for name in NODE_OPTIONS LD_PRELOAD BASH_ENV PATH GIT_SSH_COMMAND PYTHONPATH \
+              NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS HTTPS_PROXY HTTP_PROXY \
+              ALL_PROXY https_proxy http_proxy all_proxy GCONV_PATH; do
     setup_runnable
     write_mcp_http_entry docs 'get_thing' env_passthrough "$name"
     dg_run alpha --dir "$TMP/work" --mcp docs "haz algo"

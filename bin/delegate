@@ -540,7 +540,13 @@ cmd_run() {
           # dozens of these names, several as config or as commands; a list
           # would have to keep up with git. The allowlist of safe GIT_* names
           # is empty until one is actually needed.
-          LD_*|GIT_*|NODE_OPTIONS|NODE_REPL_EXTERNAL_MODULE|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|IFS|PATH|HOME|PYTHONPATH|PYTHONSTARTUP|PERL5LIB|PERL5OPT|RUBYOPT|PAGER|EDITOR|VISUAL)
+          #
+          # The proxy and TLS names are here for the same reason with a different
+          # payload: the child's HTTPS traffic carries the provider key, and a
+          # forwarded proxy (with an extra CA, or verification off) is a
+          # man-in-the-middle on it. GCONV_PATH makes glibc's iconv load a
+          # shared object from a directory of the value's choosing.
+          LD_*|GIT_*|NODE_OPTIONS|NODE_REPL_EXTERNAL_MODULE|NODE_TLS_REJECT_UNAUTHORIZED|NODE_EXTRA_CA_CERTS|HTTPS_PROXY|HTTP_PROXY|ALL_PROXY|https_proxy|http_proxy|all_proxy|GCONV_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|IFS|PATH|HOME|PYTHONPATH|PYTHONSTARTUP|PERL5LIB|PERL5OPT|RUBYOPT|PAGER|EDITOR|VISUAL)
             printf '%s✗%s %s\n' "$RED" "$R" \
               "un servidor MCP pidió reenviar ${B}${rn}${R}: su valor se interpreta como código dentro de la corrida delegada, así que no se reenvía nunca" >&2
             exit 2 ;;
@@ -674,14 +680,15 @@ cmd_run() {
   #
   # The allowlist only lets `git <subcommand>` through by name, so a `git`
   # first in PATH is what the model's command reaches. It ignores system and
-  # global config, overrides the executable keys of the repository's (filters
-  # and signature programs included), appends --no-ext-diff/--no-textconv, and
-  # refuses --ext-diff, --textconv and every prefix of --output. Defence in
-  # depth, not a boundary: it lists the helpers git 2.43 is known to run, a
-  # newer git may add one, and the real limit stays "never delegate over a
-  # hostile tree" (CLAUDE.md). Floor
-  # only: --bash is unrestricted shell, and constraining git there would be a
-  # narrower grant than the one asked for.
+  # global config, overrides the executable keys of the repository's (filters,
+  # diff drivers and signature programs included), puts --no-ext-diff,
+  # --no-textconv and --ignore-submodules=all right after the subcommand, and
+  # refuses every abbreviation of the options that undo them and every prefix
+  # of --output. Defence in depth, not a boundary: it lists the helpers git
+  # 2.43 is known to run, a newer git may add one, and the real limit stays
+  # "never delegate over a hostile tree" (CLAUDE.md). Floor only: --bash is
+  # unrestricted shell, and constraining git there would be a narrower grant
+  # than the one asked for.
   local real_git=''
   real_git="$(type -P git 2>/dev/null)" || true
   if [[ "$mode" == 'agent' ]] && (( ! want_bash )) && [[ "$real_git" == /* ]]; then
@@ -692,53 +699,50 @@ cmd_run() {
 #!/bin/sh
 # Written by delegate for the read-only floor. See bin/delegate.
 #
-# `git diff --no-index` takes any unique prefix of a long option, so refusing
-# only the exact spellings let `--textcon` through, and it ran the
-# repository's textconv driver. --output is refused in every prefix (it would
-# write a file). --ext-diff and --textconv are refused when spelled out, and
-# their abbreviations are made harmless by appending --no-ext-diff and
-# --no-textconv AFTER the caller's options, before any `--`: git keeps the
-# last one it sees. They used to be prepended, so a later `--textcon` won.
+# The hardening options go RIGHT AFTER the subcommand, before anything the
+# caller wrote. Appended at the end they were swallowed as the value of an
+# option that takes one: `git diff --line-prefix` (or --src-prefix,
+# --dst-prefix, --word-diff-regex...) consumed `--no-ext-diff`, and the
+# repository's diff driver ran. First, they are only defeated by a later
+# option that turns them back on, so every spelling and every abbreviation of
+# those is refused: --ext*, --textc*, --ignore-su*, --sub* (`git diff
+# --no-index` takes any unique prefix of a long option). --output is refused
+# in every prefix (it would write a file).
 for a in "$@"; do
   case "$a" in
-    --ext-diff|--textconv|--o|--o=*|--ou|--ou=*|--out|--out=*|--outp|--outp=*|--outpu|--outpu=*|--output|--output=*)
+    --ext*|--textc*|--ignore-su*|--sub*|--o|--o=*|--ou|--ou=*|--out|--out=*|--outp|--outp=*|--outpu|--outpu=*|--output|--output=*)
       echo "delegate: git $a está denegado en el piso de solo lectura" >&2; exit 126 ;;
   esac
 done
 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_EXTERNAL_DIFF GIT_PAGER PAGER GIT_ATTR_SOURCE
+# Submodules: their content is read by a git running with the SUBMODULE's
+# config, whose filters and drivers nothing here overrides; it is ignored.
 case "${1-}" in
-  diff|log|show) tail='--no-ext-diff --no-textconv' ;;
-  blame) tail='--no-textconv' ;;
-  *) tail='' ;;
+  diff|log|show) harden='--no-ext-diff --no-textconv --ignore-submodules=all' ;;
+  status) harden='--ignore-submodules=all' ;;
+  blame) harden='--no-textconv' ;;
+  *) harden='' ;;
 esac
-if [ -n "$tail" ]; then
-  seen=0
-  for a do
-    shift
-    if [ "$seen" = 0 ] && [ "$a" = -- ]; then
-      # shellcheck disable=SC2086
-      set -- "$@" $tail --; seen=1
-    else
-      set -- "$@" "$a"
-    fi
-  done
+if [ -n "$harden" ]; then
+  sub=$1; shift
   # shellcheck disable=SC2086
-  [ "$seen" = 1 ] || set -- "$@" $tail
+  set -- "$sub" $harden "$@"
 fi
 # Filters named by the repository's own config (`clean`, `smudge`, `process`)
-# run from `git diff` and `git status` through .gitattributes, and the global
-# and system config being ignored does nothing against them. Each one the
-# config names is overridden with an empty value, which disables it (and a
-# `required` filter then fails instead of running). A name git cannot take
-# back through `-c` (one with `=`) is refused rather than left active.
+# run from `git diff` and `git status` through .gitattributes, and so do its
+# diff drivers (`command`, `textconv`); the global and system config being
+# ignored does nothing against them. Each one the config names is overridden
+# with an empty value, which disables it (and a `required` filter then fails
+# instead of running). A name git cannot take back through `-c` (one with
+# `=`) is refused rather than left active.
 set -f
-keys=$(@REAL_GIT@ config --name-only --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null) || keys=
+keys=$(@REAL_GIT@ config --name-only --get-regexp '^(filter\..*\.(clean|smudge|process)|diff\..*\.(command|textconv))$' 2>/dev/null) || keys=
 old_ifs=$IFS; IFS='
 '
 for k in $keys; do
   case "$k" in
-    *=*) echo "delegate: el filtro $k no se puede anular; git está denegado en este repo" >&2; exit 126 ;;
+    *=*) echo "delegate: la clave $k no se puede anular; git está denegado en este repo" >&2; exit 126 ;;
   esac
   set -- -c "$k=" "$@"
 done
