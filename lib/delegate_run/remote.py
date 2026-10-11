@@ -89,6 +89,7 @@ EXIT_UNKNOWN = 4      # the host could not be reached; the run may be alive
 SSH_TRANSPORT_EXIT = 255
 CALL_TIMEOUT = 120    # seconds for a short remote call (mirror, status)
 RESENDS = 3
+UNREADABLE_POLLS = 3
 
 TERMINAL = frozenset(contract.STATUSES) | {contract.ABANDONED, contract.UNREADABLE}
 
@@ -248,27 +249,62 @@ def _push_base(repo: Path, host: str, mirror: str, base: str, run_id: str) -> No
         raise RemoteError(f"no se pudo empujar la base a {host}: {proc.stderr.strip()}", 1)
 
 
+_NOT_ON_BASE = "la rama traída no es un commit sobre la base pedida; no se publicó"
+
+
+def _ref_state(repo: Path, ref: str) -> tuple[bool, str | None]:
+    """(is a symbolic ref, the commit it names or None)."""
+    sym = runner._git(repo, ["symbolic-ref", "-q", ref], check=False).returncode == 0
+    proc = runner._git(repo, ["rev-parse", "--verify", "--quiet", "--end-of-options",
+                              f"{ref}^{{commit}}"], check=False)
+    return sym, (proc.stdout.strip() or None) if proc.returncode == 0 else None
+
+
 def _fetch_branch(repo: Path, host: str, mirror: str, run_id: str, base: str) -> str | None:
     """Bring delegate/<run_id> into the local repo. None on success, else why.
 
-    Not forced: a local branch with that name and another commit is never
-    moved. The fetched commit must be exactly one commit on top of the base:
-    a branch the remote filled with anything else is deleted again.
+    The fetch lands in a private ref (refs/delegate/fetch/<run_id>) that must
+    not exist beforehand, so it is a creation: it can never fast-forward or
+    move an existing ref, nor write through a symbolic one. The commit must be
+    exactly one commit on top of the base; only then is the branch published
+    with a create-only, non-dereferencing update-ref. The private ref is
+    removed with its expected value, whatever happened.
     """
-    ref = f"refs/heads/delegate/{run_id}"
+    tmp = f"refs/delegate/fetch/{run_id}"
+    branch = f"refs/heads/delegate/{run_id}"
+    sym, sha = _ref_state(repo, tmp)
+    if sym or sha or runner._git(repo, ["show-ref", "--verify", "--quiet", tmp],
+                                 check=False).returncode == 0:
+        return f"{tmp} ya existe en el repo local; no se toca"
     proc = runner._git(repo, ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-                              "--recurse-submodules=no", f"{host}:{mirror}", f"{ref}:{ref}"],
+                              "--recurse-submodules=no", f"{host}:{mirror}",
+                              f"refs/heads/delegate/{run_id}:{tmp}"],
                        check=False, env=runner._git_env(_git_ssh_env()))
     if proc.returncode != 0:
         return f"git fetch falló: {proc.stderr.strip()}"
-    tip = runner._rev(repo, ref)
-    parent = runner._rev(repo, f"{ref}^") if tip else None
-    second = runner._git(repo, ["rev-parse", "--verify", "--quiet", f"{ref}^2"], check=False)
-    if tip is None or parent != base or second.returncode == 0:
+    _sym, tip = _ref_state(repo, tmp)
+    try:
+        if tip is None:
+            return _NOT_ON_BASE
+        parent = runner._rev(repo, f"{tip}^")
+        second = runner._git(repo, ["rev-parse", "--verify", "--quiet", f"{tip}^2"],
+                             check=False)
+        if parent != base or second.returncode == 0:
+            return _NOT_ON_BASE
+        bsym, bsha = _ref_state(repo, branch)
+        if not bsym and bsha == tip:
+            return None  # an earlier fetch already published it
+        if bsym or bsha or runner._git(repo, ["show-ref", "--verify", "--quiet", branch],
+                                       check=False).returncode == 0:
+            return f"ya existe la rama local delegate/{run_id}; no se toca"
+        # Empty old value: create only, fails if the name appeared meanwhile.
+        up = runner._git(repo, ["update-ref", "--no-deref", branch, tip, ""], check=False)
+        if up.returncode != 0:
+            return f"no se pudo crear la rama local: {up.stderr.strip()}"
+        return None
+    finally:
         if tip:
-            runner._git(repo, ["update-ref", "--no-deref", "-d", ref, tip], check=False)
-        return "la rama traída no es un commit sobre la base pedida; se borró"
-    return None
+            runner._git(repo, ["update-ref", "--no-deref", "-d", tmp, tip], check=False)
 
 
 # --- results -------------------------------------------------------------------
@@ -284,16 +320,9 @@ def _local_copy(run_id: str, host: str, remote_result: dict, local_req: dict,
     result["remote_worktree"] = remote_result.get("worktree")
     result["worktree"] = None
     rd = contract.run_dir(run_id)
-    rd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        rd.mkdir(mode=0o700)
-    except FileExistsError:
-        raise RemoteError(f"ya existe una copia local de la corrida {run_id}",
-                          EXIT_RUN_EXISTS) from None
     result["artifacts"] = str(rd)
-    contract.write_json_atomic(rd / "request.json", local_req)
-    contract.write_json_atomic(rd / "remote.json", pending)
-    contract.write_json_atomic(rd / "result.json", result)
+    _publish_run_dir(rd, {"request.json": local_req, "remote.json": pending,
+                          "result.json": result})
     try:
         _pending_path(run_id).unlink()
     except FileNotFoundError:
@@ -301,8 +330,40 @@ def _local_copy(run_id: str, host: str, remote_result: dict, local_req: dict,
     return result
 
 
+def _publish_run_dir(rd: Path, files: dict) -> None:
+    """Fill a hidden temporary directory and rename it to runs/<run_id>: a
+    crash leaves either no run dir (fetch can retry) or a complete one. The
+    temporary name does not match RUN_ID_RE, so status/list/gc ignore it."""
+    rd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.path.lexists(rd):  # rename() would replace an empty directory
+        raise RemoteError(f"ya existe una copia local de la corrida {rd.name}",
+                          EXIT_RUN_EXISTS)
+    tmp = Path(tempfile.mkdtemp(dir=rd.parent, prefix=f".tmp-{rd.name}-"))
+    try:
+        for name, obj in files.items():
+            contract.write_json_atomic(tmp / name, obj)
+        try:
+            os.rename(tmp, rd)
+        except OSError:
+            raise RemoteError(f"ya existe una copia local de la corrida {rd.name}",
+                              EXIT_RUN_EXISTS) from None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _exit_for(result: dict) -> int:
     return 0 if result.get("status") == contract.COMPLETED else 1
+
+
+def _owned(pending: dict, obj: dict) -> bool:
+    """The remote result answers this request: same run_id, provider and
+    (once resolved) base. Defense in depth on top of the fresh run_id: a
+    record with neither (unreadable) carries no branch to fetch anyway."""
+    req = pending.get("local_request") or {}
+    return (obj.get("run_id") == pending["run_id"]
+            # A record with no readable result.json carries no provider.
+            and obj.get("provider") in (None, req.get("provider"))
+            and obj.get("base") in (None, pending["base"]))
 
 
 def _complete(pending: dict, remote_result: dict) -> tuple[dict, int]:
@@ -320,11 +381,11 @@ def _complete(pending: dict, remote_result: dict) -> tuple[dict, int]:
             for attempt in range(3):
                 why = _fetch_branch(Path(pending["repo"]), host, pending["mirror"],
                                     run_id, pending["base"])
-                if why is None or "no es un commit sobre la base" in why:
+                if why is None or not why.startswith("git fetch falló"):
                     break
                 time.sleep(_knob("DELEGATE_REMOTE_POLL", 2.0) * (attempt + 1))
             if why is not None:
-                if "no es un commit sobre la base" not in why:
+                if why.startswith("git fetch falló"):
                     # Transport: the run is fine and stays fetchable later.
                     raise RemoteError(f"la corrida {run_id} terminó en {host} pero no se pudo "
                                       f"traer la rama ({why}); reintenta con "
@@ -356,13 +417,22 @@ def _wait(pending: dict, payload: bytes | None) -> tuple[dict, int]:
     cap = _knob("DELEGATE_REMOTE_POLL_MAX", 30.0)
     giveup = _knob("DELEGATE_REMOTE_GIVEUP", 900.0)
     last_contact = time.monotonic()
-    missing, resends, seen = 0, 0, False
+    missing, resends, seen, unreadable = 0, 0, False, 0
     while True:
         kind, obj = _remote_status(host, run_id)
         if kind == "found":
             last_contact = time.monotonic()
             seen, missing = True, 0
-            if obj.get("status") in TERMINAL:
+            if not _owned(pending, obj):
+                return _unknown(pending, f"la corrida {run_id} de {host} no corresponde a "
+                                         "esta petición (proveedor o base distintos)")
+            status = obj.get("status")
+            # `unreadable` is also what a run looks like for an instant while
+            # it starts (directory made, lock not yet taken): only believed
+            # after several polls in a row.
+            unreadable = unreadable + 1 if status == contract.UNREADABLE else 0
+            if status in TERMINAL and (status != contract.UNREADABLE
+                                       or unreadable >= UNREADABLE_POLLS):
                 return _complete(pending, obj)
         elif kind == "missing":
             last_contact = time.monotonic()
@@ -398,7 +468,7 @@ def _send(pending: dict, payload: bytes, first: bool):
     if err:
         _say(err.rstrip("\n"), raw=True)
     obj = _json_object(out) if rc in (0, 1) else None
-    if obj is not None and obj.get("run_id") == run_id and obj.get("status") in TERMINAL:
+    if obj is not None and _owned(pending, obj) and obj.get("status") in TERMINAL:
         return _complete(pending, obj)
     if rc == EXIT_RUN_EXISTS:
         if first:
@@ -434,7 +504,7 @@ def _detach(pending: dict, payload: bytes) -> tuple[dict, int]:
             if proc.poll() is not None:
                 out = proc.stdout.read()
                 obj = _json_object(out) if proc.returncode in (0, 1) else None
-                if obj is not None and obj.get("run_id") == run_id \
+                if obj is not None and _owned(pending, obj) \
                         and obj.get("status") in TERMINAL:
                     return _complete(pending, obj)
                 if proc.returncode == EXIT_RUN_EXISTS:
@@ -468,6 +538,12 @@ def run_remote(raw: bytes, host: str, detach: bool = False) -> tuple[dict | None
         req = _request.parse_request(raw)
     except contract.RequestError as exc:
         raise RemoteError(str(exc), 2) from None
+    if req.run_id is not None:
+        # The client always draws a fresh id. A caller-chosen one could name a
+        # run the host already has, and after a dropped connection `status`
+        # would hand back that other run as if it were this request's.
+        raise RemoteError("con --remote el run_id lo elige el cliente: quita 'run_id' "
+                          "de la petición", 2)
     previous = os.umask(0o077)
     try:
         return _run_remote(req, host, detach)
@@ -475,10 +551,36 @@ def run_remote(raw: bytes, host: str, detach: bool = False) -> tuple[dict | None
         os.umask(previous)
 
 
+def _reserve() -> str:
+    """A fresh run_id, reserved by creating its pending record exclusively.
+
+    The local runner refuses an id with a pending record too, so a local run
+    and a remote one can never share an id on this machine.
+    """
+    for _ in range(10):
+        run_id = contract.new_run_id()
+        if os.path.lexists(contract.run_dir(run_id)):
+            continue
+        try:
+            fd = os.open(_pending_path(run_id),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            continue
+        os.write(fd, b"{}\n")
+        os.close(fd)
+        return run_id
+    raise RemoteError("no se pudo reservar un run_id único", 1)
+
+
+def _drop_pending(run_id: str) -> None:
+    try:
+        _pending_path(run_id).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _run_remote(req: contract.Request, host: str, detach: bool):
-    run_id = req.run_id or contract.new_run_id()
-    if contract.run_dir(run_id).exists() or _pending_path(run_id).exists():
-        raise RemoteError(f"ya existe una corrida local {run_id}", EXIT_RUN_EXISTS)
+    run_id = _reserve()
     work = Path(tempfile.mkdtemp(dir=_pending_dir(), prefix=".base-"))
     try:
         repo, bare = runner._toplevel(req.repo)
@@ -486,6 +588,7 @@ def _run_remote(req: contract.Request, host: str, detach: bool):
     except (runner._Refused, runner._Infra) as exc:
         status = (contract.REJECTED if isinstance(exc, runner._Refused)
                   else contract.INFRA_FAILED)
+        _drop_pending(run_id)
         return _refused_locally(req, run_id, host, status, str(exc))
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -496,6 +599,7 @@ def _run_remote(req: contract.Request, host: str, detach: bool):
         mirror = _remote_mirror(host, mirror_name(repo))
         _push_base(repo, host, mirror, base, run_id)
     except RemoteError as exc:
+        _drop_pending(run_id)
         if exc.code != 1:
             raise
         return _refused_locally(req, run_id, host, contract.INFRA_FAILED, str(exc),
@@ -517,10 +621,7 @@ def _run_remote(req: contract.Request, host: str, detach: bool):
     except RemoteError as exc:
         if exc.code in (2, EXIT_RUN_EXISTS) or "no está instalado" in str(exc):
             # The remote refused before creating the run: nothing to fetch.
-            try:
-                _pending_path(run_id).unlink()
-            except FileNotFoundError:
-                pass
+            _drop_pending(run_id)
         raise
 
 
@@ -536,11 +637,8 @@ def _refused_locally(req, run_id, host, status, error, local_req=None, base=None
         local_req = runner._request_dict(req)
         local_req.update(run_id=run_id, host=host)
     rd = contract.run_dir(run_id)
-    rd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    rd.mkdir(mode=0o700)
     result["artifacts"] = str(rd)
-    contract.write_json_atomic(rd / "request.json", local_req)
-    contract.write_json_atomic(rd / "result.json", result)
+    _publish_run_dir(rd, {"request.json": local_req, "result.json": result})
     return result, 1
 
 

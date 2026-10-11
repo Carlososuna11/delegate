@@ -1062,12 +1062,20 @@ def execute(req: Request) -> Result:
         os.umask(previous)
 
 
+def _remote_pending(run_id: str) -> bool:
+    """A Fase C client reserved this id (state_root()/remote/<run_id>.json)."""
+    return os.path.lexists(contract.state_root() / "remote" / f"{run_id}.json")
+
+
 def _new_run_dir(requested: str | None = None) -> tuple[str, Path]:
     if requested is not None:
         # The caller chose the id so it can ask `status` after a dropped
         # connection. An id already used is never reused or overwritten: the
         # request is refused before anything is written (RunExists).
         rd = contract.run_dir(requested)
+        if _remote_pending(requested):
+            raise contract.RunExists(f"el run_id {requested} está reservado por una "
+                                     "corrida remota")
         rd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             rd.mkdir(mode=0o700)
@@ -1076,6 +1084,8 @@ def _new_run_dir(requested: str | None = None) -> tuple[str, Path]:
         return requested, rd
     for _ in range(10):
         run_id = contract.new_run_id()
+        if _remote_pending(run_id):
+            continue
         rd = contract.run_dir(run_id)
         rd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:

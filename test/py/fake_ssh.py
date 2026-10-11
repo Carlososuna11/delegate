@@ -9,7 +9,7 @@ its HOME. So the laptop's environment never reaches the "remote", as with the
 real ssh.
 
 Knobs, all optional:
-  FAKE_SSH_LOG    append one JSON line per call: {"argv": [...], "cmd": "..."}
+  FAKE_SSH_LOG    append one JSON line per call: {"argv", "host", "cmd", "t"}
   FAKE_SSH_FAIL   JSON {"match": regex, "times": N}: the first N calls whose
                   command matches exit 255 without running anything
   FAKE_SSH_DROP   JSON {"match": regex, "times": N, "after": seconds}: the
@@ -74,7 +74,8 @@ def main(argv):
     log = os.environ.get("FAKE_SSH_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"argv": argv, "host": host, "cmd": cmd, "opts": opts}) + "\n")
+            f.write(json.dumps({"argv": argv, "host": host, "cmd": cmd, "opts": opts,
+                                "t": time.time()}) + "\n")
     if not cmd:
         sys.stderr.write("fake_ssh: sin comando (no hay shell interactivo)\n")
         return 255
@@ -85,12 +86,18 @@ def main(argv):
     drop = _take("FAKE_SSH_DROP", cmd)
     if not drop:
         return subprocess.run(["/bin/bash", "-c", cmd], cwd=env["HOME"], env=env).returncode
+    # stdout and stderr are both pipes of this process, never the caller's:
+    # a remote command that outlives the "connection" must not keep the
+    # caller's pipes open, or the caller would wait for it like it never
+    # would for a real dropped ssh.
     proc = subprocess.Popen(["/bin/bash", "-c", cmd], cwd=env["HOME"], env=env,
-                            stdout=subprocess.PIPE, start_new_session=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
     deadline = time.monotonic() + float(drop.get("after", 0))
     while time.monotonic() < deadline and proc.poll() is None:
         time.sleep(0.02)
     proc.stdout.close()  # the remote side now writes into a closed pipe
+    proc.stderr.close()
     sys.stderr.write(f"Connection to {host} closed by remote host.\n")
     return 255
 

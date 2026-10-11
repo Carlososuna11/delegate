@@ -235,11 +235,11 @@ class RemoteTest(unittest.TestCase):
                     "/a/b c.git", "/a/$(x).git", None, 3):
             self.assertFalse(remote._mirror_path_ok(bad), bad)
 
-    def test_caller_chosen_run_id_is_used(self):
-        run_id = "20260101-000000-abcdef"
-        code, out, err = self.run_remote(self.request(run_id=run_id))
-        self.assertEqual((code, out["run_id"]), (0, run_id), err)
-        self.assertEqual(self.remote_runs(), [run_id])
+    def test_caller_chosen_run_id_is_refused(self):
+        code, out, err = self.run_remote(self.request(run_id="20260101-000000-abcdef"))
+        self.assertEqual((code, out), (2, None))
+        self.assertIn("el cliente", err)
+        self.assertEqual(self.calls(), [])
 
     # -- local base rules --------------------------------------------------------
 
@@ -284,8 +284,13 @@ class RemoteTest(unittest.TestCase):
         self.assertEqual(out["status"], "completed")
         self.assertIn("se cortó", err)
         self.assertEqual(self.git("show", f"delegate/{out['run_id']}:edited.txt"), "remote")
-        # Recovered by asking, never by running it again.
+        # Recovered by asking, never by running it again, and the asking
+        # started while the remote run was still going.
         self.assertEqual(len(self.run_calls()), 1)
+        rres = json.loads((self.rstate / "runs" / out["run_id"] / "result.json").read_text())
+        first_poll = min(c["t"] for c in self.calls()
+                         if c["cmd"].startswith("delegate-run status"))
+        self.assertLess(first_poll, rres["finished_at"])
         self.assertEqual(self.remote_runs(), [out["run_id"]])
         self.assertTrue([c for c in self.calls() if c["cmd"].startswith("delegate-run status")])
         self.assert_clean_transport()
@@ -326,27 +331,86 @@ class RemoteTest(unittest.TestCase):
 
     # -- run_id uniqueness ---------------------------------------------------------
 
+    def in_process(self, run_id, env=None, remote_env=None):
+        """Run the client in this process with new_run_id pinned to run_id,
+        to put it in front of a run the host already has."""
+        from unittest import mock
+        renv = dict(self.remote_env, **(remote_env or {}))
+        full = dict(self.env, FAKE_REMOTE_ENV=json.dumps(renv), **(env or {}))
+        raw = json.dumps(self.request()).encode()
+        with mock.patch.dict(os.environ, full, clear=True), \
+                mock.patch.object(contract, "new_run_id", return_value=run_id):
+            try:
+                return remote.run_remote(raw, HOST)
+            except remote.RemoteError as exc:
+                return None, exc.code
+
+    def plant_remote_run(self, run_id, base="0" * 40, status="completed"):
+        rd = self.rstate / "runs" / run_id
+        rd.mkdir(parents=True)
+        (rd / "result.json").write_text(json.dumps(
+            {"v": 1, "run_id": run_id, "status": status, "provider": "deepseek",
+             "base": base, "branch": None}))
+        return rd / "result.json"
+
     def test_duplicate_run_id_on_remote_is_rejected(self):
         run_id = "20260101-000000-aaaaaa"
-        self.assertEqual(self.run_remote(self.request(run_id=run_id))[0], 0)
-        # The laptop forgets its copy; the remote still has the run.
-        shutil.rmtree(self.state / "runs" / run_id)
-        self.git("branch", "-D", f"delegate/{run_id}")
-        before = (self.rstate / "runs" / run_id / "result.json").read_bytes()
-        code, out, err = self.run_remote(self.request(run_id=run_id))
-        self.assertEqual((code, out), (remote.EXIT_RUN_EXISTS, None), err)
-        self.assertIn("ya tiene", err)
-        self.assertEqual((self.rstate / "runs" / run_id / "result.json").read_bytes(), before)
+        planted = self.plant_remote_run(run_id)
+        before = planted.read_bytes()
+        out, code = self.in_process(run_id)
+        self.assertEqual((out, code), (None, remote.EXIT_RUN_EXISTS))
+        self.assertEqual(planted.read_bytes(), before)
         self.assertFalse((self.state / "remote" / f"{run_id}.json").exists())
         self.assertFalse((self.state / "runs" / run_id).exists())
 
-    def test_duplicate_run_id_on_laptop_is_rejected_before_ssh(self):
-        run_id = "20260101-000000-bbbbbb"
-        self.assertEqual(self.run_remote(self.request(run_id=run_id))[0], 0)
-        n = len(self.calls())
-        code, out, _ = self.run_remote(self.request(run_id=run_id))
-        self.assertEqual((code, out), (remote.EXIT_RUN_EXISTS, None))
-        self.assertEqual(len(self.calls()), n)
+    def test_drop_never_adopts_another_requests_run(self):
+        # The host already has a finished run with this id (another base);
+        # the send drops before the duplicate refusal arrives. Status finds
+        # the old run, and it must not be taken as this request's.
+        run_id = "20260101-000000-eeeeee"
+        self.plant_remote_run(run_id, base="1" * 40)
+        drop = {"match": r"\Adelegate-run\Z", "times": 5, "after": 0}
+        out, code = self.in_process(run_id, env={"FAKE_SSH_DROP": json.dumps(drop)})
+        self.assertEqual(code, remote.EXIT_UNKNOWN)
+        self.assertIn("no corresponde", out["error"])
+        self.assertFalse((self.state / "runs" / run_id).exists())
+
+    def test_unreadable_is_believed_only_after_several_polls(self):
+        run_id = "20260101-000000-ffffff"
+        (self.rstate / "runs" / run_id).mkdir(parents=True)  # no lock, no result
+        fail = {"match": r"\Adelegate-run\Z", "times": 100}
+        out, code = self.in_process(run_id, env={"FAKE_SSH_FAIL": json.dumps(fail)})
+        self.assertEqual((code, out["status"]), (1, "unreadable"))
+        polls = [c for c in self.calls() if c["cmd"].startswith("delegate-run status")]
+        self.assertGreaterEqual(len(polls), remote.UNREADABLE_POLLS)
+
+    def test_fetch_never_moves_an_existing_local_ref(self):
+        head = self.git("rev-parse", "HEAD")
+        cases = (("plain", lambda rid: self.git("branch", f"delegate/{rid}", head)),
+                 ("symref", lambda rid: self.git("symbolic-ref", f"refs/heads/delegate/{rid}",
+                                                 "refs/heads/main")),
+                 ("tmp-symref", lambda rid: self.git("symbolic-ref",
+                                                     f"refs/delegate/fetch/{rid}",
+                                                     "refs/heads/main")))
+        for i, (name, plant) in enumerate(cases):
+            run_id = f"20260101-00000{i}-abcabc"
+            plant(run_id)
+            out, code = self.in_process(run_id)
+            self.assertEqual((code, out["status"]), (1, "infra_failed"), name)
+            self.assertIn("no se toca", out["error"])
+            self.assertEqual(self.git("rev-parse", "main"), head, name)
+        self.assertEqual(self.git("rev-parse", "delegate/20260101-000000-abcabc"), head)
+
+    def test_local_runner_refuses_id_reserved_by_remote_client(self):
+        run_id = "20260101-000000-cccccd"
+        (self.state / "remote").mkdir(parents=True)
+        (self.state / "remote" / f"{run_id}.json").write_text("{}\n")
+        req = json.dumps(self.request(run_id=run_id)).encode()
+        env = {"DELEGATE_BIN": str(FAKE), "DELEGATE_SANDBOX": "off", "FAKE_MODE": "ok_noop"}
+        code, out, err = self.cli([], req, env=env)
+        self.assertEqual((code, out), (3, None))
+        self.assertIn("reservado", err)
+        self.assertFalse((self.state / "runs" / run_id).exists())
 
     def test_local_runner_refuses_existing_run_id(self):
         run_id = "20260101-000000-cccccc"
