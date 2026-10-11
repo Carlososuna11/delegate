@@ -220,8 +220,8 @@ Límites conocidos:
   cambie de grupo de procesos en cada fork todavía puede escaparse. Con bubblewrap
   vive en un namespace de pid propio y muere cuando sale el harness.
 - Con sandbox siguen abiertos: la red (internet y servicios TCP de `localhost`;
-  restringirla al proveedor exige un proxy), la key en el environment del harness,
-  y los **checks**, que corren afuera con los permisos del usuario.
+  restringirla al proveedor exige un proxy) y la key en el environment del harness.
+  Los checks corren en su propio sandbox con la red igual de abierta.
 
 ### Sandbox (bubblewrap)
 
@@ -239,6 +239,13 @@ guardias de Bash y git quedan como defensa en profundidad. `DELEGATE_SANDBOX`
   repo del usuario.
 - **Seccomp contra los sockets unix**: la red compartida trae el espacio de sockets
   abstractos del host, y por ahí se alcanzaba el X11 del usuario.
+- **Los checks en el mismo perfil**, armado por el runner (no por `delegate`, que no
+  corre los checks y no tiene por qué ver su comando): HOME privado con las toolchains
+  del HOME en solo lectura (`~/.nvm/versions`, los python de uv, rustup, pyenv), el venv
+  o el archivo del ejecutable del check si está fuera de eso, y `DELEGATE_CHECK_RO`
+  para lo que el dueño de la máquina agregue. Sin caches (envenenarlas sería ejecución
+  fuera del sandbox) ni config de usuario. `checks_sandbox` en `result.json` (`bwrap`,
+  `none` o `null`), aditivo a `v: 1`. Detalle en `CLAUDE.md`, "Sandbox de los checks".
 
 ### Cómo verifica quien llama
 

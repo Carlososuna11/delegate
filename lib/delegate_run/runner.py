@@ -27,13 +27,16 @@ exists only so the tests do not wait a full minute:
   DELEGATE_RUN_SLACK   seconds the runner waits past the request timeout (30)
   DELEGATE_RUN_WALL    overrides timeout + slack entirely (tests only)
   DELEGATE_SANDBOX     auto (default), bwrap or off; see _decide_sandbox
+  DELEGATE_CHECK_RO    extra read-only paths for sandboxed checks; see sandbox.py
 
 OS sandbox. With bwrap usable, `delegate` is told to run its child (the
 harness and everything it starts) inside bubblewrap: private mount, pid, ipc
 and user namespaces, the worktree read-write, the repository's gitdir
 read-only, a tmpfs HOME and /tmp, and no unix sockets (seccomp). `delegate`
 itself runs outside, so the key file is never mounted in the sandbox. The
-network is shared: see CLAUDE.md, "Sandbox".
+request's checks run in the same kind of sandbox, built by the runner
+(sandbox.py), with the toolchain directories of HOME read-only. The network
+is shared: see CLAUDE.md, "Sandbox".
 """
 from __future__ import annotations
 
@@ -49,7 +52,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import contract, report as _report, scope as _scope
+from . import contract, report as _report, sandbox as _sandbox, scope as _scope
 from .contract import CheckResult, Request, Result
 
 DEFAULT_SLOTS = 2
@@ -819,7 +822,7 @@ def _child_argv(req: Request, worktree: Path, sandbox_ro: list[str] | None = Non
 
 
 def _supervise(argv, cwd: Path, stdout, stderr, wall: float, run: _Run,
-               env: dict | None = None) -> tuple[int, str | None]:
+               env: dict | None = None, pass_fds=()) -> tuple[int, str | None]:
     """Run argv in its own session; returns (exit code, stop reason or None).
 
     Whatever the outcome, nothing the child started is alive when this
@@ -828,7 +831,7 @@ def _supervise(argv, cwd: Path, stdout, stderr, wall: float, run: _Run,
     try:
         proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
                                 stdout=stdout, stderr=stderr, env=env,
-                                start_new_session=True)
+                                start_new_session=True, pass_fds=tuple(pass_fds))
     except OSError as exc:
         raise _Infra(f"no se pudo lanzar {argv[0]!r}: {exc}") from exc
     pid = proc.pid
@@ -940,11 +943,61 @@ def _check_env(worktree: Path) -> dict:
     return env
 
 
+def _checks_sandbox(worktree: Path, sandbox_ro: list[str]) -> _sandbox.ChecksSandbox:
+    """The sandbox for this run's checks, validated before the child runs."""
+    bwrap = contract.which("bwrap")
+    if not bwrap:
+        raise _Infra("bwrap desapareció del PATH antes de los checks")
+    try:
+        return _sandbox.ChecksSandbox(
+            bwrap, worktree, sandbox_ro, os.environ.get("HOME"), contract.state_root(),
+            os.uname().machine, os.environ.get("DELEGATE_CHECK_RO", ""))
+    except _sandbox.SandboxError as exc:
+        raise _Infra(f"sandbox de los checks: {exc}") from exc
+
+
+def _missing_executable(argv0: str, path_env: str) -> bool:
+    """True when the check's command cannot be found, as Popen would see it."""
+    if "/" in argv0:
+        return argv0.startswith("/") and not os.path.exists(argv0)
+    return shutil.which(argv0, path=path_env) is None
+
+
+def _sandboxed_check(box: _sandbox.ChecksSandbox, cmd: list[str], env: dict,
+                     worktree: Path, log, limit: float, run: _Run) -> tuple[int, str | None]:
+    """One check inside bwrap. The seccomp program reaches bwrap on a pipe."""
+    if _missing_executable(cmd[0], env["PATH"]):
+        # Same answer as an unsandboxed check (Popen's ENOENT): bwrap would
+        # say "execvp" and exit 1, and a missing tool is not a failing test.
+        log.write(f"no se pudo ejecutar el check: no encuentro {cmd[0]!r}\n".encode())
+        return 127, None
+    rfd, wfd = os.pipe()
+    try:
+        os.write(wfd, box.bpf)   # a few hundred bytes: never blocks on a pipe
+        os.close(wfd)
+        wfd = -1
+        argv, note = box.wrap(cmd, env["PATH"], rfd)
+        if note:
+            log.write(note.encode())
+            log.flush()
+        return _supervise(argv, worktree, log, subprocess.STDOUT, limit, run,
+                          env=env, pass_fds=(rfd,))
+    finally:
+        os.close(rfd)
+        if wfd >= 0:
+            os.close(wfd)
+
+
 def _run_checks(req: Request, result: Result, rd: Path, worktree: Path,
-                run: _Run) -> bool:
-    """Run every check argv in the worktree. True if any did not exit 0."""
+                run: _Run, box: _sandbox.ChecksSandbox | None = None) -> bool:
+    """Run every check argv in the worktree. True if any did not exit 0.
+
+    With `box`, each one runs inside bwrap (result.checks_sandbox "bwrap");
+    without, on the host as before ("none").
+    """
     if not req.checks:
         return False
+    result.checks_sandbox = "bwrap" if box else "none"
     checks_dir = rd / "checks"
     checks_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     limit = min(req.timeout, CHECK_MAX_TIMEOUT)
@@ -956,8 +1009,12 @@ def _run_checks(req: Request, result: Result, rd: Path, worktree: Path,
         started = time.monotonic()
         with open(rd / log_rel, "wb") as log:
             try:
-                code, reason = _supervise(list(cmd), worktree, log, subprocess.STDOUT,
-                                          limit, run, env=env)
+                if box:
+                    code, reason = _sandboxed_check(box, list(cmd), env, worktree,
+                                                    log, limit, run)
+                else:
+                    code, reason = _supervise(list(cmd), worktree, log, subprocess.STDOUT,
+                                              limit, run, env=env)
             except _Infra as exc:
                 log.write(f"no se pudo ejecutar el check: {exc}\n".encode())
                 code, reason = 127, None
@@ -1000,6 +1057,9 @@ def _run(req: Request, result: Result, run: _Run) -> None:
     if not gitdir:
         raise _Infra("no se pudo leer el gitdir del worktree")
     sandbox_ro = _sandbox_ro(worktree, gitdir) if sandboxed else None
+    # The checks' sandbox is built now, before the child: a bad
+    # DELEGATE_CHECK_RO is infra_failed before a provider is paid.
+    box = _checks_sandbox(worktree, sandbox_ro) if sandboxed and req.checks else None
     run.check_stop()
 
     with open(rd / "stdout.log", "wb") as out, open(rd / "stderr.log", "wb") as err:
@@ -1037,7 +1097,7 @@ def _run(req: Request, result: Result, run: _Run) -> None:
         result.error = harness_error
     else:
         try:
-            failed = _run_checks(req, result, rd, worktree, run)
+            failed = _run_checks(req, result, rd, worktree, run, box)
             result.status = contract.CHECKS_FAILED if failed else contract.COMPLETED
         except _Stop:
             result.status = contract.CANCELLED

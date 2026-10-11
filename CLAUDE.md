@@ -399,8 +399,10 @@ Reglas que el código cumple y los tests prueban:
   nombre el repo anulado vía `GIT_CONFIG_KEY_n`. Antes del hijo el repo es del usuario
   y su config se respeta (un smudge de LFS funciona al crear el worktree).
 - Los checks corren con un environment construido (sin tokens del que llama) y un `PATH`
-  sin entradas relativas ni dentro del worktree. Ejecutan código que escribió el modelo
-  con los permisos del usuario: el environment se limpia, los archivos no se confinan.
+  sin entradas relativas ni dentro del worktree. Ejecutan código que escribió el modelo,
+  así que con sandbox corren dentro de bubblewrap con el mismo perfil que el hijo (ver
+  "Sandbox de los checks"); sin sandbox, con los permisos del usuario: el environment se
+  limpia, los archivos no se confinan. `checks_sandbox` en `result.json` dice cuál fue.
 - Procesos: el hijo corre en su propia sesión, el runner se hace subreaper y al terminar
   (bien, por timeout o por cancelación) manda TERM a todo el árbol y a la sesión, espera
   la gracia y manda KILL. Recuerda la sesión y el grupo de cada proceso visto, zombis
@@ -496,9 +498,8 @@ Lo que **no** cierra:
   proveedor exige un proxy y `--unshare-net`: trabajo futuro.
 - La key está en el environment del harness, dentro del sandbox: con `bash` el modelo
   la lee de `/proc/self/environ` y, con la red abierta, puede mandarla a donde quiera.
-- **Los checks corren afuera**, con los permisos del usuario, y ejecutan código que
-  escribió el modelo (un `package.json`, un test). El sandbox confina al delegado, no
-  a lo que el runner corre después: trabajo futuro, correrlos con el mismo perfil.
+- Los checks corren en su propio sandbox (abajo), pero con lo que se monta para la
+  toolchain: un ejecutable de esos directorios lo puede leer el código del modelo.
 - `/usr` y `/etc` completos son legibles; las herramientas instaladas en el home
   (nvm, cargo, `~/.local/bin`) no existen adentro, así que con `bash` un `npm test`
   puede no correr ahí.
@@ -519,6 +520,55 @@ Lo que **no** cierra:
 - Un bug del kernel en lo que sigue expuesto (namespaces, syscalls permitidas).
 - En una máquina sin bwrap (`sudo apt install bubblewrap`) y con `auto`, nada de esto
   aplica: `sandbox: "none"` es la señal.
+
+### Sandbox de los checks
+
+Con sandbox (`sandbox: "bwrap"`), cada check de la petición corre dentro de bubblewrap,
+armado por el runner (`lib/delegate_run/sandbox.py`) y no por `delegate`, con el mismo
+perfil que el hijo: `/usr`, `/etc` y el `resolv.conf` en solo lectura, `/proc` y `/dev`
+propios, `/tmp` y `HOME` como tmpfs privados, el worktree en escritura y el gitdir en
+solo lectura encima, los mismos namespaces y `--disable-userns`, `--new-session` y
+`--die-with-parent`, y el **mismo** programa seccomp (un test compara byte a byte el de
+Python con `dg_seccomp_bpf`). Con `DELEGATE_SANDBOX=off`, o `auto` sin bwrap, los checks
+corren en el host como antes. `result.json` trae `checks_sandbox`: `bwrap`, `none`, o
+`null` si no corrió ningún check (campo nuevo; `v` sigue en 1).
+
+Lo que se monta del HOME, en solo lectura y nada más:
+- **Toolchains** que existan: `~/.nvm/versions`, `~/.local/share/uv/python` (los python
+  a los que apuntan los venvs de uv), `~/.rustup/toolchains`, `~/.cargo/bin`,
+  `~/.pyenv/versions`, `~/.bun/bin`. Ninguno guarda credenciales.
+- **El ejecutable del check** cuando el host lo resuelve fuera de todo lo anterior: si
+  vive en el `bin/` de un venv (hay `pyvenv.cfg` al lado), el venv entero; si no, el
+  archivo solo. Así corre `["/ruta/repo/.venv/bin/pytest"]` sin montar el repo.
+- **`DELEGATE_CHECK_RO`**: rutas extra separadas por `:` que decide el dueño de la
+  máquina, nunca la petición (p. ej. `~/.cache/ms-playwright`). Una ruta inválida deja
+  la corrida `infra_failed` **antes** de lanzar al hijo.
+
+Nunca se monta algo que sea, contenga o esté dentro de `~/.ssh`, `~/.gnupg`,
+`~/.config` (ahí viven los `key_dir`), `~/.aws`, `~/.kube`, `~/.docker`, `~/.claude`,
+`~/.codex`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.gitconfig`,
+`~/.local/state`, `~/.local/share/keyrings` y compañía, ni el state dir, ni el HOME o algo
+que lo contenga, ni algo que contenga el worktree. Esa lista solo vigila lo que nombra
+quien llama o el dueño; lo que se expone por defecto es la allowlist de toolchains. Un
+ejecutable de check que cae ahí no se monta y su log lo dice.
+
+Decisiones y límites:
+- **Las caches no se montan** (`~/.npm`, `~/.cache/uv`, el store de pnpm). En solo
+  lectura no sirven (npm y uv escriben en ellas) y en escritura un check podría
+  envenenar una cache que después ejecutan las herramientas del usuario fuera de todo
+  sandbox. Cada check arranca con cache vacía en su HOME privado y descarga de la red:
+  más lento, no más inseguro.
+- **Sin config de usuario**: `~/.npmrc`, `~/.gitconfig`, `pip.conf` y `uv.toml` no
+  existen adentro, así que un registro privado o una identidad de git no están. Un
+  check que los necesite no es para el sandbox.
+- **La red sigue abierta**, igual que para el hijo: `npm ci` necesita internet y un test
+  suele necesitar una base en `localhost`. Por TCP sí; por socket unix no (seccomp), así
+  que Postgres va por `127.0.0.1`, no por `/var/run/postgresql`.
+- Fuera de `/usr`, `/etc` y lo de arriba no hay nada: `/opt`, `/var`, `/snap` y `/nix`
+  no existen adentro; lo que haga falta de ahí va por `DELEGATE_CHECK_RO`.
+- Un venv montado tal cual: un `.pth` editable que apunte al checkout del usuario no
+  se ve (y antes importaba ese código, no el del worktree).
+- Un comando que no existe sale 127 sin lanzar bwrap, igual que sin sandbox.
 
 Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_id>/`
 (`request.json`, `result.json`, `stdout.log`, `stderr.log`, `patch.diff`, `checks/`,
@@ -719,6 +769,14 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   `auto` sin bwrap queda en `none`; `bwrap` sin bwrap es
   `infra_failed` sin lanzar al hijo; un flag de sandbox inválido sale con 2 antes de
   leer la key.
+- Con sandbox, un check no lee un canario del HOME (ni `~/.ssh`, ni `~/.npmrc`), ni el
+  checkout del usuario, ni el directorio de la corrida, y ve su HOME vacío; escribe el
+  worktree pero no la config del gitdir; no crea sockets unix; corre una herramienta de
+  `~/.nvm/versions`, el `node` real y el python de un venv fuera del worktree (sin ver
+  lo que está al lado del venv); un ejecutable bajo `~/.config` no se monta; un
+  `DELEGATE_CHECK_RO` sobre `~/.ssh`, `~/.config`, el HOME, el state dir o relativo es
+  `infra_failed` sin lanzar al hijo; con `off` el check sí lee el canario y
+  `checks_sandbox` es `none`. El seccomp de Python es byte a byte el de Bash.
 
 ## Lo que NO se construye
 

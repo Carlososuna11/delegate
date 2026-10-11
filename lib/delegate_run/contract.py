@@ -94,6 +94,10 @@ class Result:
     # an OS sandbox (DELEGATE_SANDBOX=off, or auto with bwrap unusable), None
     # when the run ended before that was decided.
     sandbox: str | None = None
+    # How the request's checks ran: "bwrap" inside the same kind of sandbox
+    # (built by the runner), "none" on the host, None when no check ran.
+    # Additive to schema v1.
+    checks_sandbox: str | None = None
     changed_files: list[dict] = field(default_factory=list)   # {"path": str, "change": "A"|"M"|"D"|"R"|"?"}
     scope_violation: list[str] = field(default_factory=list)
     checks: list[CheckResult] = field(default_factory=list)
