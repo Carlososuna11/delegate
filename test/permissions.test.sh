@@ -226,7 +226,7 @@ test_rules_state_the_working_rules() {
 
   reset_globals
   dg_perm_resolve "read,edit,bash" 1 0 0 0 || fail "--edit must resolve"
-  assert_contains "$DG_RULES" "Read, Edit, Write y Bash" "with --edit the inventory grows"
+  assert_contains "$DG_RULES" "Read, Edit y Bash; Edit también crea archivos nuevos" "with --edit the inventory grows"
   assert_not_contains "$DG_RULES" "SOLO LECTURA" "with --edit it is not a read-only run"
 
   # --bash removes the restricted-command warning, because it stops being true.

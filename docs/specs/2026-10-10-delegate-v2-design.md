@@ -198,10 +198,10 @@ Límites conocidos:
 - Con `bash`, el delegado alcanza el `.git` compartido (refs, config) y cualquier
   archivo del usuario; con `edit`, lo que permita el harness. El diff mide el
   worktree, no la máquina. Los archivos ignorados no se miden ni se commitean.
-- Con Claude Code 2.1.295 el harness responde `No such tool available: Write` aunque
-  `delegate --edit` lo otorga: una corrida con `edit` y sin `bash` puede editar archivos
-  existentes pero no crear nuevos. Es un defecto de `delegate` frente a esa versión del
-  harness, no de `delegate-run`; el smoke real usa una edición por eso.
+- Desde Claude Code 2.1.295 el harness ya no expone `Write` (`No such tool available:
+  Write`) y `Edit` crea archivos nuevos cuando la ruta no existe. `delegate --edit` sigue
+  otorgando `Write` por compatibilidad, pero el prompt le indica al modelo que cree
+  archivos con `Edit`. Verificado con una corrida real que creó un archivo nuevo.
 - Con los filtros anulados después del hijo, un archivo LFS que el delegado modifique
   queda en la rama como contenido crudo, no como puntero.
 - La limpieza de procesos no es contención del kernel: un proceso que cambie de grupo

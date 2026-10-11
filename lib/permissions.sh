@@ -233,7 +233,7 @@ Si un comando de Bash es denegado, no intentes rodear la denegación: repórtalo
   # was told it had a tool it did not have, and spent turns discovering that by
   # failing. An inventory that does not match the grant is worse than none.
   if (( we )); then
-    rules="$rules Herramientas en este entorno: Read, Edit, Write y Bash; no existen Grep ni Glob."
+    rules="$rules Herramientas en este entorno: Read, Edit y Bash; Edit también crea archivos nuevos (si Write no existe, usa Edit con una ruta nueva); no existen Grep ni Glob."
   else
     rules="$rules Herramientas en este entorno: Read y Bash; no existen Edit, Write, Grep ni Glob. Esta corrida es de SOLO LECTURA: no puedes modificar ni crear archivos. Si la tarea requiere cambiarlos, dilo en tu respuesta en vez de intentarlo."
   fi
