@@ -466,12 +466,24 @@ Lo que ve el hijo:
   de sesión en cada fork: probado sin el runner, con un control sin sandbox donde la
   misma cadena sobrevive.
 - Seccomp: `socket(AF_UNIX)` y `socketpair` de datagramas fallan con `EAFNOSUPPORT`,
-  `io_uring_setup` con `ENOSYS`, y una arquitectura ajena mata al proceso. La red es
+  `io_uring_setup`, `_enter` y `_register` con `ENOSYS`, y una arquitectura ajena mata
+  al proceso. Quedan permitidos los pares `SOCK_STREAM` y `SOCK_SEQPACKET` (las
+  tuberías de stdio de libuv): están conectados entre sí y no pueden conectarse a otra
+  dirección. Si el stdout que recibe `delegate` es un socket, el hijo recibe en su
+  lugar una tubería que `cat` reenvía desde afuera: el filtro impide crear un socket,
+  no usar uno heredado. La red es
   compartida y con ella el espacio de sockets unix **abstractos** del host: sin el
   filtro, el sandbox se conectaba a `@/tmp/.X11-unix/X0`, y un X que admite al usuario
   por uid (`SI:localuser`) lo aceptaba, que es teclear en una terminal de afuera.
   Verificado con `xdpyinfo`. Filtro solo para x86_64 y aarch64; en otra arquitectura
   `--sandbox bwrap` se rechaza.
+- Antes de leer la key, cada montaje que va encima del HOME privado se valida
+  canónico: ni el directorio de trabajo, ni un `--sandbox-ro`, ni el del binario de
+  `claude` pueden cruzarse con el `key_dir`; un `--sandbox-ro` no puede ser el HOME ni
+  contenerlo, ni contener el directorio de trabajo. Un `claude` ELF se monta solo; un
+  script lleva su directorio, salvo que ese directorio contenga el HOME.
+- El runner fija la ruta de su `git` antes de crear el worktree: una entrada
+  absoluta del `PATH` dentro del worktree no le cambia el `git` después del hijo.
 
 Lo que **no** cierra:
 - **La red no está restringida.** El hijo alcanza internet y cualquier servicio TCP de
@@ -486,6 +498,19 @@ Lo que **no** cierra:
   (nvm, cargo, `~/.local/bin`) no existen adentro, así que con `bash` un `npm test`
   puede no correr ahí.
 - El worktree y el gitdir completo (todas las ramas y objetos del repo) son legibles.
+- Un par `SOCK_STREAM` permitido puede hacer `bind()` a un nombre abstracto del host y
+  ocuparlo: un servicio que arranque después con ese nombre falla (negación de
+  servicio, no conexión; ese socket no puede escuchar). Negarlo exige negar `bind()`
+  entero o aislar la red.
+- El solo lectura del gitdir es por montaje: un symlink o un hardlink que ya existiera
+  en el gitdir apuntando al directorio de trabajo es un alias escribible. Con los
+  worktrees del runner no pasa (el worktree es nuevo y el árbol principal no se
+  monta), y un hardlink nuevo entre montajes falla con `EXDEV`; con `delegate
+  --sandbox` sobre un repo armado así, sí.
+- `sandbox: "bwrap"` dice que el probe pasó y que a `delegate` se le pidió el sandbox,
+  no una confirmación desde adentro: si bwrap falla al montar, la corrida sale
+  `task_failed` con su mensaje en `stderr.log`, y un `DELEGATE_BIN` que ignore
+  `--sandbox` corre sin confinar.
 - Un bug del kernel en lo que sigue expuesto (namespaces, syscalls permitidas).
 - En una máquina sin bwrap (`sudo apt install bubblewrap`) y con `auto`, nada de esto
   aplica: `sandbox: "none"` es la señal.
@@ -616,7 +641,13 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   config, una ref, un hook ni el `HEAD` del gitdir; sí escribe el worktree y eso llega
   a la rama; no crea sockets unix; no hereda descriptores aparte de 0, 1 y 2; y una
   cadena que cambia de sesión en cada fork muere con el sandbox (con su control sin
-  sandbox, donde sobrevive). `auto` sin bwrap queda en `none`; `bwrap` sin bwrap es
+  sandbox, donde sobrevive). Tampoco crea un hardlink del gitdir (`EXDEV`), ni usa
+  io_uring, ni recibe como stdout un socket aunque se lo pasen a `delegate`. Un
+  `--sandbox-ro` sobre el HOME (también por symlink), el `key_dir` o la key, o que
+  contenga el directorio de trabajo, y un directorio de trabajo dentro del `key_dir`,
+  salen con 2 antes de leer la key; un `claude` script en el HOME no lo monta. Un
+  `git` plantado en una entrada del `PATH` dentro del worktree no lo corre el runner.
+  `auto` sin bwrap queda en `none`; `bwrap` sin bwrap es
   `infra_failed` sin lanzar al hijo; un flag de sandbox inválido sale con 2 antes de
   leer la key.
 

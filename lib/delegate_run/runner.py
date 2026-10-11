@@ -450,9 +450,16 @@ def _hardened_env(pin: list[str], extra: dict | None = None) -> dict:
     return env
 
 
+# The git executable of the run in progress, resolved once before the
+# worktree exists. Resolved again after the child, an absolute PATH entry
+# inside the worktree (where the delegate writes) could hand the runner a
+# `git` it planted, and that one runs outside any sandbox.
+_PINNED_GIT: str | None = None
+
+
 def _git(cwd, args, check: bool = True, env: dict | None = None,
          text: bool = True) -> subprocess.CompletedProcess:
-    cmd = [_resolve("git"), *_GIT_CONFIG, *args]
+    cmd = [_PINNED_GIT or _resolve("git"), *_GIT_CONFIG, *args]
     try:
         proc = subprocess.run(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
@@ -933,8 +940,10 @@ def _request_dict(req: Request) -> dict:
 
 
 def _run(req: Request, result: Result, run: _Run) -> None:
+    global _PINNED_GIT
     rd = run.rd
     sandboxed = _decide_sandbox(result)
+    _PINNED_GIT = _resolve("git")
     repo = _toplevel(req.repo)
     run.check_stop()
     base = _resolve_base(repo, req, result.run_id, rd)
@@ -1024,6 +1033,7 @@ def _new_run_dir() -> tuple[str, Path]:
 
 
 def _execute(req: Request) -> Result:
+    global _PINNED_GIT
     run_id, rd = _new_run_dir()
     # The run lock is taken before anything else is written, and held until
     # result.json is terminal: `status`, `cancel` and `gc` read liveness from
@@ -1059,6 +1069,7 @@ def _execute(req: Request) -> Result:
         result.status = contract.INFRA_FAILED
         result.error = f"{type(exc).__name__}: {exc}"
     finally:
+        _PINNED_GIT = None
         if result.status == contract.CANCELLED and run.signalled is not None:
             result.error = f"el runner recibió la señal {signal.Signals(run.signalled).name}"
         if slot is not None:

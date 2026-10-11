@@ -108,6 +108,32 @@ class SandboxModeTest(RunnerBase):
         self.assertLess(argv.index("--sandbox"), argv.index("--"))
 
 
+class PinnedGitTest(RunnerBase):
+    def test_a_git_planted_in_the_worktree_path_never_runs(self):
+        # An absolute PATH entry inside the future worktree: empty when the
+        # run starts, filled by the delegate. The runner's git after the child
+        # must still be the one resolved before it.
+        from unittest import mock
+        from delegate_run import contract
+        run_id = "20261010-000000-abcdef"
+        marker = self.tmp / "planted-git-ran"
+        saved = {k: os.environ.get(k) for k in ("PATH", "DELEGATE_SANDBOX", "FAKE_SCRIPT")}
+        self.addCleanup(self._restore_env, saved)
+        os.environ["PATH"] = f"{self.state / 'worktrees' / run_id / 'bin'}:{os.environ['PATH']}"
+        os.environ["DELEGATE_SANDBOX"] = "off"
+        os.environ["FAKE_MODE"] = "script"
+        os.environ["FAKE_SCRIPT"] = (
+            "import os\n"
+            "os.makedirs('bin', exist_ok=True)\n"
+            f"open('bin/git', 'w').write('#!/bin/sh\\ntouch {marker}\\nexec /usr/bin/git \"$@\"\\n')\n"
+            "os.chmod('bin/git', 0o755)\n")
+        with mock.patch.object(contract, "new_run_id", return_value=run_id):
+            result = runner.execute(self._req())
+        self.assertEqual(result.run_id, run_id)
+        self.assertIn({"path": "bin/git", "change": "A"}, result.changed_files, result.error)
+        self.assertFalse(marker.exists(), "the runner ran the git the delegate planted")
+
+
 # The fake harness. Runs INSIDE the sandbox, started by the real bin/delegate,
 # and reports every probe in the `result` of a Claude Code --json object.
 # @...@ placeholders are filled in by the test: the child's environment is
@@ -172,6 +198,18 @@ except OSError as exc:
 a, b = socket.socketpair()   # stream pairs stay allowed (libuv stdio)
 a.close(); b.close()
 probes["fds"] = sorted(int(n) for n in os.listdir("/proc/self/fd"))
+import ctypes, stat
+libc = ctypes.CDLL(None, use_errno=True)
+probes["io_uring"] = []
+for nr in (425, 426, 427):   # setup, enter, register: same numbers on x86_64 and aarch64
+    rc = libc.syscall(nr, 0, 0, 0, 0, 0, 0)
+    probes["io_uring"].append(ctypes.get_errno() if rc == -1 else "allowed")
+probes["stdout_is_socket"] = stat.S_ISSOCK(os.fstat(1).st_mode)
+try:
+    os.link(os.path.join(common, "config"), "config-alias")
+    probes["gitdir_hardlink"] = "allowed"
+except OSError as exc:
+    probes["gitdir_hardlink"] = exc.errno
 
 # The escaper: a chain that moves to a new session (and group) on every fork
 # and ignores TERM. It hops faster than a /proc scan can follow, which is the
@@ -317,6 +355,9 @@ class SandboxConfinementTest(unittest.TestCase):
         self.assertEqual(probes["gitdir_writes"], {"config": False, "ref": False,
                                                    "hook": False, "worktree_head": False})
         self.assertNotEqual(probes["git_branch_rc"], 0)
+        # A hard link into the writable worktree would be a writable alias of
+        # the gitdir's file: across mounts the kernel refuses it.
+        self.assertEqual(probes["gitdir_hardlink"], 18)   # EXDEV
         listed = subprocess.run(["git", "-C", str(self.repo), "branch", "--list", "evil"],
                                 capture_output=True, text=True).stdout
         self.assertEqual(listed.strip(), "")
@@ -328,6 +369,7 @@ class SandboxConfinementTest(unittest.TestCase):
         # No unix sockets: the abstract namespace is shared with the host.
         self.assertEqual(probes["af_unix"], 97)        # EAFNOSUPPORT
         self.assertEqual(probes["dgram_pair"], 97)
+        self.assertEqual(probes["io_uring"], [38, 38, 38])  # ENOSYS
         # Nothing but stdio crosses (the extra one is listdir's own fd).
         self.assertLessEqual(len(probes["fds"]), 4, probes["fds"])
         self.assertEqual(probes["fds"][:3], [0, 1, 2])
@@ -341,7 +383,7 @@ class SandboxConfinementTest(unittest.TestCase):
         self.addCleanup(_stop_escaper, worktree)
         self.assertFalse(_beating(worktree), "the chain outlived the run")
 
-    def _delegate_direct(self, sandbox):
+    def _delegate_direct(self, sandbox, stdout_sock=False):
         """bin/delegate alone, no runner: nothing but the sandbox can clean up."""
         wt = self.tmp / "wt"
         if not wt.exists():
@@ -351,11 +393,33 @@ class SandboxConfinementTest(unittest.TestCase):
                "LANG": "C.UTF-8", "DELEGATE_PROVIDERS_DIR": str(self.tmp / "providers.d"),
                "DELEGATE_MCP_DIR": str(self.tmp / "mcp.d")}
         flags = ["--sandbox", "bwrap", "--sandbox-ro", str(self.repo / ".git")] if sandbox else []
-        proc = subprocess.run([str(DELEGATE), "fake", "--json", "--edit", "--bash", *flags,
-                               "--dir", str(wt), "--", "escape"],
-                              capture_output=True, env=env, timeout=60)
-        self.assertEqual(proc.returncode, 0, proc.stderr.decode(errors="replace"))
-        return wt, json.loads(json.loads(proc.stdout)["result"])
+        argv = [str(DELEGATE), "fake", "--json", "--edit", "--bash", *flags,
+                "--dir", str(wt), "--", "escape"]
+        if not stdout_sock:
+            proc = subprocess.run(argv, capture_output=True, env=env, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode(errors="replace"))
+            return wt, json.loads(json.loads(proc.stdout)["result"])
+        import socket
+        mine, theirs = socket.socketpair()
+        with mine:
+            proc = subprocess.Popen(argv, stdout=theirs.fileno(), stderr=subprocess.PIPE,
+                                    env=env)
+            theirs.close()
+            chunks = []
+            while True:
+                chunk = mine.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            proc.wait(timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr.read().decode(errors="replace"))
+        proc.stderr.close()
+        return wt, json.loads(json.loads(b"".join(chunks))["result"])
+
+    def test_a_socket_on_stdout_reaches_the_child_as_a_pipe(self):
+        wt, probes = self._delegate_direct(sandbox=True, stdout_sock=True)
+        self.addCleanup(_stop_escaper, wt)
+        self.assertFalse(probes["stdout_is_socket"])
 
     def test_escaper_dies_with_the_sandbox_itself(self):
         wt, probes = self._delegate_direct(sandbox=True)
@@ -408,6 +472,27 @@ class SandboxFlagsTest(unittest.TestCase):
         for path in ("repo/.git", str(self.tmp / "missing")):
             proc = self._delegate("--sandbox", "bwrap", "--sandbox-ro", path)
             self.assertEqual(proc.returncode, 2, (path, proc.stderr))
+
+    @unittest.skipIf(BWRAP_PROBLEM, f"bwrap no usable: {BWRAP_PROBLEM}")
+    def test_read_only_paths_over_home_or_keys_are_refused(self):
+        link = self.tmp / "link-to-home"
+        os.symlink(self.tmp / "home", link)
+        for path in (self.tmp / "home", link, self.tmp / "keys", self.key_file, self.tmp):
+            proc = self._delegate("--sandbox", "bwrap", "--sandbox-ro", str(path))
+            self.assertEqual(proc.returncode, 2, (path, proc.stderr))
+
+    @unittest.skipIf(BWRAP_PROBLEM, f"bwrap no usable: {BWRAP_PROBLEM}")
+    def test_workdir_inside_the_key_dir_is_refused(self):
+        sub = self.tmp / "keys" / "sub"
+        sub.mkdir()
+        proc = self._delegate("--sandbox", "bwrap", workdir=sub)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    @unittest.skipIf(BWRAP_PROBLEM, f"bwrap no usable: {BWRAP_PROBLEM}")
+    def test_read_only_path_over_the_workdir_is_refused(self):
+        proc = self._delegate("--sandbox", "bwrap", "--sandbox-ro", str(self.repo),
+                              workdir=self.repo / ".git")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
 
     @unittest.skipIf(BWRAP_PROBLEM, f"bwrap no usable: {BWRAP_PROBLEM}")
     def test_workdir_containing_home_is_refused(self):

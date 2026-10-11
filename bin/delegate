@@ -442,6 +442,9 @@ cmd_mcp() {
 # before the key is read: a run asked to be confined never runs unconfined.
 dg_reject() { printf '%s✗%s %s\n' "$RED" "$R" "$*" >&2; exit 2; }
 
+# True if two canonical paths are the same or one contains the other.
+dg_sbx_overlaps() { [[ "$1/" == "$2"/* || "$2/" == "$1"/* ]]; }
+
 # One classic-BPF instruction (struct sock_filter, little-endian): code, jt,
 # jf, k. Bash's printf builtin emits the \x00 bytes as they are.
 _dg_bpf_ins() {
@@ -462,8 +465,10 @@ _dg_bpf_ins() {
 #     created, so none can connect to an abstract (or any) address;
 #   - socketpair() only for SOCK_STREAM and SOCK_SEQPACKET (libuv's stdio
 #     pipes): a datagram pair can be re-connect()ed to another address;
-#   - io_uring_setup fails with ENOSYS: IORING_OP_SOCKET would create a
-#     socket without the socket() syscall that this filter sees;
+#   - io_uring_setup, _enter and _register fail with ENOSYS:
+#     IORING_OP_SOCKET would create a socket without the socket() syscall
+#     that this filter sees, and no ring can be used even if one were
+#     inherited;
 #   - x32 syscall numbers fail with ENOSYS, and any foreign architecture
 #     (int 0x80 on x86_64) kills the process.
 dg_seccomp_bpf() {
@@ -480,21 +485,23 @@ dg_seccomp_bpf() {
   _dg_bpf_ins $jeq 1 0 $arch                #  1 native? -> 3
   _dg_bpf_ins $ret 0 0 $kill                #  2
   _dg_bpf_ins $ld  0 0 0                    #  3 A = nr
-  _dg_bpf_ins $jge 13 0 $(( 0x40000000 ))   #  4 x32 -> 18
-  _dg_bpf_ins $jeq 3 0 $nr_socket           #  5 socket -> 9
-  _dg_bpf_ins $jeq 5 0 $nr_pair             #  6 socketpair -> 12
-  _dg_bpf_ins $jeq 10 0 $nr_uring           #  7 io_uring_setup -> 18
-  _dg_bpf_ins $ret 0 0 $allow               #  8
-  _dg_bpf_ins $ld  0 0 16                   #  9 A = low word of args[0] (domain)
-  _dg_bpf_ins $jeq 5 0 1                    # 10 AF_UNIX -> 16
-  _dg_bpf_ins $ret 0 0 $allow               # 11
-  _dg_bpf_ins $ld  0 0 24                   # 12 A = low word of args[1] (type)
-  _dg_bpf_ins $and 0 0 15                   # 13 drop SOCK_CLOEXEC / SOCK_NONBLOCK
-  _dg_bpf_ins $jeq 2 0 1                    # 14 SOCK_STREAM -> 17
-  _dg_bpf_ins $jeq 1 0 5                    # 15 SOCK_SEQPACKET -> 17
-  _dg_bpf_ins $ret 0 0 $eafnosupport        # 16
-  _dg_bpf_ins $ret 0 0 $allow               # 17
-  _dg_bpf_ins $ret 0 0 $enosys              # 18
+  _dg_bpf_ins $jge 15 0 $(( 0x40000000 ))   #  4 x32 -> 20
+  _dg_bpf_ins $jeq 5 0 $nr_socket           #  5 socket -> 11
+  _dg_bpf_ins $jeq 7 0 $nr_pair             #  6 socketpair -> 14
+  _dg_bpf_ins $jeq 12 0 $nr_uring           #  7 io_uring_setup -> 20
+  _dg_bpf_ins $jeq 11 0 $(( nr_uring + 1 )) #  8 io_uring_enter -> 20
+  _dg_bpf_ins $jeq 10 0 $(( nr_uring + 2 )) #  9 io_uring_register -> 20
+  _dg_bpf_ins $ret 0 0 $allow               # 10
+  _dg_bpf_ins $ld  0 0 16                   # 11 A = low word of args[0] (domain)
+  _dg_bpf_ins $jeq 5 0 1                    # 12 AF_UNIX -> 18
+  _dg_bpf_ins $ret 0 0 $allow               # 13
+  _dg_bpf_ins $ld  0 0 24                   # 14 A = low word of args[1] (type)
+  _dg_bpf_ins $and 0 0 15                   # 15 drop SOCK_CLOEXEC / SOCK_NONBLOCK
+  _dg_bpf_ins $jeq 2 0 1                    # 16 SOCK_STREAM -> 19
+  _dg_bpf_ins $jeq 1 0 5                    # 17 SOCK_SEQPACKET -> 19
+  _dg_bpf_ins $ret 0 0 $eafnosupport        # 18
+  _dg_bpf_ins $ret 0 0 $allow               # 19
+  _dg_bpf_ins $ret 0 0 $enosys              # 20
 }
 
 # Fills _DG_X_SBX with the bwrap prefix for the child. Arguments: bwrap path,
@@ -542,6 +549,9 @@ dg_sandbox_argv() {
        [[ "$d" == / ]]; then
       die "--sandbox bwrap: claude ($claude_real) no es un binario y su directorio contiene tu HOME; no lo monto en el sandbox"
     fi
+  fi
+  if dg_sbx_overlaps "$d" "$_DG_SBX_KEYDIR"; then
+    die "--sandbox bwrap: montar $d expondría el key_dir ($_DG_SBX_KEYDIR)"
   fi
   _DG_X_SBX+=(--ro-bind "$d" "$d" --ro-bind "$stubs" "$stubs" --bind "$wroot" "$wroot")
   for p in "$@"; do
@@ -616,7 +626,7 @@ cmd_run() {
   [[ -n "$model" ]] || model="${CFG[model]}"
 
   # ── sandbox: validated here, before the key is read ──
-  local bwrap_bin='' sbx_ro_real=() sp
+  local bwrap_bin='' sbx_ro_real=() sp rp
   case "$sandbox" in
     off)
       (( ${#sandbox_ro[@]} )) && dg_reject "--sandbox-ro solo vale con --sandbox bwrap"
@@ -635,9 +645,26 @@ cmd_run() {
          { [[ "${HOME:-}" == /?* ]] && [[ "$(readlink -f -- "$HOME" 2>/dev/null || printf '%s' "$HOME")/" == "$wroot"/* ]]; }; then
         dg_reject "--sandbox bwrap: el directorio de trabajo no puede ser / ni contener tu HOME ($wroot)"
       fi
+      # Every mount that goes on top of the private HOME is checked, canonical,
+      # against what must stay out: the key_dir (all accounts, not just this
+      # run's) overlapping in either direction, and HOME itself or an ancestor.
+      # A read-only path that contains the working directory would also hide
+      # its read-write mount.
+      _DG_SBX_HOME="$(readlink -f -- "${HOME:-/nonexistent}" 2>/dev/null || printf '%s' "${HOME:-}")"
+      _DG_SBX_KEYDIR="$(_dg_account_dir "${CFG[key_dir]}")" || dg_reject "no puedo resolver el key_dir"
+      _DG_SBX_KEYDIR="$(readlink -f -- "$_DG_SBX_KEYDIR" 2>/dev/null || printf '%s' "$_DG_SBX_KEYDIR")"
+      dg_sbx_overlaps "$wroot" "$_DG_SBX_KEYDIR" &&
+        dg_reject "--sandbox bwrap: el directorio de trabajo se cruza con el key_dir ($_DG_SBX_KEYDIR)"
       for sp in ${sandbox_ro[@]+"${sandbox_ro[@]}"}; do
         [[ "$sp" == /* && -e "$sp" ]] || dg_reject "--sandbox-ro necesita una ruta absoluta que exista: $sp"
-        sbx_ro_real+=("$(readlink -f -- "$sp")") || dg_reject "no puedo resolver $sp"
+        rp="$(readlink -f -- "$sp")" || dg_reject "no puedo resolver $sp"
+        dg_sbx_overlaps "$rp" "$_DG_SBX_KEYDIR" &&
+          dg_reject "--sandbox-ro $sp se cruza con el key_dir ($_DG_SBX_KEYDIR)"
+        [[ "$rp" == / || "$_DG_SBX_HOME/" == "$rp"/* ]] &&
+          dg_reject "--sandbox-ro $sp es tu HOME o lo contiene"
+        [[ "$wroot/" == "$rp"/* ]] &&
+          dg_reject "--sandbox-ro $sp contiene el directorio de trabajo, que quedaría en solo lectura"
+        sbx_ro_real+=("$rp")
       done
       ;;
     *) dg_reject "--sandbox acepta bwrap u off, no '$sandbox'" ;;
@@ -927,6 +954,7 @@ WRAP
     claude_real="$(readlink -f -- "$claude_bin")" || die "no puedo resolver $claude_bin"
     dg_seccomp_bpf "$HOSTTYPE" > "$stub_dir/.seccomp.bpf" || die "no pude escribir el filtro seccomp"
     _DG_X_BPF="$stub_dir/.seccomp.bpf"
+    _DG_SBX_CAT="$(type -P cat)" || die "no encuentro cat en el PATH"
     dg_sandbox_argv "$bwrap_bin" "$wroot" "$stub_dir" "$claude_real" 9 \
       ${sbx_ro_real[@]+"${sbx_ro_real[@]}"}
     claude_bin="$claude_real"
@@ -1022,6 +1050,14 @@ WRAP
   # run. Verified with a sentinel. grep needs nothing from the environment, and
   # `exec` leaves no forked copy of this shell behind it.
   exec 2> >(exec "$env_bin" -i "$grep_bin" --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
+  # In the sandbox, stdout must not be a unix socket: the seccomp filter stops
+  # the child from CREATING one, not from using one it inherits (connect() on
+  # an unconnected socket, sendto() on a datagram one, a listener's accept()).
+  # Under delegate-run stdout is a file; a caller that hands a socket gets a
+  # pipe relayed by cat outside the sandbox.
+  if [[ "$sandbox" == 'bwrap' && -S /dev/stdout ]]; then
+    exec 1> >(exec "$env_bin" -i "$_DG_SBX_CAT")
+  fi
 
   # The environment is BUILT, not inherited. `env -u A -u B VAR=x cmd` keeps
   # everything else the parent had, so GITHUB_TOKEN, AWS_*, NODE_OPTIONS and
