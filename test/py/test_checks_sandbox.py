@@ -131,6 +131,17 @@ class ChecksSandboxTest(ChecksBase):
         self.assertIn("unix-denied 97", log)
         self.assertNotIn("UNIX-OK", log)
 
+    def test_a_check_inherits_only_stdio_and_runs_under_seccomp(self):
+        code = ("import os\n"
+                "print('fds', sorted(int(f) for f in os.listdir('/proc/self/fd')))\n"
+                "print([l.split()[1] for l in open('/proc/self/status')"
+                " if l.startswith('Seccomp:')])\n")
+        result = runner.execute(self._req(checks=(("python3", "-c", code),)))
+        log = self._log(result)
+        # The listing's own descriptor is the 3.
+        self.assertIn("fds [0, 1, 2, 3]", log)
+        self.assertIn("['2']", log)
+
     def test_a_check_runs_a_tool_from_the_home_toolchain(self):
         home = self._fake_home()
         bindir = home / ".nvm" / "versions" / "node" / "v0.0.0" / "bin"
@@ -196,6 +207,60 @@ class ChecksSandboxTest(ChecksBase):
         self.assertNotIn("LEAKY-RAN", log)
         self.assertIn("no se monta", log)
 
+    def test_registry_credentials_inside_a_toolchain_are_masked(self):
+        home = self._fake_home()
+        prefix = home / ".nvm" / "versions" / "node" / "v0.0.0"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "etc").mkdir()
+        (prefix / "etc" / "npmrc").write_text("//r/:_authToken=nvm-npmrc-canary-3c9d\n")
+        (prefix / "lib").mkdir()
+        (prefix / "lib" / "runtime.js").write_text("runtime-visible\n")
+        project = self.tmp / "project"
+        project.mkdir()
+        subprocess.run(["/usr/bin/python3", "-m", "venv", "--without-pip",
+                        str(project / ".venv")], check=True)
+        (project / ".venv" / "pip.conf").write_text(
+            "[global]\nindex-url = https://u:pipconf-canary-8e21@x/simple\n")
+        probe = (f"import sys\nfor p in ['{prefix}/etc/npmrc', '{prefix}/lib/runtime.js',"
+                 f" '{project}/.venv/pip.conf']:\n"
+                 "    print(p, repr(open(p).read()))\n")
+        result = runner.execute(self._req(
+            checks=((str(project / ".venv" / "bin" / "python"), "-c", probe),)))
+        log = self._log(result)
+        self.assertEqual(result.checks[0].exit, 0, log)
+        self.assertIn("runtime-visible", log)
+        self.assertNotIn("nvm-npmrc-canary-3c9d", log)
+        self.assertNotIn("pipconf-canary-8e21", log)
+        self.assertIn(f"{prefix}/etc/npmrc ''", log)
+
+    def test_check_ro_over_a_symlinked_sensitive_dir_is_refused(self):
+        # ~/.config lives elsewhere through a symlink; mounting its real
+        # parent would expose the provider keys.
+        home = self._fake_home()
+        elsewhere = self.tmp / "devtools"
+        (elsewhere / "config" / "qwen").mkdir(parents=True)
+        (elsewhere / "config" / "qwen" / "api_key").write_text("key-canary\n")
+        os.symlink(elsewhere / "config", home / ".config")
+        os.environ["DELEGATE_CHECK_RO"] = str(elsewhere)
+        result = runner.execute(self._req(checks=(("true",),)))
+        self.assertEqual(result.status, "infra_failed")
+        self.assertIn("DELEGATE_CHECK_RO", result.error)
+        self.assertFalse(self.argv_file.exists())
+
+    def test_check_ro_over_a_provider_key_dir_is_refused(self):
+        keys = self.tmp / "outside" / "keys"
+        keys.mkdir(parents=True)
+        providers = self.tmp / "providers.d"
+        providers.mkdir()
+        (providers / "p").write_text(f"model\tm\nkey_dir\t{keys}\n")
+        saved = os.environ.get("DELEGATE_PROVIDERS_DIR")
+        self.addCleanup(self._restore_env, {"DELEGATE_PROVIDERS_DIR": saved})
+        os.environ["DELEGATE_PROVIDERS_DIR"] = str(providers)
+        os.environ["DELEGATE_CHECK_RO"] = str(self.tmp / "outside")
+        result = runner.execute(self._req(checks=(("true",),)))
+        self.assertEqual(result.status, "infra_failed")
+        self.assertIn(str(keys), result.error)
+
     def test_check_ro_exposes_an_extra_directory(self):
         extra = self.tmp / "browsers"
         extra.mkdir()
@@ -234,6 +299,32 @@ class ChecksSandboxTest(ChecksBase):
         import time
         time.sleep(4)
         self.assertFalse(marker.exists())
+
+
+@unittest.skipIf(BWRAP_PROBLEM, f"bwrap no usable: {BWRAP_PROBLEM}")
+class PinnedBwrapTest(ChecksBase):
+    def test_a_bwrap_in_the_worktree_path_never_runs(self):
+        # The base itself carries bin/bwrap, and an absolute PATH entry points
+        # at the future worktree's bin: once the worktree exists, a lookup by
+        # name would find it (and the delegate could rewrite it). The runner
+        # must keep the bwrap it resolved before creating the worktree.
+        from unittest import mock
+        run_id = "20261011-000000-abcdef"
+        marker = self.tmp / "planted-bwrap-ran"
+        (self.repo / "bin").mkdir()
+        planted = self.repo / "bin" / "bwrap"
+        planted.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        planted.chmod(0o755)
+        self._git(self.repo, "add", "bin/bwrap")
+        self._git(self.repo, "commit", "-q", "-m", "plant")
+        os.environ["DELEGATE_SANDBOX"] = "auto"
+        os.environ["PATH"] = f"{self.state / 'worktrees' / run_id / 'bin'}:{os.environ['PATH']}"
+        with mock.patch.object(contract, "new_run_id", return_value=run_id):
+            result = runner.execute(self._req(checks=(("true",),)))
+        self.assertEqual(result.run_id, run_id)
+        self.assertEqual(result.checks_sandbox, "bwrap", result.error)
+        self.assertEqual(result.checks[0].exit, 0)
+        self.assertFalse(marker.exists(), "the runner ran the bwrap from the worktree")
 
 
 class ChecksWithoutSandboxTest(ChecksBase):

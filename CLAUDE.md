@@ -552,11 +552,19 @@ Lo que se monta del HOME, en solo lectura y nada más:
   máquina, nunca la petición (p. ej. `~/.cache/ms-playwright`). Una ruta inválida deja
   la corrida `infra_failed` **antes** de lanzar al hijo.
 
+Dentro de todo lo montado, los archivos que pueden llevar credenciales de un registro
+(`npmrc`, `.npmrc`, `pip.conf`, `.pypirc`, `.netrc`, `.git-credentials`, `credentials`,
+`auth.json`, `uv.toml`, `.yarnrc*`, hasta 4 niveles) se tapan con un archivo vacío: nvm
+guarda la config global de npm en `~/.nvm/versions/node/<v>/etc/npmrc`, y un venv su
+`pip.conf` con el índice autenticado.
+
 Nunca se monta algo que sea, contenga o esté dentro de `~/.ssh`, `~/.gnupg`,
 `~/.config` (ahí viven los `key_dir`), `~/.aws`, `~/.kube`, `~/.docker`, `~/.claude`,
 `~/.codex`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.gitconfig`,
-`~/.local/state`, `~/.local/share/keyrings` y compañía, ni el state dir, ni el HOME o algo
-que lo contenga, ni algo que contenga el worktree. Esa lista solo vigila lo que nombra
+`~/.local/state`, `~/.local/share/keyrings` y compañía (bajo el `HOME` y bajo el home de
+`passwd`, por ruta y por destino real si son symlinks), ni el `key_dir` de ningún
+proveedor (leído de `providers.d` como dato), ni el state dir, ni el HOME o algo que lo
+contenga, ni algo que contenga el worktree. Esa lista solo vigila lo que nombra
 quien llama o el dueño; lo que se expone por defecto es la allowlist de toolchains. Un
 ejecutable de check que cae ahí no se monta y su log lo dice.
 
@@ -577,6 +585,10 @@ Decisiones y límites:
 - Un venv montado tal cual: un `.pth` editable que apunte al checkout del usuario no
   se ve (y antes importaba ese código, no el del worktree).
 - Un comando que no existe sale 127 sin lanzar bwrap, igual que sin sandbox.
+- El `bwrap` de los checks se fija al decidir el sandbox, **antes** de crear el
+  worktree, y nunca dentro del state dir: una entrada del `PATH` que apunte al worktree
+  futuro le daría al runner un `bwrap` del árbol, que correría los checks en el host
+  con `checks_sandbox: "bwrap"`.
 
 Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_id>/`
 (`request.json`, `result.json`, `stdout.log`, `stderr.log`, `patch.diff`, `checks/`,
@@ -783,8 +795,12 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   `~/.nvm/versions`, el `node` real y el python de un venv fuera del worktree (sin ver
   lo que está al lado del venv); un ejecutable bajo `~/.config` no se monta; un
   `DELEGATE_CHECK_RO` sobre `~/.ssh`, `~/.config`, el HOME, el state dir o relativo es
-  `infra_failed` sin lanzar al hijo; con `off` el check sí lee el canario y
-  `checks_sandbox` es `none`. El seccomp de Python es byte a byte el de Bash.
+  `infra_failed` sin lanzar al hijo, igual que uno sobre el destino real de un
+  `~/.config` symlink o sobre el `key_dir` de un proveedor; el `npmrc` de nvm y el
+  `pip.conf` de un venv montados se leen vacíos; un `bwrap` en una entrada del `PATH`
+  dentro del worktree no corre; el check no hereda descriptores aparte de 0, 1 y 2 y
+  corre con seccomp; con `off` el check sí lee el canario y `checks_sandbox` es `none`.
+  El seccomp de Python es byte a byte el de Bash.
 
 ## Lo que NO se construye
 

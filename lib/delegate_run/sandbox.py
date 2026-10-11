@@ -26,7 +26,9 @@ What a check needs from the home, read-only and nothing else:
   useless (npm and uv write to them) and read-write a check could poison a
   cache the user's host tools later execute from, outside any sandbox. A
   check starts with an empty cache in the private HOME, and installs go to
-  the network.
+  the network. Inside every mounted tree, files that may hold registry
+  credentials (CREDENTIAL_NAMES: nvm's etc/npmrc, a venv's pip.conf...) are
+  masked with an empty file.
 - The check's own executable when the host resolves it outside every mount
   above (a venv's `.venv/bin/pytest`, a tool in ~/bin): its venv when it is
   one (the directory holding pyvenv.cfg), else the file alone.
@@ -45,6 +47,7 @@ and TCP services on localhost (a test database); unix sockets do not work.
 from __future__ import annotations
 
 import os
+import pwd
 import shutil
 import struct
 from pathlib import Path
@@ -59,6 +62,17 @@ SENSITIVE = (".ssh", ".gnupg", ".config", ".aws", ".azure", ".kube", ".docker",
              ".git-credentials", ".gitconfig", ".password-store", ".pki",
              ".vault-token", ".local/share/keyrings", ".local/state", ".mozilla",
              ".bash_history", ".zsh_history", ".python_history")
+
+# Files that may carry registry or index credentials INSIDE a mounted
+# toolchain, venv or extra path: nvm's global npm config lives at
+# ~/.nvm/versions/node/<v>/etc/npmrc, a venv's pip config at <venv>/pip.conf.
+# Each one found (a regular file, up to CREDENTIAL_DEPTH levels down) is
+# masked with an empty file after the mounts.
+CREDENTIAL_NAMES = frozenset({"npmrc", ".npmrc", "pip.conf", "pip.ini", ".pypirc",
+                              ".netrc", ".git-credentials", "credentials",
+                              "credentials.toml", ".yarnrc", ".yarnrc.yml", "uv.toml",
+                              "auth.json"})
+CREDENTIAL_DEPTH = 4
 
 _SYSTEM_DIRS = ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
 _ARCHES = {"x86_64": (0xC000003E, 41, 53), "aarch64": (0xC00000B7, 198, 199)}
@@ -107,6 +121,22 @@ def seccomp_bpf(machine: str) -> bytes:
     return b"".join(struct.pack("<HBBI", *ins) for ins in prog)
 
 
+def _credential_files(src: str, dest: str) -> list[str]:
+    """Paths, under `dest`, of the credential files found under `src`."""
+    if os.path.isfile(src):
+        return [dest] if os.path.basename(src) in CREDENTIAL_NAMES else []
+    found = []
+    base = src.rstrip("/").count("/")
+    for top, dirs, files in os.walk(src, followlinks=False):
+        rel = os.path.relpath(top, src)
+        for name in files:
+            if name in CREDENTIAL_NAMES and not os.path.islink(os.path.join(top, name)):
+                found.append(os.path.normpath(os.path.join(dest, rel, name)))
+        if top.rstrip("/").count("/") - base >= CREDENTIAL_DEPTH:
+            dirs[:] = []
+    return found
+
+
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
@@ -124,17 +154,30 @@ class ChecksSandbox:
     """
 
     def __init__(self, bwrap: str, worktree: Path, gitdirs: list[str], home: str | None,
-                 state_root: Path, machine: str, extra_ro: str = ""):
+                 state_root: Path, machine: str, extra_ro: str = "", key_dirs=(),
+                 empty: str = ""):
         self.bwrap = bwrap
+        self.empty = empty
         self.worktree = os.path.realpath(worktree)
         self.home = home if home and home.startswith("/") and home != "/" else None
         self.bpf = seccomp_bpf(machine)
         self.denied = [os.path.realpath(state_root)]
-        if self.home:
-            real_home = os.path.realpath(self.home)
-            for rel in SENSITIVE:
-                self.denied.append(os.path.join(real_home, rel))
-                self.denied.append(os.path.join(self.home, rel))
+        # The sensitive names under HOME and under the account's home from
+        # passwd, which differ when the caller set HOME elsewhere.
+        homes = {self.home} if self.home else set()
+        try:
+            homes.add(pwd.getpwuid(os.getuid()).pw_dir)
+        except KeyError:
+            pass
+        for home in {h for h in homes if h and h != "/"}:
+            for base in {home, os.path.realpath(home)}:
+                for rel in SENSITIVE:
+                    self.denied.append(os.path.join(base, rel))
+                    # A sensitive directory that is a symlink is denied where
+                    # it really lives, too: ~/.config -> /srv/x/config.
+                    self.denied.append(os.path.realpath(os.path.join(base, rel)))
+        for kd in key_dirs:
+            self.denied += [os.path.abspath(kd), os.path.realpath(kd)]
         self.visible = [*_SYSTEM_DIRS, self.worktree]
         self.toolchain: list[tuple[str, str]] = []
         if self.home:
@@ -155,6 +198,10 @@ class ChecksSandbox:
             self.extra.append((os.path.realpath(raw), raw))
             self.visible.append(raw)
         self.gitdirs = list(gitdirs)
+        self.masks = [m for src, dest in self.toolchain + self.extra
+                      for m in _credential_files(src, dest)]
+        if not self.empty:
+            raise SandboxError("falta el archivo vacío para tapar credenciales")
 
     def _allowed(self, path: str) -> str | None:
         """None if `path` may be bound read-only; otherwise why not."""
@@ -216,8 +263,15 @@ class ChecksSandbox:
         for src, dest in self.toolchain + self.extra:
             out += ["--ro-bind", src, dest]
         bind, note = self._executable_bind(argv[0], path_env)
+        masks = list(self.masks)
         if bind:
             out += ["--ro-bind", bind[0], bind[1]]
+            masks += _credential_files(*bind)
+        # An empty regular file, not /dev/null: a device node on a bwrap
+        # mount opens with EACCES, and npm reading its global npmrc must see
+        # an empty config, not an error.
+        for m in masks:
+            out += ["--ro-bind", self.empty, m]
         out += ["--bind", self.worktree, self.worktree]
         for p in self.gitdirs:
             out += ["--ro-bind", p, p]

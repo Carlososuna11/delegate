@@ -725,14 +725,28 @@ def _sandbox_mode() -> str:
     return raw
 
 
+# The bwrap the checks run under, resolved by _decide_sandbox BEFORE the
+# worktree exists: an absolute PATH entry inside the future worktree must not
+# hand the runner a `bwrap` the delegate wrote (it would run the checks on the
+# host while result.json says "bwrap"). Same rule as _PINNED_GIT.
+_PINNED_BWRAP: str | None = None
+
+
 def _bwrap_unusable() -> str | None:
     """None if bwrap can build the sandbox here; otherwise why not."""
+    global _PINNED_BWRAP
+    _PINNED_BWRAP = None
     machine = os.uname().machine
     if machine not in _SANDBOX_ARCHES:
         return f"no hay filtro seccomp para la arquitectura {machine}"
     bwrap = contract.which("bwrap")
     if not bwrap:
         return "no encuentro bwrap en el PATH (instálalo con 'sudo apt install bubblewrap')"
+    bwrap = os.path.realpath(bwrap)
+    state = os.path.realpath(os.environ.get("DELEGATE_STATE_DIR")
+                             or Path.home() / ".local" / "state" / "delegate")
+    if bwrap.startswith(state + os.sep):
+        return f"bwrap ({bwrap}) está dentro del state dir de delegate"
     try:
         proc = subprocess.run([bwrap, *_BWRAP_PROBE], stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -742,6 +756,7 @@ def _bwrap_unusable() -> str | None:
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip() or f"código {proc.returncode}"
         return f"bwrap no pudo crear el sandbox: {detail}"
+    _PINNED_BWRAP = bwrap
     return None
 
 
@@ -943,17 +958,52 @@ def _check_env(worktree: Path) -> dict:
     return env
 
 
-def _checks_sandbox(worktree: Path, sandbox_ro: list[str]) -> _sandbox.ChecksSandbox:
+def _checks_sandbox(worktree: Path, sandbox_ro: list[str], rd: Path) -> _sandbox.ChecksSandbox:
     """The sandbox for this run's checks, validated before the child runs."""
-    bwrap = contract.which("bwrap")
-    if not bwrap:
-        raise _Infra("bwrap desapareció del PATH antes de los checks")
+    if not _PINNED_BWRAP:
+        raise _Infra("no hay un bwrap fijado para los checks")
+    # Mounted read-only over credential files found in the mounted trees.
+    empty = rd / "empty"
+    empty.write_bytes(b"")
+    empty.chmod(0o444)
     try:
         return _sandbox.ChecksSandbox(
-            bwrap, worktree, sandbox_ro, os.environ.get("HOME"), contract.state_root(),
-            os.uname().machine, os.environ.get("DELEGATE_CHECK_RO", ""))
+            _PINNED_BWRAP, worktree, sandbox_ro, os.environ.get("HOME"),
+            contract.state_root(), os.uname().machine,
+            os.environ.get("DELEGATE_CHECK_RO", ""), _key_dirs(), str(empty))
     except _sandbox.SandboxError as exc:
         raise _Infra(f"sandbox de los checks: {exc}") from exc
+
+
+def _key_dirs() -> list[str]:
+    """Every provider's key_dir, best effort: only ever ADDS denied paths.
+
+    The providers directory is DELEGATE_PROVIDERS_DIR or the one next to the
+    real `delegate`; each `key_dir<TAB>value` line is read as data (`~/`
+    expanded), never sourced.
+    """
+    dirs = []
+    pdir = os.environ.get("DELEGATE_PROVIDERS_DIR")
+    if not pdir:
+        try:
+            dg = os.path.realpath(_resolve(os.environ.get("DELEGATE_BIN") or "delegate"))
+            pdir = os.path.join(os.path.dirname(os.path.dirname(dg)), "providers.d")
+        except _Infra:
+            return dirs
+    try:
+        names = os.listdir(pdir)
+    except OSError:
+        return dirs
+    for name in names:
+        try:
+            with open(os.path.join(pdir, name), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    key, _, value = line.strip().partition("\t")
+                    if key == "key_dir" and value:
+                        dirs.append(os.path.expanduser(value) if value.startswith("~/") else value)
+        except OSError:
+            continue
+    return [d for d in dirs if d.startswith("/")]
 
 
 def _missing_executable(argv0: str, path_env: str) -> bool:
@@ -1059,7 +1109,7 @@ def _run(req: Request, result: Result, run: _Run) -> None:
     sandbox_ro = _sandbox_ro(worktree, gitdir) if sandboxed else None
     # The checks' sandbox is built now, before the child: a bad
     # DELEGATE_CHECK_RO is infra_failed before a provider is paid.
-    box = _checks_sandbox(worktree, sandbox_ro) if sandboxed and req.checks else None
+    box = _checks_sandbox(worktree, sandbox_ro, rd) if sandboxed and req.checks else None
     run.check_stop()
 
     with open(rd / "stdout.log", "wb") as out, open(rd / "stderr.log", "wb") as err:
