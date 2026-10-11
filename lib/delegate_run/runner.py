@@ -34,6 +34,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -65,6 +66,29 @@ _CHECK_ENV_KEEP = ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
 # the delegate wrote), and nothing daemonizes behind the runner's back.
 _GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
                "-c", "maintenance.auto=false", "-c", "core.quotePath=false")
+
+
+def _trusted_path() -> str:
+    """The caller's PATH with only absolute entries.
+
+    Commands are resolved against this BEFORE any cwd change: a relative or
+    empty entry would resolve inside the worktree, where the delegate can plant
+    a `git` or a `delegate` that the runner would then run with its full
+    environment.
+    """
+    entries = [e for e in os.environ.get("PATH", "").split(os.pathsep) if e.startswith("/")]
+    return os.pathsep.join(entries) or "/usr/bin:/bin"
+
+
+def _resolve(name: str) -> str:
+    if "/" in name:
+        if not os.path.isabs(name):
+            raise _Infra(f"{name!r} tiene que ser una ruta absoluta o un nombre en el PATH")
+        return name
+    found = shutil.which(name, path=_trusted_path())
+    if not found:
+        raise _Infra(f"no encuentro {name!r} en el PATH")
+    return os.path.abspath(found)
 
 
 class _Infra(Exception):
@@ -317,6 +341,9 @@ def _acquire_slot(wait: bool, run: _Run):
 def _git_env(extra: dict | None = None) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # Helpers git runs by name (git-lfs, a credential helper) resolve against
+    # this PATH with the worktree as cwd: no relative entries.
+    env["PATH"] = _trusted_path()
     if extra:
         env.update(extra)
     return env
@@ -324,7 +351,7 @@ def _git_env(extra: dict | None = None) -> dict:
 
 def _git(cwd, args, check: bool = True, env: dict | None = None,
          text: bool = True) -> subprocess.CompletedProcess:
-    cmd = ["git", *_GIT_CONFIG, *args]
+    cmd = [_resolve("git"), *_GIT_CONFIG, *args]
     try:
         proc = subprocess.run(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
@@ -517,7 +544,7 @@ def _commit(worktree: Path, base: str, tree: str, result: Result, req: Request) 
 # --- child ------------------------------------------------------------------
 
 def _child_argv(req: Request, worktree: Path) -> list[str]:
-    argv = [os.environ.get("DELEGATE_BIN") or "delegate", req.provider, "--json"]
+    argv = [_resolve(os.environ.get("DELEGATE_BIN") or "delegate"), req.provider, "--json"]
     if req.account:
         argv += ["--account", req.account]
     if "edit" in req.grants:

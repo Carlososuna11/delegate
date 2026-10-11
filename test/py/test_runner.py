@@ -509,6 +509,23 @@ class ChecksEnvTest(RunnerBase):
         self.assertEqual(result.checks[0].exit, 127)
 
 
+class PlantedBinaryTest(RunnerBase):
+    def test_runner_never_runs_a_git_planted_in_the_worktree(self):
+        # The delegate leaves an executable named `git` in the worktree, and
+        # the caller's PATH has a relative entry. The runner's own git calls
+        # after the child (add, write-tree, commit-tree) must not run it.
+        os.environ["FAKE_MODE"] = "plant_git"
+        marker = self.tmp / "planted-git-ran"
+        os.environ["FAKE_MARKER"] = str(marker)
+        self.addCleanup(os.environ.pop, "FAKE_MARKER", None)
+        old_path = os.environ["PATH"]
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        os.environ["PATH"] = ".:" + old_path
+        result = runner.execute(self._req())
+        self.assertEqual(result.status, contract.COMPLETED, result.error)
+        self.assertFalse(marker.exists(), "the runner ran the delegate's git")
+
+
 class DirtyTreeTest(RunnerBase):
     def test_untracked_only_is_dirty(self):
         (self.repo / "new.txt").write_text("wip\n", encoding="utf-8")

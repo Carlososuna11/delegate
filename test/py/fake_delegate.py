@@ -23,6 +23,7 @@ Modes (FAKE_MODE):
   self_commit        write edited.txt and `git commit` it in --dir, valid JSON
   odd_names          create a file whose name has a newline, outside src/
   plant_bin          write an executable `mycheck` in --dir that exits 0
+  plant_git          write an executable `git` in --dir that touches $FAKE_MARKER
   plant_checks       write edited.txt plus files that try to define the checks
                      (.delegate-run.json, package.json), valid JSON
 
@@ -149,6 +150,11 @@ def main(argv):
         path = os.path.join(workdir, "mycheck")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, 0o755)
+    if mode == "plant_git":
+        path = os.path.join(workdir, "git")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"#!/bin/sh\ntouch {os.environ['FAKE_MARKER']}\nexit 0\n")
         os.chmod(path, 0o755)
     if mode == "plant_checks":
         for name, body in (("edited.txt", "x\n"),
