@@ -6,12 +6,14 @@ Every run lives in ``contract.run_dir(run_id)`` with a ``request.json`` and,
 once finished, a ``result.json`` (shape: ``contract.Result.to_json()``). While
 the run is alive ``result.json`` carries ``status == contract.RUNNING``.
 
-Price estimates come from ``prices.tsv`` shipped next to this module. The table
-ships with its header and no invented rows: ``cost`` reports ``None`` (a lower
-bound) for any run whose model has no row, and says so in ``note``.
+Price estimates come from ``prices.tsv``: ``<state_root>/prices.tsv`` when it
+exists (the machine's own, kept out of the repo), else the one shipped next to
+this module. The shipped table has its header and no invented rows: a run whose
+model has no row has no cost, and ``cost`` says its total is a lower bound.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -37,18 +39,24 @@ _GIT_TIMEOUT = 60
 # run-directory helpers
 # --------------------------------------------------------------------------- #
 
+# Abandoned runs are collected only once delegate's own timeout has surely
+# stopped whatever the dead runner left behind: the longest request timeout
+# plus an hour.
+ABANDONED_MIN_AGE = 14400 + 3600
+
+
 def _runs_root() -> Path:
     return contract.state_root() / "runs"
 
 
 def _run_ids() -> list[str]:
-    """Existing run ids, sorted oldest first (the id is time-sortable)."""
+    """Run ids with a well-formed name, oldest first (the id is time-sortable)."""
     root = _runs_root()
     if not root.is_dir():
         return []
     ids = []
     for entry in os.scandir(root):
-        if entry.is_dir() and not entry.name.startswith("."):
+        if contract.RUN_ID_RE.match(entry.name) and entry.is_dir(follow_symlinks=False):
             ids.append(entry.name)
     ids.sort()
     return ids
@@ -82,28 +90,49 @@ def _read_request(run_id: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+def _observed(run_id: str) -> tuple[dict, bool]:
+    """(result as a caller should see it, alive).
+
+    The recorded status is trusted only if it is terminal or the runner is
+    alive. A RUNNING record with no runner holding the lock is ABANDONED; a
+    missing or broken result.json is RUNNING while the runner lives (it is
+    about to write it) and UNREADABLE otherwise.
+    """
+    rd = contract.run_dir(run_id)
+    alive = contract.runner_alive(rd)
+    result = _read_result(run_id)
+    if result is None:
+        result = {"v": contract.SCHEMA_VERSION, "run_id": run_id,
+                  "status": contract.RUNNING if alive else contract.UNREADABLE}
+    elif result.get("status") == contract.RUNNING and not alive:
+        result = dict(result, status=contract.ABANDONED,
+                      error="el runner murió sin escribir un status final")
+    result["alive"] = alive
+    return result, alive
+
+
 # --------------------------------------------------------------------------- #
 # status / list
 # --------------------------------------------------------------------------- #
 
 def status(run_id: str) -> dict:
-    """Parsed result.json for a run. Raises FileNotFoundError when it is absent."""
-    result = _read_result(run_id)
-    if result is None:
-        raise FileNotFoundError(
-            f"no existe la corrida {run_id!r} o su result.json no se puede leer")
-    return result
+    """result.json as observed now (see _observed). FileNotFoundError if no run."""
+    if not contract.run_dir(run_id).is_dir():
+        raise FileNotFoundError(f"no existe la corrida {run_id!r}")
+    return _observed(run_id)[0]
 
 
 def list_runs(limit: int = 20) -> list[dict]:
-    """Runs newest first, one summary dict each; unreadable dirs are skipped."""
+    """Every run dir, newest first, including running and unreadable ones."""
     out: list[dict] = []
     if limit is not None and limit <= 0:
         return out
-    for run_id, result in _read_results():
+    for run_id in reversed(_run_ids()):
+        result, alive = _observed(run_id)
         out.append({
             "run_id": run_id,
             "status": result.get("status"),
+            "alive": alive,
             "provider": result.get("provider"),
             "base": result.get("base"),
             "branch": result.get("branch"),
@@ -114,10 +143,43 @@ def list_runs(limit: int = 20) -> list[dict]:
             break
     return out
 
-
-# --------------------------------------------------------------------------- #
 # prices
 # --------------------------------------------------------------------------- #
+
+def default_prices_path() -> Path:
+    local = contract.state_root() / "prices.tsv"
+    return local if local.is_file() else PRICES_PATH
+
+
+def estimate_cost(provider: str, model: str | None, usage, model_usage,
+                  prices: dict) -> float | None:
+    """USD estimate for one run, or None. Never fills a gap with 0.
+
+    With the harness's per-model breakdown every model that used tokens must
+    have a row and all four counts; otherwise the top-level usage is priced
+    with the main model's row. Anything missing gives None.
+    """
+    keys = {"input": "inputTokens", "output": "outputTokens",
+            "cache_read": "cacheReadInputTokens", "cache_write": "cacheCreationInputTokens"}
+    if isinstance(model_usage, dict) and model_usage:
+        total = 0.0
+        for name, per in model_usage.items():
+            if not isinstance(per, dict):
+                return None
+            counts = {k: per.get(v) for k, v in keys.items()}
+            if not all(_count(c) for c in counts.values()):
+                return None
+            price = prices.get((provider, name))
+            if price is None:
+                return None
+            total += _compute_cost(price, counts)
+        return total
+    if model and _usage_known(usage):
+        price = prices.get((provider, model))
+        if price is not None:
+            return _compute_cost(price, usage)
+    return None
+
 
 def load_prices(path: str | Path | None = None) -> dict[tuple[str, str], dict]:
     """Load prices.tsv into {(provider, model): {price...}}.
@@ -125,7 +187,7 @@ def load_prices(path: str | Path | None = None) -> dict[tuple[str, str], dict]:
     Comments (#) and blank lines are ignored. The first non-comment line is the
     header. Rejects malformed rows with a clear ValueError.
     """
-    path = Path(path) if path is not None else PRICES_PATH
+    path = Path(path) if path is not None else default_prices_path()
     expected = "\t".join(PRICE_FIELDS)
     rows: dict[tuple[str, str], dict] = {}
     header_seen = False
@@ -201,6 +263,7 @@ def _empty_bucket() -> dict:
     b["runs"] = 0
     b["runs_with_unknown_usage"] = 0
     b["cost_usd_estimate"] = 0.0
+    b["_cost_known"] = 0
     return b
 
 
@@ -212,11 +275,13 @@ def cost(days: int = 7, *, prices_path: str | Path | None = None) -> dict:
     the model has a row, else None; with any unknown cost the total is a lower
     bound and ``note`` says so.
     """
-    prices = load_prices(prices_path)
+    table = Path(prices_path) if prices_path is not None else default_prices_path()
+    prices = load_prices(table)
     cutoff = time.time() - days * 86400
     buckets: dict[str, dict] = {}
     total_runs = 0
     total_cost = 0.0
+    known_costs = 0
     lower_bound = False
 
     for _run_id, result in _read_results():
@@ -248,8 +313,16 @@ def cost(days: int = 7, *, prices_path: str | Path | None = None) -> dict:
             lower_bound = True
         else:
             bucket["cost_usd_estimate"] += float(estimate)
+            bucket["_cost_known"] += 1
             total_cost += float(estimate)
+            known_costs += 1
 
+    for bucket in buckets.values():
+        if bucket.pop("_cost_known") == 0:
+            bucket["cost_usd_estimate"] = None
+        if bucket["runs_with_unknown_usage"] == bucket["runs"]:
+            for k in _USAGE_KEYS:
+                bucket[k] = None
     note = "estimación"
     if lower_bound:
         note += ("; el total es una cota inferior: hay corridas sin costo conocido "
@@ -257,21 +330,25 @@ def cost(days: int = 7, *, prices_path: str | Path | None = None) -> dict:
     return {
         "runs": total_runs,
         "by_provider_model": buckets,
-        "total_cost_usd_estimate": total_cost,
-        "price_table": str(Path(prices_path) if prices_path is not None else PRICES_PATH),
+        # None, not 0.0, when no run had a known cost: an unknown is not free.
+        "total_cost_usd_estimate": None if total_runs and not known_costs else total_cost,
+        "price_table": str(table),
         "note": note,
     }
 
 
+# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # gc
 # --------------------------------------------------------------------------- #
 
 def _git(repo, *args) -> tuple[int, str]:
     """Run git, returning (returncode, message). Never raises for a bad repo."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
-        p = subprocess.run(["git", "-C", str(repo), *args],
-                           capture_output=True, text=True, timeout=_GIT_TIMEOUT)
+        p = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *args],
+                           capture_output=True, text=True, timeout=_GIT_TIMEOUT,
+                           stdin=subprocess.DEVNULL, env=env)
     except (OSError, subprocess.SubprocessError) as e:
         return 127, str(e)
     if p.returncode != 0:
@@ -280,27 +357,22 @@ def _git(repo, *args) -> tuple[int, str]:
     return 0, ""
 
 
-def _branch_exists(repo, branch: str) -> bool:
-    try:
-        p = subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
-                            f"refs/heads/{branch}"], capture_output=True, text=True,
-                           timeout=_GIT_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return p.returncode == 0
+def _ref_exists(repo, ref: str) -> bool:
+    return _git(repo, "show-ref", "--verify", "--quiet", ref)[0] == 0
 
 
 def _gc_one(run_id: str, result: dict) -> dict:
     errors: list[str] = []
     request = _read_request(run_id) or {}
     repo = request.get("repo")
-    if repo is not None and not isinstance(repo, str):
+    if not isinstance(repo, str) or not os.path.isdir(repo):
         repo = None
 
     # gc only ever removes what the runner itself creates: the worktree at
-    # state_root()/worktrees/<run_id> and the branch delegate/<run_id>. A
-    # result.json naming anything else is not followed, so an edited or
-    # corrupt file cannot point gc at the user's own checkout or `main`.
+    # state_root()/worktrees/<run_id>, the branch delegate/<run_id> and the ref
+    # refs/delegate/snapshot/<run_id>. A result.json naming anything else is
+    # not followed, so an edited or corrupt file cannot point gc at the
+    # user's own checkout or `main`.
     expected_wt = contract.state_root() / "worktrees" / run_id
     worktree = result.get("worktree")
     if worktree and Path(worktree) != expected_wt:
@@ -311,18 +383,25 @@ def _gc_one(run_id: str, result: dict) -> dict:
         return {"run_id": run_id, "removed": False,
                 "error": f"la rama {result.get('branch')!r} no es {branch}; no se toca"}
 
-    if worktree and Path(worktree).exists():
-        if not repo:
-            errors.append("no se pudo leer 'repo' de request.json para quitar el worktree")
-        else:
-            rc, msg = _git(repo, "worktree", "remove", "--force", worktree)
-            if rc != 0:
+    if expected_wt.exists():
+        if repo:
+            rc, msg = _git(repo, "worktree", "remove", "--force", str(expected_wt))
+            if rc != 0 and expected_wt.exists():
                 errors.append(f"git worktree remove falló: {msg}")
-
-    if repo and _branch_exists(repo, branch):
-        rc, msg = _git(repo, "branch", "-D", branch)
-        if rc != 0:
-            errors.append(f"git branch -D falló: {msg}")
+        else:
+            # The repo is gone or unknown: the directory is ours, under the
+            # state dir, and nothing else can unregister it.
+            try:
+                shutil.rmtree(expected_wt)
+            except OSError as e:
+                errors.append(f"no se pudo borrar el worktree: {e}")
+    if repo:
+        _git(repo, "worktree", "prune")
+        for ref in (f"refs/heads/{branch}", f"refs/delegate/snapshot/{run_id}"):
+            if _ref_exists(repo, ref):
+                rc, msg = _git(repo, "update-ref", "-d", ref)
+                if rc != 0:
+                    errors.append(f"no se pudo borrar {ref}: {msg}")
 
     if errors:
         return {"run_id": run_id, "removed": False, "error": "; ".join(errors)}
@@ -334,29 +413,56 @@ def _gc_one(run_id: str, result: dict) -> dict:
     return {"run_id": run_id, "removed": True, "error": None}
 
 
-def gc(days: int = 14, dry_run: bool = False) -> list[dict]:
-    """Garbage-collect terminal runs older than `days`.
+def _collectable(run_id: str, cutoff: float, now: float) -> bool:
+    result = _read_result(run_id)
+    status_ = result.get("status") if result else None
+    if status_ in contract.STATUSES:
+        finished = result.get("finished_at")
+        return isinstance(finished, (int, float)) and finished < cutoff
+    # RUNNING with no runner, or no readable result at all: abandoned. Only
+    # once delegate's own timeout has certainly ended what the runner left.
+    started = result.get("started_at") if result else None
+    if not isinstance(started, (int, float)):
+        try:
+            started = contract.run_dir(run_id).stat().st_mtime
+        except OSError:
+            return False
+    return started < cutoff and started < now - ABANDONED_MIN_AGE
 
-    Returns one dict per candidate: ``{"run_id", "removed", "error"}``. Only
-    runs with a terminal status (contract.STATUSES) and a ``finished_at`` older
-    than the cutoff are touched; a running run or one without result.json is
-    never touched. With ``dry_run`` nothing is changed and every candidate comes
-    back with ``removed`` False. Git failures are reported in ``error`` and keep
-    the run dir in place; they never abort the whole gc.
+
+def gc(days: int = 14, dry_run: bool = False) -> list[dict]:
+    """Garbage-collect finished runs older than `days`; never a live one.
+
+    Returns one dict per candidate: ``{"run_id", "removed", "error"}``.
+    Candidates are runs with a terminal status and ``finished_at`` older than
+    the cutoff, plus abandoned runs (RUNNING or unreadable with no runner
+    alive) started before the cutoff and more than ABANDONED_MIN_AGE ago.
+    Liveness is the run lock: gc takes it exclusively before deciding and holds
+    it while deleting, so a live runner, which holds it from its first write
+    to its last, is never touched. With ``dry_run`` nothing is changed. Git
+    failures are reported in ``error`` and keep the run dir in place.
     """
-    cutoff = time.time() - days * 86400
+    now = time.time()
+    cutoff = now - days * 86400
     out: list[dict] = []
     for run_id in _run_ids():
-        result = _read_result(run_id)
-        if result is None:
+        rd = contract.run_dir(run_id)
+        try:
+            fd = os.open(contract.lock_path(rd),
+                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except OSError:
             continue
-        if result.get("status") not in contract.STATUSES:
-            continue
-        finished = result.get("finished_at")
-        if not isinstance(finished, (int, float)) or finished >= cutoff:
-            continue
-        if dry_run:
-            out.append({"run_id": run_id, "removed": False, "error": None})
-        else:
-            out.append(_gc_one(run_id, result))
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue  # a runner holds it: live
+            if not _collectable(run_id, cutoff, now):
+                continue
+            if dry_run:
+                out.append({"run_id": run_id, "removed": False, "error": None})
+            else:
+                out.append(_gc_one(run_id, _read_result(run_id) or {}))
+        finally:
+            os.close(fd)
     return out

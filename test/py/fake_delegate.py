@@ -46,8 +46,10 @@ RESULT = {
     },
     "total_cost_usd": 0.0123,
     "modelUsage": {
-        "small-model": {"inputTokens": 2, "outputTokens": 1},
-        "deepseek-chat": {"inputTokens": 11, "outputTokens": 7},
+        "small-model": {"inputTokens": 2, "outputTokens": 1,
+                        "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
+        "deepseek-chat": {"inputTokens": 11, "outputTokens": 7,
+                          "cacheReadInputTokens": 3, "cacheCreationInputTokens": 2},
     },
 }
 

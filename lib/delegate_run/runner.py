@@ -39,7 +39,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import contract
+from . import contract, report as _report
 from .contract import CheckResult, Request, Result
 
 DEFAULT_SLOTS = 2
@@ -614,9 +614,20 @@ def _apply_harness_json(result: Result, rd: Path) -> bool:
             u = item[1] if isinstance(item[1], dict) else {}
             return sum(_count(u.get(k)) or 0 for k in ("inputTokens", "outputTokens"))
         result.model = max(models.items(), key=weight)[0]
+    result.cost_usd_estimate = _estimate(result, models)
     if data.get("is_error") is True:
         result.error = "el harness reportó is_error=true"
     return True
+
+
+def _estimate(result: Result, model_usage) -> float | None:
+    """Price the run with prices.tsv; a broken or empty table gives None."""
+    try:
+        prices = _report.load_prices()
+    except ValueError:
+        return None
+    return _report.estimate_cost(result.provider, result.model, result.usage,
+                                 model_usage, prices)
 
 
 # --- checks -----------------------------------------------------------------

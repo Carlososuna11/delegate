@@ -1,4 +1,5 @@
 """Tests for delegate_run.report: status, list, cost and gc."""
+import fcntl
 import json
 import os
 import subprocess
@@ -40,6 +41,13 @@ def write_run(run_id, result=None, request=None):
     return d
 
 
+def hold_lock(test, rd):
+    """Hold the run lock the way a live runner does, until the test ends."""
+    fd = os.open(contract.lock_path(rd), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    test.addCleanup(os.close, fd)
+
+
 class ReportTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -70,21 +78,35 @@ class StatusTests(ReportTestBase):
 
     def test_missing_run_raises_file_not_found(self):
         with self.assertRaises(FileNotFoundError):
-            report.status("20200101-000000-none00")
+            report.status("20200101-000000-abcdef")
 
     def test_error_message_is_spanish(self):
         try:
-            report.status("20200101-000000-none00")
+            report.status("20200101-000000-abcdef")
         except FileNotFoundError as e:
             self.assertIn("no existe", str(e))
         else:
             self.fail("expected FileNotFoundError")
 
-    def test_running_result_is_returned(self):
+    def test_running_result_is_returned_while_the_lock_is_held(self):
+        rd = write_run("20260101-000000-bbbbbb",
+                       result=self.result("20260101-000000-bbbbbb", status=contract.RUNNING))
+        hold_lock(self, rd)
+        got = report.status("20260101-000000-bbbbbb")
+        self.assertEqual(got["status"], contract.RUNNING)
+        self.assertTrue(got["alive"])
+
+    def test_running_without_runner_is_abandoned(self):
         write_run("20260101-000000-bbbbbb",
                   result=self.result("20260101-000000-bbbbbb", status=contract.RUNNING))
-        self.assertEqual(report.status("20260101-000000-bbbbbb")["status"],
-                         contract.RUNNING)
+        got = report.status("20260101-000000-bbbbbb")
+        self.assertEqual(got["status"], contract.ABANDONED)
+        self.assertFalse(got["alive"])
+
+    def test_invalid_run_id_is_value_error(self):
+        for bad in ("..", "../x", "20260101-000000-zzzzzz", "x"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                report.status(bad)
 
 
 class ListRunsTests(ReportTestBase):
@@ -111,19 +133,30 @@ class ListRunsTests(ReportTestBase):
                                      base="deadbeef", branch="delegate/x",
                                      started_at=10.0, finished_at=20.0))
         row = report.list_runs()[0]
-        self.assertEqual(set(row), {"run_id", "status", "provider", "base",
+        self.assertEqual(set(row), {"run_id", "status", "alive", "provider", "base",
                                     "branch", "started_at", "finished_at"})
         self.assertEqual(row["provider"], "qwen")
         self.assertEqual(row["started_at"], 10.0)
 
-    def test_skips_malformed_and_missing_result(self):
+    def test_lists_malformed_missing_and_running_results(self):
         write_run("20260101-000000-aaaaaa", result=self.result("20260101-000000-aaaaaa"))
         bad = contract.run_dir("20260102-000000-bbbbbb")
         bad.mkdir(parents=True, exist_ok=True)
         (bad / "result.json").write_text("not json", encoding="utf-8")
-        write_run("20260103-000000-cccccc", request={"repo": "/x"})  # no result yet
-        got = report.list_runs()
-        self.assertEqual([r["run_id"] for r in got], ["20260101-000000-aaaaaa"])
+        write_run("20260103-000000-cccccc", request={"repo": "/x"})  # no result
+        live = write_run("20260104-000000-dddddd", request={"repo": "/x"})
+        hold_lock(self, live)  # a runner that has not written result.json yet
+        got = {r["run_id"]: r["status"] for r in report.list_runs()}
+        self.assertEqual(got, {
+            "20260101-000000-aaaaaa": contract.COMPLETED,
+            "20260102-000000-bbbbbb": contract.UNREADABLE,
+            "20260103-000000-cccccc": contract.UNREADABLE,
+            "20260104-000000-dddddd": contract.RUNNING,
+        })
+
+    def test_ignores_dirs_that_are_not_run_ids(self):
+        (contract.state_root() / "runs" / "junk").mkdir(parents=True)
+        self.assertEqual(report.list_runs(), [])
 
     def test_empty_when_no_runs(self):
         self.assertEqual(report.list_runs(), [])
@@ -230,6 +263,29 @@ class CostTests(ReportTestBase):
         write_run("20260101-000000-aaaaaa", result=r)
         out = report.cost(days=7)
         self.assertIn("cota inferior", out["note"])
+        # Nothing known: null, never a 0.0 that reads as "free".
+        self.assertIsNone(out["total_cost_usd_estimate"])
+        self.assertIsNone(out["by_provider_model"]["deepseek/unknown-model"]["cost_usd_estimate"])
+
+    def test_unknown_usage_is_null_not_zero(self):
+        r = self.result("20260101-000000-aaaaaa", provider="deepseek", model="m",
+                        started_at=time.time(), usage=None)
+        write_run("20260101-000000-aaaaaa", result=r)
+        bucket = report.cost(days=7)["by_provider_model"]["deepseek/m"]
+        self.assertIsNone(bucket["input"])
+        self.assertEqual(bucket["runs_with_unknown_usage"], 1)
+
+    def test_state_dir_price_table_wins(self):
+        (Path(self.tmp.name) / "prices.tsv").write_text(
+            HEADER + "\ndeepseek\tm\t1\t2\t0.5\t0\t2026-10-01\n", encoding="utf-8")
+        self.assertEqual(report.default_prices_path(), Path(self.tmp.name) / "prices.tsv")
+        r = self.result("20260101-000000-aaaaaa", provider="deepseek", model="m",
+                        started_at=time.time(),
+                        usage={"input": 1_000_000, "output": 1_000_000,
+                               "cache_read": 0, "cache_write": 0})
+        write_run("20260101-000000-aaaaaa", result=r)
+        self.assertAlmostEqual(report.cost(days=7)["total_cost_usd_estimate"], 3.0)
+
 
     def test_ignores_runs_older_than_days(self):
         now = time.time()
@@ -249,6 +305,41 @@ class CostTests(ReportTestBase):
         self.assertEqual(out["by_provider_model"], {})
         self.assertEqual(out["total_cost_usd_estimate"], 0.0)
         self.assertEqual(out["note"], "estimación")
+
+
+class EstimateCostTests(unittest.TestCase):
+    PRICES = {("deepseek", "big"): {"input_per_mtok": 1.0, "output_per_mtok": 2.0,
+                                    "cache_read_per_mtok": 0.1, "cache_write_per_mtok": 0.0,
+                                    "as_of": "2026-10-01"}}
+
+    def per(self, i, o, cr=0, cw=0):
+        return {"inputTokens": i, "outputTokens": o, "cacheReadInputTokens": cr,
+                "cacheCreationInputTokens": cw}
+
+    def test_per_model_breakdown(self):
+        got = report.estimate_cost("deepseek", "big", None,
+                                   {"big": self.per(1_000_000, 500_000, 1_000_000)},
+                                   self.PRICES)
+        self.assertAlmostEqual(got, 1.0 + 1.0 + 0.1)
+
+    def test_any_model_without_price_gives_none(self):
+        got = report.estimate_cost("deepseek", "big", None,
+                                   {"big": self.per(1, 1), "small": self.per(1, 1)},
+                                   self.PRICES)
+        self.assertIsNone(got)
+
+    def test_missing_count_gives_none(self):
+        per = self.per(1, 1)
+        del per["cacheReadInputTokens"]
+        self.assertIsNone(report.estimate_cost("deepseek", "big", None, {"big": per},
+                                               self.PRICES))
+
+    def test_top_level_usage_fallback(self):
+        usage = {"input": 1_000_000, "output": 0, "cache_read": 0, "cache_write": 0}
+        self.assertAlmostEqual(report.estimate_cost("deepseek", "big", usage, None,
+                                                    self.PRICES), 1.0)
+        self.assertIsNone(report.estimate_cost("deepseek", "other", usage, None,
+                                               self.PRICES))
 
 
 class GcTests(ReportTestBase):
@@ -312,7 +403,7 @@ class GcTests(ReportTestBase):
         self.assertEqual(report.gc(days=14), [])
         self.assertTrue(contract.run_dir(run_id).exists())
 
-    def test_reports_git_failure_without_crashing(self):
+    def test_repo_gone_still_removes_our_worktree_dir(self):
         run_id = "20200101-000000-aaaaaa"
         wt = contract.state_root() / "worktrees" / run_id
         wt.mkdir(parents=True)
@@ -320,10 +411,38 @@ class GcTests(ReportTestBase):
                   result=self.old(run_id, worktree=str(wt)),
                   request={"repo": str(Path(self.tmp.name) / "no-such-repo")})
         out = report.gc(days=14)
-        self.assertEqual(len(out), 1)
-        self.assertFalse(out[0]["removed"])
-        self.assertIsNotNone(out[0]["error"])
-        self.assertTrue(contract.run_dir(run_id).exists())
+        self.assertEqual(out, [{"run_id": run_id, "removed": True, "error": None}])
+        self.assertFalse(wt.exists())
+
+    def test_never_touches_a_run_whose_lock_is_held(self):
+        run_id = "20200101-000000-aaaaaa"
+        rd = write_run(run_id, result=self.old(run_id))
+        hold_lock(self, rd)
+        self.assertEqual(report.gc(days=0), [])
+        self.assertTrue(rd.exists())
+
+    def test_abandoned_run_is_collected_only_when_old(self):
+        old_id, new_id = "20200101-000000-aaaaaa", "20200101-000000-bbbbbb"
+        long_ago = time.time() - 30 * 86400
+        write_run(old_id, result=self.result(old_id, status=contract.RUNNING,
+                                             started_at=long_ago))
+        write_run(new_id, result=self.result(new_id, status=contract.RUNNING,
+                                             started_at=time.time() - 3600))
+        out = report.gc(days=0)
+        self.assertEqual([o["run_id"] for o in out], [old_id])
+        self.assertFalse(contract.run_dir(old_id).exists())
+        self.assertTrue(contract.run_dir(new_id).exists())
+
+    def test_snapshot_ref_is_removed(self):
+        repo = Path(self.tmp.name) / "repo"
+        init_repo(repo)
+        run_id = "20200101-000000-aaaaaa"
+        git("-C", str(repo), "update-ref", f"refs/delegate/snapshot/{run_id}", "HEAD")
+        write_run(run_id, result=self.old(run_id), request={"repo": str(repo)})
+        self.assertTrue(report.gc(days=14)[0]["removed"])
+        ref = subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
+                              f"refs/delegate/snapshot/{run_id}"], capture_output=True)
+        self.assertNotEqual(ref.returncode, 0)
 
     def test_no_repo_still_removes_dir_without_worktree(self):
         run_id = "20200101-000000-aaaaaa"

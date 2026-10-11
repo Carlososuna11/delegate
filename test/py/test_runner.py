@@ -129,7 +129,23 @@ class RunnerTest(RunnerBase):
         # The main model, not the first key of modelUsage.
         self.assertEqual(result.model, "deepseek-chat")
         # The harness's total_cost_usd uses Anthropic prices: never trusted.
+        # The shipped price table is empty, so the estimate is unknown.
         self.assertIsNone(result.cost_usd_estimate)
+
+    def test_cost_comes_from_the_price_table(self):
+        header = ("provider\tmodel\tinput_per_mtok\toutput_per_mtok\t"
+                  "cache_read_per_mtok\tcache_write_per_mtok\tas_of\n")
+        rows = ("deepseek\tdeepseek-chat\t1000000\t1000000\t0\t0\t2026-10-01\n"
+                "deepseek\tsmall-model\t1000000\t1000000\t0\t0\t2026-10-01\n")
+        (self.state / "prices.tsv").write_text(header + rows, encoding="utf-8")
+        os.environ["FAKE_MODE"] = "ok_noop"
+        result = runner.execute(self._req())
+        # $1 per token in and out, cache free: (2+1) + (11+7), both models priced.
+        self.assertAlmostEqual(result.cost_usd_estimate, 21.0)
+        (self.state / "prices.tsv").write_text(header + rows.splitlines()[0] + "\n",
+                                               encoding="utf-8")
+        # One model without a row: no estimate, not a partial one.
+        self.assertIsNone(runner.execute(self._req()).cost_usd_estimate)
         self.assertEqual(result.report, "fake delegate finished")
         self.assertEqual(result.base, self._head())
 
