@@ -23,6 +23,8 @@ Modes (FAKE_MODE):
   self_commit        write edited.txt and `git commit` it in --dir, valid JSON
   odd_names          create a file whose name has a newline, outside src/
   plant_bin          write an executable `mycheck` in --dir that exits 0
+  plant_checks       write edited.txt plus files that try to define the checks
+                     (.delegate-run.json, package.json), valid JSON
 
 If FAKE_ARGV_FILE is set, the full argv is also dumped there as JSON so a test
 can assert the exact command line the runner built.
@@ -148,6 +150,12 @@ def main(argv):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("#!/bin/sh\nexit 0\n")
         os.chmod(path, 0o755)
+    if mode == "plant_checks":
+        for name, body in (("edited.txt", "x\n"),
+                           (".delegate-run.json", '{"checks": []}\n'),
+                           ("package.json", '{"scripts": {"test": "true"}}\n')):
+            with open(os.path.join(workdir, name), "w", encoding="utf-8") as fh:
+                fh.write(body)
     if mode == "is_error":
         json.dump(dict(RESULT, is_error=True, subtype="error_during_execution"),
                   sys.stdout)

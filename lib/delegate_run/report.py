@@ -123,13 +123,23 @@ def status(run_id: str) -> dict:
 
 
 def list_runs(limit: int = 20) -> list[dict]:
-    """Every run dir, newest first, including running and unreadable ones."""
-    out: list[dict] = []
+    """Every run dir, newest first, including running and unreadable ones.
+
+    Newest by started_at: the run_id only orders to the second, and two runs
+    in the same second sort by their random suffix.
+    """
     if limit is not None and limit <= 0:
-        return out
-    for run_id in reversed(_run_ids()):
+        return []
+    rows: list[dict] = []
+    for run_id in _run_ids():
         result, alive = _observed(run_id)
-        out.append({
+        started = result.get("started_at")
+        if not isinstance(started, (int, float)):
+            try:
+                started = contract.run_dir(run_id).stat().st_mtime
+            except OSError:
+                started = 0.0
+        rows.append(({
             "run_id": run_id,
             "status": result.get("status"),
             "alive": alive,
@@ -138,11 +148,13 @@ def list_runs(limit: int = 20) -> list[dict]:
             "branch": result.get("branch"),
             "started_at": result.get("started_at"),
             "finished_at": result.get("finished_at"),
-        })
-        if limit is not None and len(out) >= limit:
-            break
-    return out
+        }, (started, run_id)))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    rows = [r[0] for r in rows]
+    return rows[:limit] if limit is not None else rows
 
+
+# --------------------------------------------------------------------------- #
 # prices
 # --------------------------------------------------------------------------- #
 
@@ -337,7 +349,6 @@ def cost(days: int = 7, *, prices_path: str | Path | None = None) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # gc
 # --------------------------------------------------------------------------- #
