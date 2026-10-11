@@ -28,6 +28,8 @@ Modes (FAKE_MODE):
                      clean filter that touches $FAKE_MARKER
   plant_checks       write edited.txt plus files that try to define the checks
                      (.delegate-run.json, package.json), valid JSON
+  script             exec the Python in $FAKE_SCRIPT with --dir as cwd, then
+                     print the valid JSON result (or exit with what it sets)
 
 If FAKE_ARGV_FILE is set, the full argv is also dumped there as JSON so a test
 can assert the exact command line the runner built.
@@ -171,6 +173,10 @@ def main(argv):
             fh.write("x\n")
         with open(os.path.join(workdir, ".git"), "w", encoding="utf-8") as fh:
             fh.write(f"gitdir: {evil}/.git\n")
+    if mode == "script":
+        os.chdir(workdir)
+        exec(compile(os.environ["FAKE_SCRIPT"], "<FAKE_SCRIPT>", "exec"),
+             {"__name__": "fake_script", "git": lambda *a: _git(".", *a)})
     if mode == "plant_checks":
         for name, body in (("edited.txt", "x\n"),
                            (".delegate-run.json", '{"checks": []}\n'),

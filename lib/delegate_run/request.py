@@ -15,6 +15,7 @@ import os
 import re
 
 from .contract import GRANTS, SCHEMA_VERSION, Request, RequestError
+from .scope import ScopeError, compile_glob
 
 # Every key a request may carry. Anything else is refused by name so a typo
 # never silently becomes a default.
@@ -293,6 +294,10 @@ def _check_scope(obj: dict) -> tuple[str, ...]:
         if ".." in pattern.split("/"):
             raise RequestError(
                 f"'scope'[{index}]={pattern!r} no puede salir del repo ('..')")
+        try:
+            compile_glob(pattern)
+        except ScopeError as exc:
+            raise RequestError(f"'scope'[{index}]: {exc}") from None
     return tuple(raw)
 
 

@@ -279,6 +279,17 @@ def _empty_bucket() -> dict:
     return b
 
 
+def _harness_model_usage(run_id: str):
+    """`modelUsage` from the run's stdout.log, or None if absent or unreadable."""
+    try:
+        raw = (contract.run_dir(run_id) / "stdout.log").read_text(encoding="utf-8",
+                                                                 errors="replace")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    return data.get("modelUsage") if isinstance(data, dict) else None
+
+
 def cost(days: int = 7, *, prices_path: str | Path | None = None) -> dict:
     """Aggregate usage and estimated cost over runs started within `days`.
 
@@ -318,9 +329,13 @@ def cost(days: int = 7, *, prices_path: str | Path | None = None) -> dict:
                 and math.isfinite(estimate) and estimate >= 0):
             estimate = None
         if estimate is None:
-            price = prices.get((provider, model))
-            if price is not None and _usage_known(usage):
-                estimate = _compute_cost(price, usage)
+            # Re-priced with the same rule the run used (estimate_cost), from
+            # the harness's own per-model breakdown: a table filled in later
+            # prices old runs, and a run whose models are not all priced stays
+            # unknown. Pricing its top-level usage as the main model alone
+            # would invent a number the run itself refused to give.
+            estimate = estimate_cost(provider, model, usage,
+                                     _harness_model_usage(_run_id), prices)
         if estimate is None:
             lower_bound = True
         else:
@@ -354,22 +369,63 @@ def cost(days: int = 7, *, prices_path: str | Path | None = None) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _git(repo, *args) -> tuple[int, str]:
-    """Run git, returning (returncode, message). Never raises for a bad repo."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    """Run git, returning (returncode, message). Never raises for a bad repo.
+
+    gc meets repositories delegates have written to: git is found by absolute
+    path (a relative PATH entry would find one planted in a worktree) and runs
+    with the hardened environment, never the caller's.
+    """
+    git = contract.which("git")
+    if git is None:
+        return 127, "no encuentro git en el PATH"
     try:
-        p = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *args],
+        p = subprocess.run([git, "-C", str(repo), *args],
                            capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-                           stdin=subprocess.DEVNULL, env=env)
+                           stdin=subprocess.DEVNULL, env=contract.hardened_git_env(),
+                           cwd="/")
     except (OSError, subprocess.SubprocessError) as e:
         return 127, str(e)
     if p.returncode != 0:
         return p.returncode, (p.stderr.strip() or p.stdout.strip()
                               or f"git salió con {p.returncode}")
-    return 0, ""
+    return 0, p.stdout
 
 
 def _ref_exists(repo, ref: str) -> bool:
     return _git(repo, "show-ref", "--verify", "--quiet", ref)[0] == 0
+
+
+def _remove_worktree(repo, expected_wt: Path, errors: list[str]) -> None:
+    """Unregister and delete state_root()/worktrees/<run_id>, and only that.
+
+    A symlink there (or one in place of worktrees/) is never followed: git
+    would resolve it and remove whatever worktree it points at, a live run's
+    included. The link itself is removed; its target is not touched.
+    """
+    parent = expected_wt.parent
+    if parent.is_symlink():
+        errors.append(f"{parent} es un enlace simbólico; no se toca")
+        return
+    if expected_wt.is_symlink():
+        try:
+            expected_wt.unlink()
+        except OSError as e:
+            errors.append(f"no se pudo borrar el enlace {expected_wt}: {e}")
+            return
+    if repo:
+        # Works with the directory gone too: it then only unregisters it. No
+        # `git worktree prune`: that sweeps every registration in the repo,
+        # including an unrelated worktree that is only moved or unmounted.
+        rc, msg = _git(repo, "worktree", "remove", "--force", str(expected_wt))
+        if rc != 0 and expected_wt.exists() and "is not a working tree" not in msg:
+            errors.append(f"git worktree remove falló: {msg}")
+    if expected_wt.exists() and not expected_wt.is_symlink():
+        # The repo is gone or does not know it: the directory is ours, under
+        # the state dir, and nothing else can unregister it.
+        try:
+            shutil.rmtree(expected_wt)
+        except OSError as e:
+            errors.append(f"no se pudo borrar el worktree: {e}")
 
 
 def _gc_one(run_id: str, result: dict) -> dict:
@@ -394,25 +450,18 @@ def _gc_one(run_id: str, result: dict) -> dict:
         return {"run_id": run_id, "removed": False,
                 "error": f"la rama {result.get('branch')!r} no es {branch}; no se toca"}
 
-    if expected_wt.exists():
-        if repo:
-            rc, msg = _git(repo, "worktree", "remove", "--force", str(expected_wt))
-            if rc != 0 and expected_wt.exists():
-                errors.append(f"git worktree remove falló: {msg}")
-        else:
-            # The repo is gone or unknown: the directory is ours, under the
-            # state dir, and nothing else can unregister it.
-            try:
-                shutil.rmtree(expected_wt)
-            except OSError as e:
-                errors.append(f"no se pudo borrar el worktree: {e}")
+    _remove_worktree(repo, expected_wt, errors)
     if repo:
-        _git(repo, "worktree", "prune")
         for ref in (f"refs/heads/{branch}", f"refs/delegate/snapshot/{run_id}"):
-            if _ref_exists(repo, ref):
-                rc, msg = _git(repo, "update-ref", "-d", ref)
-                if rc != 0:
-                    errors.append(f"no se pudo borrar {ref}: {msg}")
+            # A symbolic ref here (a delegate with bash can write one) would
+            # make `update-ref -d` delete its target, `main` included.
+            # --no-deref deletes the name itself, whatever it holds.
+            rc, _ = _git(repo, "symbolic-ref", "-q", ref)
+            if rc != 0 and not _ref_exists(repo, ref):
+                continue
+            rc, msg = _git(repo, "update-ref", "--no-deref", "-d", ref)
+            if rc != 0:
+                errors.append(f"no se pudo borrar {ref}: {msg}")
 
     if errors:
         return {"run_id": run_id, "removed": False, "error": "; ".join(errors)}

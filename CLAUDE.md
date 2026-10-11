@@ -359,9 +359,18 @@ Reglas que el código cumple y los tests prueban:
 - Un árbol sucio, **incluidos los archivos nuevos**, se rechaza cuando la base es el
   commit actual. `snapshot: true` lo congela con un índice temporal en
   `refs/delegate/snapshot/<run_id>` sin tocar el índice ni el árbol del usuario. Con
-  otra base el árbol no se lee, así que no importa si está sucio.
+  otra base el árbol no se lee, así que no importa si está sucio. Se rechaza también
+  un índice con archivos `assume-unchanged` o `skip-worktree` presentes (git no ve sus
+  cambios) y un submódulo con cambios adentro (ni el snapshot ni el worktree los
+  llevan). El chequeo corre con `GIT_OPTIONAL_LOCKS=0`: no reescribe el índice.
 - Los cambios se miden contra la base con `-z` y sin detección de renombres: los dos
-  extremos de un rename pasan por el scope. Lo que el delegado haya commiteado da igual.
+  extremos de un rename pasan por el scope. Lo que el delegado haya commiteado da igual,
+  y las refs de reemplazo (`refs/replace/*`) se ignoran en toda llamada. Un nombre que
+  no es UTF-8 se reporta con `surrogateescape` (el JSON sale en ASCII): `b"\xff.txt"`
+  y el literal `\xff.txt` nunca se confunden en el scope.
+- Scope: `*` y `?` no cruzan `/`, `**` sí, un patrón sin comodines es un directorio, y
+  las clases `[...]` siguen al shell y a git (`!` o `^` niegan, `]` inicial es literal).
+  Un patrón que no compila se rechaza en la petición.
 - La rama es plumbing (`commit-tree` + `update-ref` que solo crea): sin hooks, sin firma,
   autor `delegate <proveedor>`, padre la base. Lo que escriban los checks no llega a la
   rama. Sin cambios no hay rama.
@@ -370,18 +379,33 @@ Reglas que el código cumple y los tests prueban:
   archivo `.git` del worktree reapuntado a un repo con un `filter.*.clean` corría ese
   programa con el environment del runner). `git` y `delegate` se resuelven a ruta
   absoluta contra las entradas absolutas del `PATH`, antes de entrar al worktree.
+- Después del hijo, la config del repo es del delegado (el worktree comparte
+  `.git/config`). Todo git de ahí en adelante, y el de `gc`, corre endurecido: sin
+  config de sistema ni global, environment construido (sin tokens del que llama),
+  hooks, `core.fsmonitor`, `diff.external` y firmas apagados, y cada filtro
+  (`clean`/`smudge`/`process`/`required`) y driver de diff (`command`/`textconv`) que
+  nombre el repo anulado vía `GIT_CONFIG_KEY_n`. Antes del hijo el repo es del usuario
+  y su config se respeta (un smudge de LFS funciona al crear el worktree).
 - Los checks corren con un environment construido (sin tokens del que llama) y un `PATH`
   sin entradas relativas ni dentro del worktree. Ejecutan código que escribió el modelo
   con los permisos del usuario: el environment se limpia, los archivos no se confinan.
 - Procesos: el hijo corre en su propia sesión, el runner se hace subreaper y al terminar
   (bien, por timeout o por cancelación) manda TERM a todo el árbol y a la sesión, espera
-  la gracia y manda KILL. TERM o INT al runner cuentan como cancelación; HUP se ignora.
+  la gracia y manda KILL. Recuerda la sesión y el grupo de cada proceso visto, zombis
+  incluidos, y los mata con `killpg`: una cadena de fork-y-salir que un escaneo de
+  `/proc` no alcanza a ver viva cae igual. TERM o INT al runner cuentan como
+  cancelación, también si llegan después del hijo (mientras se mide o se commitea):
+  la corrida queda `cancelled`, nunca `completed`; HUP se ignora.
 - Un lock por corrida (`flock`, lo suelta el kernel) dice si el runner vive. `gc` lo toma
   exclusivo antes de decidir y nunca borra algo distinto de `worktrees/<run_id>`,
-  `delegate/<run_id>` y la ref del snapshot.
+  `delegate/<run_id>` y la ref del snapshot: borra refs con `--no-deref` (un symref
+  plantado no arrastra a `main`), no sigue un symlink en `worktrees/<run_id>` y no
+  corre `git worktree prune` (barre registros ajenos).
 - El costo sale de `prices.tsv` (el de `~/.local/state/delegate/` gana sobre el del
   repo, que va sin precios). `total_cost_usd` del harness se ignora: pone precios de
-  Anthropic a modelos que no lo son. Sin precio o sin uso, `null`, nunca 0.
+  Anthropic a modelos que no lo son. Sin precio o sin uso, `null`, nunca 0. `cost`
+  recalcula una corrida sin costo con la misma regla, desde el `modelUsage` de su
+  `stdout.log`: si un modelo no tiene precio, sigue `null`.
 - El runner nunca abre una key. Por eso el resultado trae `account` (la cuenta pedida, o
   null si decidió delegate), no una huella.
 
@@ -389,7 +413,10 @@ Reglas que el código cumple y los tests prueban:
 corrida queda `abandoned`; `gc` la recoge pasadas 5 horas. Con `bash` el delegado
 alcanza el `.git` compartido (refs, config) y cualquier archivo del usuario: el diff y
 el scope miden el worktree, no la máquina. Los archivos ignorados por `.gitignore` ni se
-miden ni se commitean.
+miden ni se commitean. Con los filtros anulados, un archivo LFS que el delegado modifique
+entra a la rama como contenido crudo, no como puntero. La limpieza de procesos no es
+contención del kernel: un proceso que cambie de grupo en cada fork todavía puede
+escaparse (haría falta un cgroup).
 
 Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_id>/`
 (`request.json`, `result.json`, `stdout.log`, `stderr.log`, `patch.diff`, `checks/`,

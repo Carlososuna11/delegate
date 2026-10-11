@@ -467,5 +467,112 @@ class GcTests(ReportTestBase):
         self.assertIn("master", branches)
 
 
+    # -- what a delegate with bash can leave behind --------------------------
+
+    def _finished_run(self, repo, run_id):
+        wt = contract.state_root() / "worktrees" / run_id
+        git("-C", str(repo), "worktree", "add", "--detach", "-q", str(wt), "HEAD")
+        write_run(run_id, result=self.old(run_id, worktree=str(wt),
+                                          branch=f"delegate/{run_id}"),
+                  request={"repo": str(repo)})
+        return wt
+
+    def test_a_symbolic_branch_ref_never_deletes_its_target(self):
+        repo = Path(self.tmp.name) / "repo"
+        init_repo(repo)
+        run_id = "20200101-000000-aaaaaa"
+        self._finished_run(repo, run_id)
+        main = subprocess.run(["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        git("-C", str(repo), "symbolic-ref", f"refs/heads/delegate/{run_id}",
+            f"refs/heads/{main}")
+        out = report.gc(days=14)
+        self.assertTrue(out[0]["removed"], out)
+        alive = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q",
+                                f"refs/heads/{main}"], capture_output=True)
+        self.assertEqual(alive.returncode, 0, "gc deleted the branch the symref pointed at")
+
+    def test_a_symlinked_worktree_dir_never_removes_its_target(self):
+        repo = Path(self.tmp.name) / "repo"
+        init_repo(repo)
+        run_id = "20200101-000000-aaaaaa"
+        wt = self._finished_run(repo, run_id)
+        git("-C", str(repo), "worktree", "remove", "--force", str(wt))
+        victim = contract.state_root() / "worktrees" / "20990101-000000-bbbbbb"
+        git("-C", str(repo), "worktree", "add", "--detach", "-q", str(victim), "HEAD")
+        wt.symlink_to(victim, target_is_directory=True)
+        report.gc(days=14)
+        self.assertTrue(victim.is_dir(), "gc removed the worktree the symlink pointed at")
+        listed = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                                capture_output=True, text=True).stdout
+        self.assertIn(str(victim), listed)
+        self.assertFalse(wt.is_symlink())
+
+    def test_an_unrelated_moved_worktree_keeps_its_registration(self):
+        repo = Path(self.tmp.name) / "repo"
+        init_repo(repo)
+        run_id = "20200101-000000-aaaaaa"
+        self._finished_run(repo, run_id)
+        other = Path(self.tmp.name) / "unrelated"
+        git("-C", str(repo), "worktree", "add", "--detach", "-q", str(other), "HEAD")
+        other.rename(Path(self.tmp.name) / "unrelated-moved")
+        report.gc(days=14)
+        self.assertTrue((repo / ".git" / "worktrees" / "unrelated").exists(),
+                        "gc pruned a registration that was not its own")
+
+    def test_gc_never_runs_a_git_from_a_relative_path_entry(self):
+        repo = Path(self.tmp.name) / "repo"
+        init_repo(repo)
+        run_id = "20200101-000000-aaaaaa"
+        wt = self._finished_run(repo, run_id)
+        marker = Path(self.tmp.name) / "planted-ran"
+        planted = wt / "git"
+        planted.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n", encoding="utf-8")
+        planted.chmod(0o755)
+        old_path, old_cwd = os.environ["PATH"], os.getcwd()
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        self.addCleanup(os.chdir, old_cwd)
+        os.environ["PATH"] = ".:" + old_path
+        os.chdir(wt)
+        report.gc(days=14)
+        self.assertFalse(marker.exists(), "gc ran the git planted in the worktree")
+
+
+class CostRepricingTests(ReportTestBase):
+    def test_a_run_whose_models_are_not_all_priced_stays_unknown(self):
+        # One model of two has a price: the run's estimate is None, and the
+        # aggregate must not reprice its whole usage as the priced model.
+        p = Path(self.tmp.name) / "prices.tsv"
+        p.write_text(f"{HEADER}\ndeepseek\tbig\t1\t1\t0\t0\t2026-01-01\n", encoding="utf-8")
+        run_id = "20260101-000000-aaaaaa"
+        rd = write_run(run_id, result=self.result(
+            run_id, provider="deepseek", model="big", started_at=time.time(),
+            usage={"input": 1_000_000, "output": 0, "cache_read": 0, "cache_write": 0},
+            cost_usd_estimate=None))
+        per = {"inputTokens": 500_000, "outputTokens": 0, "cacheReadInputTokens": 0,
+               "cacheCreationInputTokens": 0}
+        (rd / "stdout.log").write_text(json.dumps({"modelUsage": {"big": per, "small": per}}),
+                                       encoding="utf-8")
+        out = report.cost(days=7, prices_path=p)
+        self.assertIsNone(out["total_cost_usd_estimate"])
+        self.assertIn("cota inferior", out["note"])
+
+    def test_a_table_filled_later_prices_every_model_of_an_old_run(self):
+        p = Path(self.tmp.name) / "prices.tsv"
+        p.write_text(f"{HEADER}\ndeepseek\tbig\t1\t0\t0\t0\t2026-01-01\n"
+                     "deepseek\tsmall\t2\t0\t0\t0\t2026-01-01\n", encoding="utf-8")
+        run_id = "20260101-000000-aaaaaa"
+        rd = write_run(run_id, result=self.result(
+            run_id, provider="deepseek", model="big", started_at=time.time(),
+            usage={"input": 2_000_000, "output": 0, "cache_read": 0, "cache_write": 0},
+            cost_usd_estimate=None))
+        per = {"inputTokens": 1_000_000, "outputTokens": 0, "cacheReadInputTokens": 0,
+               "cacheCreationInputTokens": 0}
+        (rd / "stdout.log").write_text(json.dumps({"modelUsage": {"big": per, "small": per}}),
+                                       encoding="utf-8")
+        out = report.cost(days=7, prices_path=p)
+        self.assertAlmostEqual(out["total_cost_usd_estimate"], 3.0)
+
+
 if __name__ == "__main__":
     unittest.main()

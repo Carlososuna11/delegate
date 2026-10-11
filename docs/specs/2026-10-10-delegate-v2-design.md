@@ -24,7 +24,7 @@ actual.
 
 | # | Defecto | Arreglo |
 |---|---|---|
-| A1 | Git ejecuta programas desde el piso de solo lectura (`--ext-diff`, `--textconv`, `diff.external`, `core.fsmonitor`, `core.pager` de la config del repo) | En el piso, `git` corre con `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` y `-c` que anulan `diff.external`, `core.fsmonitor`, `core.pager`, `core.hooksPath`, y deniega `--ext-diff`, `--textconv` y `--output` en todas sus formas. Se documenta que es defensa en profundidad: el límite real sigue siendo "no delegar sobre árboles hostiles". |
+| A1 | Git ejecuta programas desde el piso de solo lectura (`--ext-diff`, `--textconv`, `diff.external`, `core.fsmonitor`, `core.pager` de la config del repo) | En el piso, `git` corre con `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` y `-c` que anulan `diff.external`, `core.fsmonitor`, `core.pager`, `core.hooksPath`, anula cada filtro y driver de diff (`command`, `textconv`) del repo, pone `--no-ext-diff --no-textconv --ignore-submodules=all` justo después del subcomando (al final, `--line-prefix` y similares se los tragaban como valor) y deniega `--ext*`, `--textc*`, `--ignore-su*`, `--sub*` y `--output` en todas sus formas. Se documenta que es defensa en profundidad: el límite real sigue siendo "no delegar sobre árboles hostiles". |
 | A2 | `GIT_CONFIG_*`, `GIT_CONFIG_PARAMETERS` y familia pasan el guardián de passthrough MCP | Se agregan a los nombres rechazados (`GIT_*` completo salvo una allowlist vacía por ahora). |
 | A3 | `PATH` heredado: entradas vacías o relativas permiten que el repo revisado gane sobre `grep`, `git`, `timeout` y `claude` | `claude_bin`, `timeout` y `grep` se resuelven a ruta absoluta **antes** de cualquier `cd`. El `PATH` del hijo se construye: stubs + directorios absolutos del `PATH` del padre, descartando vacíos, relativos y cualquiera dentro de `--dir`. |
 | A4 | El texto de la tarea puede ser una opción de `claude` (`-- --help` sale 0 sin hacer nada) | `--` antes del prompt posicional. `--append-system-prompt` sigue siendo la última opción. |
@@ -163,6 +163,21 @@ Lo que cambió respecto de lo de arriba al implementarlo, y por qué. El código
   cada llamada posterior lleva `--git-dir` y `--work-tree`: el `.git` del worktree es un
   archivo que el delegado puede reescribir. `git` y `delegate` se resuelven a ruta
   absoluta con las entradas absolutas del `PATH`, nunca desde el worktree.
+- **Git endurecido después del hijo.** Desde que el hijo corrió, `.git/config` es del
+  delegado. `add`, `diff-tree`, `commit-tree`, `update-ref` y todo el git de `gc` corren
+  sin config de sistema ni global, con un environment construido, y con hooks,
+  `core.fsmonitor`, `diff.external`, firmas y cada filtro y driver de diff del repo
+  anulados por `GIT_CONFIG_KEY_n`. En todas las llamadas: `GIT_NO_REPLACE_OBJECTS=1`
+  (una ref de reemplazo escondía una edición del scope) y `GIT_OPTIONAL_LOCKS=0`. Las
+  refs se crean y borran con `--no-deref`; `gc` no sigue symlinks en `worktrees/` ni
+  corre `git worktree prune`.
+- **Chequeo de árbol sucio** con porcelain v2: rechaza un submódulo con cambios adentro
+  y un índice con `assume-unchanged`/`skip-worktree` en archivos presentes, que
+  esconden cambios.
+- **Limpieza de procesos** recuerda sesión y grupo de todo proceso visto (zombis
+  incluidos) y usa `killpg`, que el kernel aplica a todos los miembros a la vez.
+- **Parada tardía.** Una cancelación o un TERM que llega después del hijo convierte un
+  `completed`/`checks_failed` en `cancelled` antes de escribir el resultado final.
 - **Checks** con un environment construido (`HOME`, `PATH` filtrado, locale, `TMPDIR`) y
   un `PATH` sin entradas relativas ni dentro del worktree: corren código del modelo, y
   los tokens de quien llama no tienen por qué verlo.
@@ -170,6 +185,9 @@ Lo que cambió respecto de lo de arriba al implementarlo, y por qué. El código
   que no lo son (el harness mismo marca `costBasis: unknown`). Se estima por modelo con
   `prices.tsv`; un modelo sin fila o un conteo ausente dejan `null`. El
   `prices.tsv` de `~/.local/state/delegate/` gana sobre el del repo, que va sin precios.
+  `cost` recalcula con la misma regla desde el `modelUsage` de `stdout.log`.
+- **JSON en ASCII** (`ensure_ascii`), en disco y en stdout: los nombres no UTF-8 viajan
+  como `surrogateescape` y un surrogate suelto del harness no rompe el resultado final.
 - **Perilla de tests.** `DELEGATE_RUN_WALL` reemplaza `timeout + 30 s`;
   `DELEGATE_RUN_GRACE` y `DELEGATE_RUN_SLACK` acortan la gracia y el margen.
 
@@ -184,6 +202,10 @@ Límites conocidos:
   `delegate --edit` lo otorga: una corrida con `edit` y sin `bash` puede editar archivos
   existentes pero no crear nuevos. Es un defecto de `delegate` frente a esa versión del
   harness, no de `delegate-run`; el smoke real usa una edición por eso.
+- Con los filtros anulados después del hijo, un archivo LFS que el delegado modifique
+  queda en la rama como contenido crudo, no como puntero.
+- La limpieza de procesos no es contención del kernel: un proceso que cambie de grupo
+  de procesos en cada fork todavía puede escaparse. Cerrarlo exige un cgroup.
 
 ### Cómo verifica quien llama
 

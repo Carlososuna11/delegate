@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -159,7 +160,7 @@ def write_json_atomic(path: Path, obj) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
+            json.dump(obj, f, ensure_ascii=True, indent=2)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
@@ -170,3 +171,56 @@ def write_json_atomic(path: Path, obj) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+# --- git environment ---------------------------------------------------------
+# Shared by the runner and gc: every git call that may meet configuration a
+# delegate wrote goes through hardened_git_env(). See runner._hardened_env.
+
+GIT_ENV_KEEP = ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
+# Replacement refs are ignored: `refs/replace/*` is shared by every worktree,
+# so a delegate with bash could make a forbidden edit invisible to the scope
+# check. GIT_OPTIONAL_LOCKS=0 keeps `git status` from rewriting the user's
+# index while the runner only inspects it.
+GIT_FIXED_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1",
+                 "GIT_OPTIONAL_LOCKS": "0"}
+GIT_HARDENED_CONFIG = (("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false"),
+                       ("diff.external", ""), ("submodule.recurse", "false"),
+                       ("core.pager", "cat"), ("log.showSignature", "false"),
+                       ("gpg.program", "/bin/false"), ("gpg.ssh.program", "/bin/false"),
+                       ("gpg.x509.program", "/bin/false"), ("gc.auto", "0"),
+                       ("maintenance.auto", "false"))
+
+
+def trusted_path() -> str:
+    """The caller's PATH with only absolute entries.
+
+    Commands are resolved against this BEFORE any cwd change: a relative or
+    empty entry would resolve inside a worktree, where the delegate can plant
+    a `git` or a `delegate` that would then run with the caller's environment.
+    """
+    entries = [e for e in os.environ.get("PATH", "").split(os.pathsep) if e.startswith("/")]
+    return os.pathsep.join(entries) or "/usr/bin:/bin"
+
+
+def which(name: str) -> str | None:
+    """Absolute path of `name` on trusted_path(), or None."""
+    found = shutil.which(name, path=trusted_path())
+    return os.path.abspath(found) if found else None
+
+
+def hardened_git_env(overrides=()) -> dict:
+    """An environment BUILT for git, never inherited: no system or global
+    config, none of the caller's variables beyond GIT_ENV_KEEP (its tokens
+    never reach a program git starts), and GIT_HARDENED_CONFIG plus
+    `overrides` as command-line config. GIT_CONFIG_KEY_n takes any key, even
+    one `-c` could not express (a subsection with `=`)."""
+    env = {k: os.environ[k] for k in GIT_ENV_KEEP if k in os.environ}
+    env.update(GIT_FIXED_ENV)
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, PATH=trusted_path())
+    pairs = list(GIT_HARDENED_CONFIG) + list(overrides)
+    env["GIT_CONFIG_COUNT"] = str(len(pairs))
+    for i, (key, value) in enumerate(pairs):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    return env

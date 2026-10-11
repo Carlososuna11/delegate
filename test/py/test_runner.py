@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -597,6 +598,218 @@ class DirtyTreeTest(RunnerBase):
         plain.mkdir()
         result = runner.execute(self._req(repo=str(plain)))
         self.assertEqual(result.status, contract.REJECTED)
+
+
+
+class ScriptedBase(RunnerBase):
+    """The fake runs FAKE_SCRIPT in the worktree: one test, one behaviour."""
+
+    def script(self, code):
+        os.environ["FAKE_MODE"] = "script"
+        os.environ["FAKE_SCRIPT"] = code
+        self.addCleanup(os.environ.pop, "FAKE_SCRIPT", None)
+
+    def secret(self, name="GITHUB_TOKEN", value="SYNTHETIC_CALLER_SECRET"):
+        old = os.environ.get(name)
+        os.environ[name] = value
+        self.addCleanup(lambda: os.environ.pop(name, None) if old is None
+                        else os.environ.__setitem__(name, old))
+
+
+class PostChildGitTest(ScriptedBase):
+    """After the child ran, the repository's config is the delegate's."""
+
+    def test_filters_and_fsmonitor_from_the_repo_config_never_run(self):
+        # The delegate (with bash it can) adds a clean filter and an fsmonitor
+        # hook to .git/config. The runner's `git add` used to run both, with
+        # the caller's environment: the filter received GITHUB_TOKEN.
+        leak = self.tmp / "leaked"
+        self.secret()
+        self.script(f"""
+import os, pathlib
+os.environ.pop("GITHUB_TOKEN", None)
+pathlib.Path(".gitattributes").write_text("victim filter=review\\n")
+pathlib.Path("victim").write_text("data\\n")
+pathlib.Path("helper.sh").write_text('#!/bin/sh\\nprintf "%s|" "$GITHUB_TOKEN" >> "{leak}"\\ncat\\n')
+os.chmod("helper.sh", 0o755)
+git("config", "filter.review.clean", os.path.abspath("helper.sh"))
+git("config", "filter.review.required", "true")
+git("config", "core.fsmonitor", os.path.abspath("helper.sh"))
+git("config", "diff.review.command", os.path.abspath("helper.sh"))
+""")
+        result = runner.execute(self._req())
+        self.assertFalse(leak.exists(), f"a helper from the repo config ran: {leak.read_text() if leak.exists() else ''}")
+        self.assertEqual(result.status, contract.COMPLETED, result.error)
+        self.assertIn({"path": "victim", "change": "A"}, result.changed_files)
+
+    def test_replacement_refs_do_not_hide_an_edit_from_the_scope(self):
+        # refs/replace is shared by every worktree: replacing the base commit
+        # with one that already holds the forbidden edit made that edit vanish
+        # from changed_files and scope_violation, while the branch carried it.
+        self.script("""
+import pathlib, subprocess
+pathlib.Path("README.md").write_text("hidden forbidden edit\\n")
+git("add", "README.md")
+tree = subprocess.check_output(["git", "write-tree"], text=True).strip()
+env = dict(__import__("os").environ, GIT_AUTHOR_NAME="x", GIT_AUTHOR_EMAIL="x@x",
+           GIT_COMMITTER_NAME="x", GIT_COMMITTER_EMAIL="x@x")
+fake = subprocess.check_output(["git", "commit-tree", tree, "-m", "r"], text=True, env=env).strip()
+git("replace", "HEAD", fake)
+pathlib.Path("allowed").write_text("visible permitted edit\\n")
+""")
+        result = runner.execute(self._req(scope=("allowed",)))
+        self.assertIn("README.md", result.scope_violation)
+        self.assertIn({"path": "README.md", "change": "M"}, result.changed_files)
+
+    def test_a_planted_symbolic_ref_does_not_move_its_target(self):
+        # The delegate pre-creates refs/heads/delegate/<run_id> as a symbolic
+        # ref to main: creating the branch must not move main.
+        self.script("""
+import pathlib
+run_id = pathlib.Path.cwd().name
+pathlib.Path("edited.txt").write_text("x\\n")
+git("symbolic-ref", f"refs/heads/delegate/{run_id}", "refs/heads/main")
+""")
+        main_before = self._head()
+        result = runner.execute(self._req())
+        self.assertEqual(self._git(self.repo, "rev-parse", "refs/heads/main").stdout.strip(),
+                         main_before)
+        self.assertEqual(result.status, contract.INFRA_FAILED)
+
+    def test_non_utf8_name_cannot_pass_as_a_literal_one(self):
+        # backslashreplace turned b"\xff.txt" into the str "\\xff.txt", which
+        # is also the literal name with a backslash: a scope naming the
+        # literal file admitted the other one.
+        self.script("open(b'\\xff.txt', 'wb').write(b'x\\n')")
+        result = runner.execute(self._req(scope=("\\xff.txt",)))
+        self.assertEqual(result.scope_violation, ["\udcff.txt"])
+
+    def test_a_lone_surrogate_in_the_harness_json_still_publishes_a_result(self):
+        self.script("""
+import json, sys
+print(json.dumps({"type": "result", "is_error": False, "result": chr(0xd800)}))
+sys.exit(0)
+""")
+        req = {"v": 1, "provider": "deepseek", "repo": str(self.repo), "task": "t"}
+        proc = subprocess.run([str(BIN)], input=json.dumps(req), capture_output=True,
+                              text=True, env=dict(os.environ), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["status"], contract.COMPLETED)
+        self.assertEqual(out["report"], "\ud800")
+        on_disk = json.loads((self.state / "runs" / out["run_id"] / "result.json").read_text())
+        self.assertEqual(on_disk["status"], contract.COMPLETED)
+
+
+class LateStopTest(ScriptedBase):
+    def _stage_then(self, action):
+        original = runner._stage
+
+        def staged(worktree, gitdir):
+            action(Path(worktree))
+            return original(worktree, gitdir)
+        runner._stage = staged
+        self.addCleanup(setattr, runner, "_stage", original)
+
+    def test_cancel_marker_after_the_child_exited_is_honoured(self):
+        # With no checks nothing looked at the marker after the child: a run
+        # cancelled while staging reported `completed`.
+        self._stage_then(lambda wt: (self.state / "runs" / wt.name / runner.CANCEL_MARKER).touch())
+        result = runner.execute(self._req())
+        self.assertEqual(result.status, contract.CANCELLED)
+
+    def test_term_after_the_child_exited_is_honoured(self):
+        self._stage_then(lambda wt: os.kill(os.getpid(), signal.SIGTERM))
+        result = runner.execute(self._req())
+        self.assertEqual(result.status, contract.CANCELLED)
+
+
+class IndexStateTest(ScriptedBase):
+    def test_assume_unchanged_edit_is_not_silently_dropped(self):
+        self._git(self.repo, "update-index", "--assume-unchanged", "README.md")
+        (self.repo / "README.md").write_text("uncommitted\n", encoding="utf-8")
+        result = runner.execute(self._req(snapshot=True))
+        self.assertEqual(result.status, contract.REJECTED)
+        self.assertIn("assume-unchanged", result.error)
+
+    def test_dirty_submodule_content_is_rejected_even_with_snapshot(self):
+        sub = self.tmp / "sub"
+        sub.mkdir()
+        self._git(sub, "init", "-q")
+        (sub / "f").write_text("one\n", encoding="utf-8")
+        self._git(sub, "add", "f")
+        self._git(sub, "commit", "-qm", "sub")
+        self._git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add",
+                  "-q", str(sub), "mod")
+        self._git(self.repo, "commit", "-qm", "add submodule")
+        (self.repo / "mod" / "f").write_text("dirty\n", encoding="utf-8")
+        result = runner.execute(self._req(snapshot=True))
+        self.assertEqual(result.status, contract.REJECTED)
+        self.assertIn("mod", result.error)
+
+    def test_the_dirty_check_never_rewrites_the_users_index(self):
+        future = time.time() + 5
+        os.utime(self.repo / "README.md", (future, future))
+        index = self.repo / ".git" / "index"
+        before = index.read_bytes()
+        self.assertEqual(runner._dirty(self.repo), (False, []))
+        self.assertEqual(index.read_bytes(), before)
+
+
+class CleanupRaceTest(ScriptedBase):
+    def test_a_fork_and_exit_chain_does_not_outlive_the_run(self):
+        # Each link forks the next and exits, so a /proc scan rarely sees a
+        # live one; the dead links' session and group give it away.
+        beat = self.tmp / "heartbeat"
+        self.script(f"""
+import os, pathlib, time
+if os.fork() == 0:
+    os.setsid()
+    end = time.monotonic() + 3
+    while time.monotonic() < end:
+        pathlib.Path({str(beat)!r}).write_text(str(os.getpid()))
+        if os.fork():
+            os._exit(0)
+    os._exit(0)
+""")
+        result = runner.execute(self._req())
+        self.assertEqual(result.status, contract.COMPLETED, result.error)
+        first = beat.read_text()
+        time.sleep(0.3)
+        self.assertEqual(beat.read_text(), first, "the chain kept running after the run")
+
+    def test_an_orphan_already_dead_at_cleanup_is_reaped(self):
+        runner._become_subreaper()
+        rd = self.tmp / "rd"
+        rd.mkdir()
+        code = ("import os, time, pathlib\n"
+                "pid = os.fork()\n"
+                "if not pid: os._exit(0)\n"
+                f"pathlib.Path({str(self.tmp / 'gc.pid')!r}).write_text(str(pid))\n"
+                "time.sleep(0.2)\n")
+        with open(os.devnull, "wb") as out:
+            runner._supervise([sys.executable, "-c", code], self.tmp, out, out, 10,
+                              runner._Run(rd))
+        pid = int((self.tmp / "gc.pid").read_text())
+        self.assertIsNone(runner._stat(pid), "a dead orphan was left a zombie")
+
+
+class GlobClassTest(unittest.TestCase):
+    def test_bracket_classes(self):
+        cases = [("a.txt", "[!]].txt", True), ("].txt", "[!]].txt", False),
+                 ("].txt", "[]].txt", True), ("-", "[a-]", True), ("b", "[a-c]", True),
+                 ("a/b", "a[/]b", False), ("z.txt", "[!a].txt", True),
+                 ("a.txt", "[^a].txt", False), ("\\", "[\\\\]", True)]
+        for path, pattern, expected in cases:
+            with self.subTest(path=path, pattern=pattern):
+                self.assertEqual(runner.in_scope(path, [pattern]), expected)
+
+    def test_a_pattern_that_cannot_compile_is_refused_in_the_request(self):
+        from delegate_run import request
+        body = {"v": 1, "provider": "deepseek", "repo": "/tmp", "task": "t",
+                "scope": ["[z-a]"]}
+        with self.assertRaises(contract.RequestError):
+            request.parse_request(json.dumps(body))
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import contract, report as _report
+from . import contract, report as _report, scope as _scope
 from .contract import CheckResult, Request, Result
 
 DEFAULT_SLOTS = 2
@@ -60,24 +60,21 @@ _PR_SET_CHILD_SUBREAPER = 36
 _CHECK_ENV_KEEP = ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
                    "TERM", "TMPDIR", "TZ", "SHELL")
 
-# Git for the runner's own calls: the user's config is trusted, the caller's
-# GIT_* environment is not carried (GIT_DIR or GIT_INDEX_FILE from a hook would
-# point every call somewhere else), hooks never run (the worktree holds content
-# the delegate wrote), and nothing daemonizes behind the runner's back.
+# Git for the runner's own calls: the caller's GIT_* environment is not
+# carried (GIT_DIR or GIT_INDEX_FILE from a hook would point every call
+# somewhere else), hooks never run and nothing daemonizes behind the runner's
+# back. Before the child runs, the repository is the user's and its config is
+# honoured (a smudge filter such as LFS works). After it ran, the config is
+# the delegate's to write (a worktree shares .git/config with the user's
+# checkout, and --bash reaches it), so every call goes through
+# _hardened_env: see contract.hardened_git_env.
 _GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
                "-c", "maintenance.auto=false", "-c", "core.quotePath=false")
+# Executable keys a repository can define under a name of its choosing: each
+# one found is overridden with an empty value (an empty `required` is false).
+_HARDENED_KEYS_RE = r"^(filter\..*\.(clean|smudge|process|required)|diff\..*\.(command|textconv))$"
 
-
-def _trusted_path() -> str:
-    """The caller's PATH with only absolute entries.
-
-    Commands are resolved against this BEFORE any cwd change: a relative or
-    empty entry would resolve inside the worktree, where the delegate can plant
-    a `git` or a `delegate` that the runner would then run with its full
-    environment.
-    """
-    entries = [e for e in os.environ.get("PATH", "").split(os.pathsep) if e.startswith("/")]
-    return os.pathsep.join(entries) or "/usr/bin:/bin"
+_trusted_path = contract.trusted_path
 
 
 def _resolve(name: str) -> str:
@@ -85,10 +82,10 @@ def _resolve(name: str) -> str:
         if not os.path.isabs(name):
             raise _Infra(f"{name!r} tiene que ser una ruta absoluta o un nombre en el PATH")
         return name
-    found = shutil.which(name, path=_trusted_path())
+    found = contract.which(name)
     if not found:
         raise _Infra(f"no encuentro {name!r} en el PATH")
-    return os.path.abspath(found)
+    return found
 
 
 class _Infra(Exception):
@@ -191,7 +188,7 @@ def _become_subreaper() -> bool:
 
 
 def _stat(pid: int):
-    """(ppid, sid, starttime, state) from /proc/<pid>/stat, or None."""
+    """(ppid, sid, starttime, state, pgrp) from /proc/<pid>/stat, or None."""
     try:
         data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -199,8 +196,8 @@ def _stat(pid: int):
     end = data.rfind(")")
     fields = data[end + 2:].split()
     try:
-        # fields[0] is field 3 (state); ppid=4, sid=6, starttime=22.
-        return int(fields[1]), int(fields[3]), int(fields[19]), fields[0]
+        # fields[0] is field 3 (state); ppid=4, pgrp=5, sid=6, starttime=22.
+        return int(fields[1]), int(fields[3]), int(fields[19]), fields[0], int(fields[2])
     except (IndexError, ValueError):
         return None
 
@@ -215,19 +212,21 @@ def _snapshot_procs() -> dict[int, tuple]:
     return procs
 
 
-def _tree(root: int, sid: int | None) -> dict[int, int]:
-    """{pid: starttime} of root, its descendants and its session; never us.
+def _tree(root: int, sids) -> dict[int, int]:
+    """{pid: starttime} of root, its descendants and its sessions; never us.
 
     Descendants are followed from the root and from the runner itself (an
     orphan reparented to the subreaper is the runner's child now). Members of
-    the root's session are added even when they escaped the tree, which is the
-    case when the runner could not become a subreaper.
+    the sessions in `sids` are added even when they escaped the tree, which is
+    the case when the runner could not become a subreaper.
     """
+    if isinstance(sids, int) or sids is None:
+        sids = {sids} if sids else set()
     me = os.getpid()
     procs = _snapshot_procs()
     children: dict[int, list[int]] = {}
-    for pid, (ppid, _sid, _start, _state) in procs.items():
-        children.setdefault(ppid, []).append(pid)
+    for pid, info in procs.items():
+        children.setdefault(info[0], []).append(pid)
     found: dict[int, int] = {}
     stack = [root] + [p for p in children.get(me, []) if p != root]
     while stack:
@@ -236,10 +235,9 @@ def _tree(root: int, sid: int | None) -> dict[int, int]:
             continue
         found[pid] = procs[pid][2]
         stack.extend(children.get(pid, []))
-    if sid is not None and sid > 1:
-        for pid, (_ppid, psid, start, _state) in procs.items():
-            if psid == sid and pid != me:
-                found.setdefault(pid, start)
+    for pid, info in procs.items():
+        if info[1] in sids and info[1] > 1 and pid != me:
+            found.setdefault(pid, info[2])
     return found
 
 
@@ -273,39 +271,91 @@ def _reap_orphans(pids) -> None:
             pass
 
 
+class _Groups:
+    """Sessions and process groups the tree has been seen in.
+
+    A /proc scan is not atomic: a process that forks and exits in a loop is
+    gone by the time it is signalled, and its successor was not in the scan.
+    Session and group ids survive fork, so every one seen is remembered: the
+    session widens later scans, and the group is signalled with killpg, which
+    the kernel applies to every member at once. Never the runner's own.
+    """
+
+    def __init__(self, sid: int | None):
+        self.own = {os.getsid(0), os.getpgrp()}
+        self.sids = {sid} if sid and sid > 1 else set()
+        self.pgrps: set[int] = set()
+
+    def note(self, pids) -> None:
+        for pid in pids:
+            info = _stat(pid)
+            if info is None:
+                continue
+            if info[1] > 1 and info[1] not in self.own:
+                self.sids.add(info[1])
+            if info[4] > 1 and info[4] not in self.own:
+                self.pgrps.add(info[4])
+
+    def kill(self, sig: int) -> None:
+        for pgrp in self.pgrps:
+            try:
+                os.killpg(pgrp, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 def _terminate_tree(root: int, sid: int | None, grace: float) -> None:
     """TERM everything under root, wait up to grace, KILL what is left.
 
-    Rescans on every poll so a process forked during shutdown is caught too.
+    Rescans on every poll so a process forked during shutdown is caught too,
+    and only stops after several scans in a row find nothing (see _Groups).
     The root must not have been reaped yet (zombie at most).
     """
+    groups = _Groups(sid)
     seen: dict[int, int] = {}
+
+    def scan() -> dict[int, int]:
+        # Zombies count for learning groups: a fork-and-exit chain leaves its
+        # dead links as the subreaper's zombies, whose stat still names the
+        # session and group of the live link.
+        tree = _tree(root, groups.sids)
+        groups.note(tree)
+        return _live(tree)
+
     deadline = time.monotonic() + grace
-    targets = _live(_tree(root, sid))
+    targets = scan()
     while targets:
         seen.update(targets)
         _signal_all(targets, signal.SIGTERM)
+        groups.kill(signal.SIGTERM)
         if time.monotonic() >= deadline:
             break
         time.sleep(POLL)
+        targets = scan()
         _reap_orphans([p for p in seen if p != root])
-        targets = _live(_tree(root, sid))
-    for _ in range(100):
-        targets = _live(_tree(root, sid))
+    quiet = 0
+    for _ in range(200):
+        targets = scan()
+        groups.kill(signal.SIGKILL)
         if not targets:
-            break
+            quiet += 1
+            if quiet >= 3:
+                break
+            time.sleep(POLL / 5)
+            continue
+        quiet = 0
         seen.update(targets)
         _signal_all(targets, signal.SIGKILL)
-        time.sleep(POLL)
+        time.sleep(POLL / 5)
         _reap_orphans([p for p in seen if p != root])
     _reap_orphans([p for p in seen if p != root])
     # Orphans that exited on their own before the cleanup are zombies of the
     # subreaper and were never "live": reap them too, never the root (its
     # owner reaps it).
     me = os.getpid()
-    ours = _tree(root, sid)
-    _reap_orphans([pid for pid, (ppid, _sid, _st, state) in _snapshot_procs().items()
-                   if ppid == me and state == "Z" and pid != root and pid in ours])
+    ours = _tree(root, groups.sids)
+    _reap_orphans([pid for pid, info in _snapshot_procs().items()
+                   if info[0] == me and info[3] == "Z" and pid != root and pid in ours])
 
 
 def _child_exited(pid: int) -> bool:
@@ -345,12 +395,37 @@ def _acquire_slot(wait: bool, run: _Run):
 
 # --- git --------------------------------------------------------------------
 
+def _path(raw: bytes) -> str:
+    """Git's bytes as a str that round-trips: UTF-8, other bytes as surrogates."""
+    return raw.decode("utf-8", "surrogateescape")
+
+
 def _git_env(extra: dict | None = None) -> dict:
+    """Environment for git BEFORE the child runs: the user's own repository."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.update(contract.GIT_FIXED_ENV)
     # Helpers git runs by name (git-lfs, a credential helper) resolve against
-    # this PATH with the worktree as cwd: no relative entries.
+    # this PATH: no relative entries.
     env["PATH"] = _trusted_path()
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _hardened_env(pin: list[str], extra: dict | None = None) -> dict:
+    """Environment for git AFTER the child ran.
+
+    The filter and driver names are read from the pinned repository on every
+    call: reading config runs nothing, and a name added later is caught.
+    """
+    base = contract.hardened_git_env()
+    proc = _git(".", [*pin, "config", "-z", "--name-only", "--get-regexp", _HARDENED_KEYS_RE],
+                check=False, env=base, text=False)
+    if proc.returncode not in (0, 1):  # 1: no key matched
+        raise _Infra("git config falló al leer los filtros del repositorio: "
+                     + proc.stderr.decode("utf-8", "replace").strip())
+    keys = [(_path(k), "") for k in proc.stdout.split(b"\0") if k]
+    env = contract.hardened_git_env(keys)
     if extra:
         env.update(extra)
     return env
@@ -372,6 +447,13 @@ def _git(cwd, args, check: bool = True, env: dict | None = None,
     return proc
 
 
+def _wgit(worktree: Path, gitdir: str, args, extra: dict | None = None,
+          text: bool = True) -> subprocess.CompletedProcess:
+    """A hardened git call inside the delegate's worktree, pinned to its gitdir."""
+    pin = _pin(worktree, gitdir)
+    return _git(worktree, [*pin, *args], env=_hardened_env(pin, extra), text=text)
+
+
 def _toplevel(repo: str) -> Path:
     if not os.path.isdir(repo):
         raise _Refused(f"'repo' no es un directorio: {repo}")
@@ -387,11 +469,52 @@ def _rev(repo: Path, rev: str) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
 
 
-def _dirty(repo: Path) -> bool:
-    # --untracked-files=all regardless of status.showUntrackedFiles: a tree dirty
-    # only by new files is still a tree the caller may think is being used.
-    proc = _git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-    return bool(proc.stdout)
+def _dirty(repo: Path) -> tuple[bool, list[str]]:
+    """(the tree has changes, submodules with uncommitted content inside).
+
+    --untracked-files=all regardless of status.showUntrackedFiles: a tree dirty
+    only by new files is still a tree the caller may think is being used.
+    Porcelain v2 says which entries are submodules and whether their content
+    (not just their commit) changed: a snapshot cannot carry that content.
+    """
+    proc = _git(repo, ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+                text=False)
+    records = proc.stdout.split(b"\0")
+    dirty, submodules, i = False, [], 0
+    while i < len(records):
+        rec = records[i]
+        i += 1
+        if not rec:
+            continue
+        dirty = True
+        kind = rec[:1]
+        if kind == b"2":
+            i += 1  # the rename's original path is the next record
+        if kind in (b"1", b"2"):
+            fields = rec.split(b" ", 8)
+            sub = fields[2] if len(fields) > 2 else b"N..."
+            if sub.startswith(b"S") and (sub[2:3] == b"M" or sub[3:4] == b"U"):
+                submodules.append(_path(fields[-1]))
+    return dirty, submodules
+
+
+def _hidden_changes(repo: Path) -> list[str]:
+    """Paths whose changes the user's index tells git not to look at.
+
+    assume-unchanged hides an edit from `git status` (and so from the dirty
+    check and the snapshot); skip-worktree does the same for a file that is
+    present. A sparse checkout's absent files are skip-worktree too, and those
+    are fine: there is nothing on disk to lose.
+    """
+    out = _git(repo, ["ls-files", "-v", "-z"], text=False).stdout
+    hidden = []
+    for rec in out.split(b"\0"):
+        if len(rec) < 3:
+            continue
+        tag, path = rec[:1], _path(rec[2:])
+        if tag.islower() or (tag == b"S" and os.path.lexists(repo / path)):
+            hidden.append(path)
+    return hidden
 
 
 def _snapshot(repo: Path, head: str, run_id: str, rd: Path) -> str:
@@ -414,7 +537,7 @@ def _snapshot(repo: Path, head: str, run_id: str, rd: Path) -> str:
     commit = _git(repo, ["commit-tree", "--no-gpg-sign", tree, "-p", head,
                          "-m", f"delegate-run snapshot {run_id}"],
                   env=_git_env(_identity("snapshot"))).stdout.strip()
-    _git(repo, ["update-ref", f"refs/delegate/snapshot/{run_id}", commit, ""])
+    _git(repo, ["update-ref", "--no-deref", f"refs/delegate/snapshot/{run_id}", commit, ""])
     return commit
 
 
@@ -433,8 +556,19 @@ def _resolve_base(repo: Path, req: Request, run_id: str, rd: Path) -> str:
             raise _Refused("snapshot=true solo vale con la base en el commit "
                            "actual (HEAD): el snapshot es el estado de tu árbol")
         return sha
-    if not _dirty(repo):
+    hidden = _hidden_changes(repo)
+    if hidden:
+        raise _Refused("el índice marca archivos como assume-unchanged o skip-worktree "
+                       f"({', '.join(hidden[:5])}): git no ve sus cambios, así que no se "
+                       "puede saber si el árbol está limpio; quita esas marcas con "
+                       "`git update-index --no-assume-unchanged --no-skip-worktree`")
+    dirty, submodules = _dirty(repo)
+    if not dirty:
         return sha
+    if submodules:
+        raise _Refused("hay submódulos con cambios sin commit adentro "
+                       f"({', '.join(submodules[:5])}): ni el snapshot ni el worktree "
+                       "llevan ese contenido; haz commit en el submódulo antes de delegar")
     if not req.snapshot:
         raise _Refused("el árbol de trabajo tiene cambios sin commit o archivos "
                        "nuevos; usa snapshot=true para correr sobre ese estado, "
@@ -450,50 +584,8 @@ def _identity(provider: str) -> dict:
 
 # --- scope ------------------------------------------------------------------
 
-def _glob_regex(pattern: str) -> re.Pattern:
-    """Path glob: `*` and `?` stay inside one segment, `**` spans segments.
-
-    A pattern with no wildcard names a file or a directory and matches
-    everything under it. Unlike fnmatch, `src/*.ts` does not match
-    `src/deep/x.ts`: a scope must not be wider than it reads.
-    """
-    if not any(c in pattern for c in "*?["):
-        p = pattern.rstrip("/")
-        return re.compile(re.escape(p) + r"(?:/.*)?\Z", re.S)
-    out, i, n = [], 0, len(pattern)
-    while i < n:
-        c = pattern[i]
-        if pattern.startswith("**/", i):
-            out.append(r"(?:[^/]+/)*")
-            i += 3
-        elif pattern.startswith("**", i):
-            out.append(r".*")
-            i += 2
-        elif c == "*":
-            out.append(r"[^/]*")
-            i += 1
-        elif c == "?":
-            out.append(r"[^/]")
-            i += 1
-        elif c == "[":
-            j = pattern.find("]", i + 2 if pattern[i + 1:i + 2] in ("!", "]") else i + 1)
-            if j < 0:
-                out.append(re.escape(c))
-                i += 1
-                continue
-            body = pattern[i + 1:j].replace("\\", "\\\\")
-            if body.startswith("!"):
-                body = "^" + body[1:]
-            out.append(f"(?![/])[{body}]")
-            i = j + 1
-        else:
-            out.append(re.escape(c))
-            i += 1
-    return re.compile("".join(out) + r"\Z", re.S)
-
-
-def in_scope(path: str, scope) -> bool:
-    return any(_glob_regex(p).match(path) for p in scope)
+_glob_regex = _scope.compile_glob
+in_scope = _scope.in_scope
 
 
 # --- changes ----------------------------------------------------------------
@@ -516,8 +608,8 @@ def _stage(worktree: Path, gitdir: str) -> str:
     This tree is what the scope check sees and what gets committed: checks run
     later and may write files, and none of that reaches the branch.
     """
-    _git(worktree, [*_pin(worktree, gitdir), "add", "-A", "--", "."])
-    return _git(worktree, [*_pin(worktree, gitdir), "write-tree"]).stdout.strip()
+    _wgit(worktree, gitdir, ["add", "-A", "--", "."])
+    return _wgit(worktree, gitdir, ["write-tree"]).stdout.strip()
 
 
 def _compute_changes(worktree: Path, gitdir: str, base: str, tree: str, req: Request,
@@ -525,20 +617,25 @@ def _compute_changes(worktree: Path, gitdir: str, base: str, tree: str, req: Req
     # -z: a path with a newline or a quote is one record, never two.
     # --no-renames: a rename is a delete plus an add, so both ends are checked
     # against the scope; with rename detection only the new path was.
-    raw = _git(worktree, [*_pin(worktree, gitdir), "diff-tree", "-r", "-z", "--no-renames", "--name-status",
-                          base, tree], text=False).stdout
+    raw = _wgit(worktree, gitdir, ["diff-tree", "-r", "-z", "--no-renames", "--name-status",
+                                   base, tree], text=False).stdout
     parts = raw.split(b"\0")
     changed = []
     for i in range(0, len(parts) - 1, 2):
         code = parts[i].decode("ascii", "replace")[:1]
-        path = parts[i + 1].decode("utf-8", "backslashreplace")
+        # surrogateescape is reversible: the bytes b"\xff.txt" and the literal
+        # name "\\xff.txt" stay distinct strings, so a scope naming one never
+        # admits the other (backslashreplace made them equal). JSON output is
+        # ASCII-escaped, which carries the surrogate through.
+        path = _path(parts[i + 1])
         changed.append({"path": path, "change": code})
     result.changed_files = changed
     if req.scope:
         result.scope_violation = [c["path"] for c in changed
                                   if not in_scope(c["path"], req.scope)]
-    patch = _git(worktree, [*_pin(worktree, gitdir), "diff-tree", "-r", "-p", "--binary", "--no-renames",
-                            base, tree], text=False).stdout
+    patch = _wgit(worktree, gitdir, ["diff-tree", "-r", "-p", "--binary", "--no-renames",
+                                     "--no-ext-diff", "--no-textconv", base, tree],
+                  text=False).stdout
     (rd / "patch.diff").write_bytes(patch)
 
 
@@ -552,11 +649,11 @@ def _commit(worktree: Path, gitdir: str, base: str, tree: str, result: Result, r
     """
     one_line = " ".join(req.task.split())[:60]
     message = f"delegate {result.run_id}: {one_line}\n\nprovider: {req.provider}\n"
-    commit = _git(worktree, [*_pin(worktree, gitdir), "commit-tree", "--no-gpg-sign", tree, "-p", base,
-                             "-m", message],
-                  env=_git_env(_identity(req.provider))).stdout.strip()
+    commit = _wgit(worktree, gitdir, ["commit-tree", "--no-gpg-sign", tree, "-p", base,
+                                      "-m", message], extra=_identity(req.provider)).stdout.strip()
     branch = f"delegate/{result.run_id}"
-    _git(worktree, [*_pin(worktree, gitdir), "update-ref", f"refs/heads/{branch}", commit, ""])
+    # --no-deref: a symbolic ref planted at this name must not move its target.
+    _wgit(worktree, gitdir, ["update-ref", "--no-deref", f"refs/heads/{branch}", commit, ""])
     return branch
 
 
@@ -795,6 +892,13 @@ def _run(req: Request, result: Result, run: _Run) -> None:
 
     if result.changed_files:
         result.branch = _commit(worktree, gitdir, base, tree, result, req)
+    # A stop asked for after the child exited (TERM while staging or
+    # committing, a cancel during a run with no checks) is honoured up to
+    # here, the last point before the terminal result is written: a run told
+    # to stop never reports success. The branch, if any, stays for inspection.
+    if result.status in (contract.COMPLETED, contract.CHECKS_FAILED) and run.stop_requested():
+        result.status = contract.CANCELLED
+        result.error = "se pidió detener la corrida durante el post-proceso"
 
 
 def execute(req: Request) -> Result:
