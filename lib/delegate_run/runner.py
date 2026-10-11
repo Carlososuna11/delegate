@@ -299,6 +299,13 @@ def _terminate_tree(root: int, sid: int | None, grace: float) -> None:
         time.sleep(POLL)
         _reap_orphans([p for p in seen if p != root])
     _reap_orphans([p for p in seen if p != root])
+    # Orphans that exited on their own before the cleanup are zombies of the
+    # subreaper and were never "live": reap them too, never the root (its
+    # owner reaps it).
+    me = os.getpid()
+    ours = _tree(root, sid)
+    _reap_orphans([pid for pid, (ppid, _sid, _st, state) in _snapshot_procs().items()
+                   if ppid == me and state == "Z" and pid != root and pid in ours])
 
 
 def _child_exited(pid: int) -> bool:
@@ -491,22 +498,34 @@ def in_scope(path: str, scope) -> bool:
 
 # --- changes ----------------------------------------------------------------
 
-def _stage(worktree: Path) -> str:
+def _pin(worktree: Path, gitdir: str) -> list[str]:
+    """Explicit --git-dir/--work-tree for every git call inside the worktree.
+
+    The worktree's `.git` is a FILE the delegate can rewrite: pointed at a
+    repository it built, with a `filter.*.clean` or `core.fsmonitor` in its
+    config, the runner's own `git add` would run model-chosen programs with
+    the runner's environment. The gitdir is read once, before the child runs,
+    and the `.git` file is never consulted again.
+    """
+    return ["--git-dir", gitdir, "--work-tree", str(worktree)]
+
+
+def _stage(worktree: Path, gitdir: str) -> str:
     """Stage everything the delegate left (untracked too) and return the tree.
 
     This tree is what the scope check sees and what gets committed: checks run
     later and may write files, and none of that reaches the branch.
     """
-    _git(worktree, ["add", "-A", "--", "."])
-    return _git(worktree, ["write-tree"]).stdout.strip()
+    _git(worktree, [*_pin(worktree, gitdir), "add", "-A", "--", "."])
+    return _git(worktree, [*_pin(worktree, gitdir), "write-tree"]).stdout.strip()
 
 
-def _compute_changes(worktree: Path, base: str, tree: str, req: Request,
+def _compute_changes(worktree: Path, gitdir: str, base: str, tree: str, req: Request,
                      result: Result, rd: Path) -> None:
     # -z: a path with a newline or a quote is one record, never two.
     # --no-renames: a rename is a delete plus an add, so both ends are checked
     # against the scope; with rename detection only the new path was.
-    raw = _git(worktree, ["diff-tree", "-r", "-z", "--no-renames", "--name-status",
+    raw = _git(worktree, [*_pin(worktree, gitdir), "diff-tree", "-r", "-z", "--no-renames", "--name-status",
                           base, tree], text=False).stdout
     parts = raw.split(b"\0")
     changed = []
@@ -518,12 +537,12 @@ def _compute_changes(worktree: Path, base: str, tree: str, req: Request,
     if req.scope:
         result.scope_violation = [c["path"] for c in changed
                                   if not in_scope(c["path"], req.scope)]
-    patch = _git(worktree, ["diff-tree", "-r", "-p", "--binary", "--no-renames",
+    patch = _git(worktree, [*_pin(worktree, gitdir), "diff-tree", "-r", "-p", "--binary", "--no-renames",
                             base, tree], text=False).stdout
     (rd / "patch.diff").write_bytes(patch)
 
 
-def _commit(worktree: Path, base: str, tree: str, result: Result, req: Request) -> str:
+def _commit(worktree: Path, gitdir: str, base: str, tree: str, result: Result, req: Request) -> str:
     """Create delegate/<run_id> pointing at a commit of exactly `tree`.
 
     Plumbing on purpose: no hooks (they would run code from a tree the model
@@ -533,11 +552,11 @@ def _commit(worktree: Path, base: str, tree: str, result: Result, req: Request) 
     """
     one_line = " ".join(req.task.split())[:60]
     message = f"delegate {result.run_id}: {one_line}\n\nprovider: {req.provider}\n"
-    commit = _git(worktree, ["commit-tree", "--no-gpg-sign", tree, "-p", base,
+    commit = _git(worktree, [*_pin(worktree, gitdir), "commit-tree", "--no-gpg-sign", tree, "-p", base,
                              "-m", message],
                   env=_git_env(_identity(req.provider))).stdout.strip()
     branch = f"delegate/{result.run_id}"
-    _git(worktree, ["update-ref", f"refs/heads/{branch}", commit, ""])
+    _git(worktree, [*_pin(worktree, gitdir), "update-ref", f"refs/heads/{branch}", commit, ""])
     return branch
 
 
@@ -729,6 +748,9 @@ def _run(req: Request, result: Result, run: _Run) -> None:
     worktree.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _git(repo, ["worktree", "add", "--detach", "--quiet", str(worktree), base])
     result.worktree = str(worktree)
+    gitdir = _git(worktree, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    if not gitdir:
+        raise _Infra("no se pudo leer el gitdir del worktree")
     run.check_stop()
 
     with open(rd / "stdout.log", "wb") as out, open(rd / "stderr.log", "wb") as err:
@@ -738,8 +760,8 @@ def _run(req: Request, result: Result, run: _Run) -> None:
 
     # The changes are computed from the worktree whatever happened: a run that
     # timed out may still have left work worth inspecting on its branch.
-    tree = _stage(worktree)
-    _compute_changes(worktree, base, tree, req, result, rd)
+    tree = _stage(worktree, gitdir)
+    _compute_changes(worktree, gitdir, base, tree, req, result, rd)
 
     parsed = _apply_harness_json(result, rd)
     harness_error = result.error
@@ -772,7 +794,7 @@ def _run(req: Request, result: Result, run: _Run) -> None:
             result.status = contract.CANCELLED
 
     if result.changed_files:
-        result.branch = _commit(worktree, base, tree, result, req)
+        result.branch = _commit(worktree, gitdir, base, tree, result, req)
 
 
 def execute(req: Request) -> Result:

@@ -24,6 +24,8 @@ Modes (FAKE_MODE):
   odd_names          create a file whose name has a newline, outside src/
   plant_bin          write an executable `mycheck` in --dir that exits 0
   plant_git          write an executable `git` in --dir that touches $FAKE_MARKER
+  hijack_gitdir      point the worktree's .git at a repo whose config defines a
+                     clean filter that touches $FAKE_MARKER
   plant_checks       write edited.txt plus files that try to define the checks
                      (.delegate-run.json, package.json), valid JSON
 
@@ -156,6 +158,19 @@ def main(argv):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(f"#!/bin/sh\ntouch {os.environ['FAKE_MARKER']}\nexit 0\n")
         os.chmod(path, 0o755)
+    if mode == "hijack_gitdir":
+        # Build a repo inside the worktree whose config runs a program on
+        # `git add`, and point the worktree's .git file at it.
+        evil = os.path.join(workdir, "evil")
+        _git(workdir, "init", "-q", evil)
+        _git(evil, "commit", "-q", "--allow-empty", "-m", "evil")
+        _git(evil, "config", "filter.evil.clean", f"touch {os.environ['FAKE_MARKER']}; cat")
+        with open(os.path.join(workdir, ".gitattributes"), "w", encoding="utf-8") as fh:
+            fh.write("* filter=evil\n")
+        with open(os.path.join(workdir, "edited.txt"), "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        with open(os.path.join(workdir, ".git"), "w", encoding="utf-8") as fh:
+            fh.write(f"gitdir: {evil}/.git\n")
     if mode == "plant_checks":
         for name, body in (("edited.txt", "x\n"),
                            (".delegate-run.json", '{"checks": []}\n'),

@@ -526,6 +526,19 @@ class PlantedBinaryTest(RunnerBase):
         self.assertFalse(marker.exists(), "the runner ran the delegate's git")
 
 
+class GitdirHijackTest(RunnerBase):
+    def test_runner_ignores_a_rewritten_dot_git_file(self):
+        os.environ["FAKE_MODE"] = "hijack_gitdir"
+        marker = self.tmp / "filter-ran"
+        os.environ["FAKE_MARKER"] = str(marker)
+        self.addCleanup(os.environ.pop, "FAKE_MARKER", None)
+        result = runner.execute(self._req())
+        self.assertFalse(marker.exists(), "the runner ran a filter from the delegate's repo")
+        # The branch lives in the real repository, not in the planted one.
+        self.assertEqual(result.status, contract.COMPLETED, result.error)
+        self._git(self.repo, "rev-parse", "--verify", result.branch)
+
+
 class DirtyTreeTest(RunnerBase):
     def test_untracked_only_is_dirty(self):
         (self.repo / "new.txt").write_text("wip\n", encoding="utf-8")
