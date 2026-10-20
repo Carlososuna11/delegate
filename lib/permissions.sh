@@ -126,6 +126,13 @@ dg_perm_resolve() {
   local caps="${1-}" want_edit="${2-}" want_bash="${3-}"
   local want_mcp="${4-}" want_mcp_write="${5-}" mcp_rules="${6-}"
 
+  # Cleared on entry, before any return. The globals were only assigned on
+  # success, so a refusal right after a grant left the earlier, wider
+  # DG_ALLOWED in place, readable as this call's answer. Verified: an
+  # unrestricted grant followed by a refused one returned 2 with `Bash` still
+  # in DG_ALLOWED.
+  unset DG_TOOLS DG_ALLOWED DG_RULES
+
   # caps arrives already validated by lib/config.sh. Empty means the default
   # ceiling, which is what a provider file without a `caps` line gets.
   [[ -n "${caps// /}" ]] || caps="$(dg_perm_caps_default)"
@@ -191,10 +198,12 @@ dg_perm_resolve() {
   #   `find` is out: -delete and -exec write.
   #   `rg` is out: `rg --pre=/usr/bin/rm pattern file` makes ripgrep spawn rm,
   #     by design and documented. grep has no equivalent and covers the need.
-  #   `git` stays, with its options unconstrained, so `git diff --output=path`
-  #     can still create or truncate a file — verified. It stays because
-  #     log/diff/show is most of what a review task does, and the residual is
-  #     named in CLAUDE.md instead of pretended away.
+  #   `git` stays, because log/diff/show is most of what a review task does.
+  #     The allow list cannot constrain its options, so on the floor
+  #     bin/delegate puts a `git` wrapper first in PATH that refuses
+  #     --ext-diff, --textconv and --output and ignores the executable keys of
+  #     the repository's config. The residual is named in CLAUDE.md instead of
+  #     pretended away.
   local tools='Read,Bash'
   local allowed='Read,Bash(grep:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*),Bash(git blame:*)'
 
@@ -224,7 +233,7 @@ Si un comando de Bash es denegado, no intentes rodear la denegación: repórtalo
   # was told it had a tool it did not have, and spent turns discovering that by
   # failing. An inventory that does not match the grant is worse than none.
   if (( we )); then
-    rules="$rules Herramientas en este entorno: Read, Edit, Write y Bash; no existen Grep ni Glob."
+    rules="$rules Herramientas en este entorno: Read, Edit y Bash; Edit también crea archivos nuevos (si Write no existe, usa Edit con una ruta nueva); no existen Grep ni Glob."
   else
     rules="$rules Herramientas en este entorno: Read y Bash; no existen Edit, Write, Grep ni Glob. Esta corrida es de SOLO LECTURA: no puedes modificar ni crear archivos. Si la tarea requiere cambiarlos, dilo en tu respuesta en vez de intentarlo."
   fi

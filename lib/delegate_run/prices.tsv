@@ -1,0 +1,40 @@
+# Tabla de precios de delegate-run (USD por millón de tokens).
+#
+# Se llena SOLO desde la página oficial de precios de cada proveedor, con la URL
+# en `source` y la fecha en que se copió en `as_of`. NO inventes valores: un
+# precio equivocado es peor que una fila ausente, porque el costo se reporta
+# como estimación y nadie lo va a notar. Sin fila, el costo queda null.
+#
+# Columnas separadas por TAB. Las líneas que empiezan con # son comentarios.
+# - Los cuatro precios son los de HORA PICO. `peak_utc` dice qué horas UTC son
+#   pico (`mon-fri 01-04,06-10`: días, y ventanas con inicio incluido y fin
+#   excluido); fuera de ellas se cobra precio x `offpeak_factor`. Sin franjas,
+#   `-` en las dos columnas.
+# - `model` es la clave de `modelUsage` del harness, tal cual: con el sufijo
+#   `[1m]` si el proveedor lo lleva en `providers.d/`.
+#
+# DeepSeek (https://api-docs.deepseek.com/quick_start/pricing, leída el 2026-10-10):
+# - deepseek-flash = DeepSeek-V4.1-Flash. Pico: caché hit $0.006, caché miss
+#   $0.3, salida $1.2. Fuera de pico la mitad ("Off-peak rates are half of the
+#   peak rates"): $0.003, $0.15, $0.6.
+# - deepseek-v4-pro = DeepSeek-V4-Pro-0813. Pico: $0.044, $1.32, $3.96.
+# - Pico: 01:00-04:00 y 06:00-10:00 UTC, lunes a viernes. Los feriados chinos
+#   son fuera de pico y la tabla no los modela: ese día se estima a precio pico
+#   (sobreestima, nunca subestima).
+# - `deepseek-flash[1m]`: el sufijo es la pista de ventana de 1M del harness
+#   (sale así en `modelUsage`). DeepSeek mapea un nombre que no reconoce a
+#   deepseek-flash (https://api-docs.deepseek.com/guides/anthropic_api), así
+#   que se cobra a precio Flash en cualquier caso.
+# - DeepSeek no cobra escritura de caché: cada token de entrada es hit o miss
+#   (https://api-docs.deepseek.com/guides/kv_cache). cache_write = precio miss.
+#
+# Qwen (Token Plan, token-plan.ap-southeast-1): SIN FILA a propósito. Es una
+# suscripción mensual con créditos, no un precio por token, y la página oficial
+# (https://www.alibabacloud.com/help/en/model-studio/token-plan-personal-overview)
+# dice que los créditos por llamada se determinan "dynamically ... by model type,
+# token usage, thinking mode, and tool calls" sin publicar una tasa. El consumo
+# real se ve en la consola del Token Plan. Sus corridas quedan con costo null.
+provider	model	input_per_mtok	output_per_mtok	cache_read_per_mtok	cache_write_per_mtok	as_of	source	peak_utc	offpeak_factor
+deepseek	deepseek-flash[1m]	0.3	1.2	0.006	0.3	2026-10-10	https://api-docs.deepseek.com/quick_start/pricing	mon-fri 01-04,06-10	0.5
+deepseek	deepseek-flash	0.3	1.2	0.006	0.3	2026-10-10	https://api-docs.deepseek.com/quick_start/pricing	mon-fri 01-04,06-10	0.5
+deepseek	deepseek-v4-pro	1.32	3.96	0.044	1.32	2026-10-10	https://api-docs.deepseek.com/quick_start/pricing	mon-fri 01-04,06-10	0.5

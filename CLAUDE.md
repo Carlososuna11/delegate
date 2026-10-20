@@ -16,19 +16,31 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    en `ps` para cualquier usuario de la máquina. Se lee de un archivo modo 600 y se pasa
    solo por el environment del proceso hijo. Ni siquiera como argumento de `env`:
    `env ANTHROPIC_API_KEY=... cmd` pone la key en el argv de `env`, y
-   `/proc/<pid>/cmdline` es legible por cualquiera. Se exporta en este shell y el `exec`
-   la hereda. Tres corolarios, cada uno un camino de fuga que existió:
-   - `set +x` y `unset SHELLOPTS BASH_ENV ENV` en la primera línea útil del script: Bash
-     honra un `SHELLOPTS=xtrace` heredado y trazaría `key=<la key>` a stderr, que es el
-     mismo stream que recoge `--json 2>&1`.
+   `/proc/<pid>/cmdline` es legible por cualquiera. Viaja por un pipe (fd 3, NUL
+   separado, escrito por el `printf` builtin) hacia un trampolín `/bin/bash -p`
+   arrancado con `env -i`, que la exporta para el hijo y lo supervisa. Corolarios, cada
+   uno un camino de fuga que existió:
+   - El shebang es `#!/bin/bash -p`: ruta fija y modo privilegiado. Lo que el shell que
+     invoca controla actuaba **antes** de la primera línea del script: `BASH_ENV` se
+     sourceaba, una función exportada llamada `set` corría dentro de la propia limpieza,
+     y un `SHELLOPTS=xtrace` con un `PS4` que expandía `$ANTHROPIC_API_KEY` imprimía la
+     key del padre. El modo privilegiado no lee `BASH_ENV` ni `ENV`, no importa
+     funciones e ignora `SHELLOPTS`, `BASHOPTS`, `CDPATH` y `GLOBIGNORE` del environ.
+     La primera línea útil es `set +a +x +v`, para `bash -a` y `bash -x`: `allexport`
+     volvía a exportar la key a pesar del `local +x`, y `xtrace` trazaría `key=<la key>`
+     al stderr que recoge `--json 2>&1`. El límite: invocado como `bash bin/delegate`
+     el shebang no aplica y nada de esto vale; instalado y llamado por nombre, sí.
    - `local +x key`: un `local` que tapa una variable exportada del mismo nombre
      **conserva** el atributo de export, así que con `export key=...` en el shell que
      invoca, la key entraba al environment de todo helper posterior.
    - El environment del hijo se **construye** desde una allowlist. `env -u A -u B` deja
      pasar todo lo demás, así que `GITHUB_TOKEN`, `AWS_*` y `NODE_OPTIONS` llegaban a una
-     corrida sin flags.
-   - Las **funciones** exportadas se borran aparte, en la primera línea útil del script.
-     Viven en el environ como `BASH_FUNC_<nombre>%%`, que `compgen -e` no lista y
+     corrida sin flags. Y se construye con `env -i`, no solo con el wipe: Bash no importa
+     una entrada del environ cuyo nombre no es un identificador (`SECRET-TOKEN`, `A.B`,
+     un `BASH_FUNC_x%%` que no importó), `compgen -e` no la ve, y Bash se la pasa intacta
+     a cada hijo.
+   - Las **funciones** exportadas: el modo privilegiado no las importa, y el script igual
+     borra las que hubiera, por si lo corren como `bash bin/delegate`. Viven en el environ como `BASH_FUNC_<nombre>%%`, que `compgen -e` no lista y
      `unset -v` no toca, y una función importada **gana** sobre el binario del mismo
      nombre: con `export -f grep` en el shell padre, el piso de solo lectura —donde
      `Bash(grep:*)` está permitido— pasaba a ser ejecución arbitraria, y este script
@@ -56,8 +68,35 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    (`caps`) gana sobre los flags: si no incluye `bash`, `--bash` se **rechaza**, no se
    ignora en silencio, y un rechazo no deja ningún global seteado, para que una corrida
    negada no pueda leerse como una más angosta.
-5. **Otras CLIs de IA bloqueadas en el PATH del hijo.** Un delegado no invoca `codex`,
-   `claude` ni `delegate` para gastar cuota cara ni para re-delegar.
+5. **Otras CLIs de IA bloqueadas por nombre en el PATH del hijo.** `codex`, `claude`,
+   `delegate`, `dlg`, `dg`, `deepseek-agent`, `qwen-agent`, `opencode` y `gemini` son
+   stubs que salen con 126, para que un delegado no gaste cuota cara ni re-delegue.
+   Lo que esto promete es exactamente eso: bloquea la invocación **por nombre**. Una
+   corrida con `--bash` puede llamar un binario por su ruta absoluta o reescribir su
+   `PATH`, y eso no lo impide nada aquí.
+
+   Los stubs viven en un directorio privado por corrida (`mktemp -d`, 700, en
+   `XDG_RUNTIME_DIR` o `TMPDIR`), que se borra al terminar. El directorio compartido
+   de antes se reescribía con `>` en cada corrida, así que seguía un symlink
+   precreado, y un ejecutable dejado ahí (`node`, `git`) corría antes que el real. El
+   padre tiene que ser del usuario o de root, y solo escribible por su dueño o con
+   sticky bit: quien puede escribir el padre puede renombrar el directorio de la
+   corrida y poner el suyo, aunque este sea 700.
+
+   Alguien tiene que esperar al hijo para borrar el directorio, y no puede ser el CLI:
+   un proceso vivo conserva en `/proc/<pid>/environ` el environment con el que
+   arrancó, aunque haga `unset`, y el CLI arrancó con las credenciales del padre. Por
+   eso el CLI hace `exec` a un supervisor `/bin/bash -p` arrancado con `env -i` (mismo
+   pid, environ vacío). El supervisor:
+   - instala sus trampas antes de lanzar al hijo;
+   - le reenvía TERM, INT y HUP, cada una como sí misma;
+   - cierra todo descriptor por encima de 2;
+   - borra el directorio y sale con el código del hijo, aunque el borrado falle.
+
+   **Límite:** un SIGKILL al proceso de la corrida no se puede atrapar. El hijo
+   (`timeout` y el harness) sigue vivo hasta su timeout, y el directorio de stubs
+   queda en disco. Bajo `delegate-run` ese caso queda cubierto mientras el runner
+   viva: es subreaper y limpia el árbol completo (ver "delegate-run").
 6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
    y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
    variables de entorno, ni reescribir lo que la corrida fija. Una entrada declara
@@ -68,8 +107,12 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
      ganar; el rechazo no es por el orden sino porque un servidor que pide un nombre que
      la corrida posee está pidiendo algo que no puede tener.
    - Los que se interpretan como **código** dentro del hijo: `LD_*`, `NODE_OPTIONS`,
-     `BASH_ENV`, `ENV`, `PATH`, `HOME`, `PYTHONPATH`, `GIT_SSH_COMMAND`,
-     `GIT_EXTERNAL_DIFF`, `PAGER`, `EDITOR` y compañía. Como el environment del hijo se
+     `BASH_ENV`, `ENV`, `PATH`, `HOME`, `PYTHONPATH`, todo `GIT_*` (con
+     `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` una entrada http
+     configuraba `diff.external` y el `git diff` del piso lo corría), `PAGER`,
+     `EDITOR`, `GCONV_PATH` y compañía. También los que desvían o debilitan el TLS del
+     hijo, que lleva la key del proveedor: `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` (y
+     en minúsculas), `NODE_EXTRA_CA_CERTS` y `NODE_TLS_REJECT_UNAUTHORIZED`. Como el environment del hijo se
      construye desde una allowlist, el passthrough es el **único** canal por el que algo
      de este shell cruza, y un nombre de estos lo convierte en ejecución de código.
      Las credenciales **no** están en esa lista a propósito: reenviar un token es para lo
@@ -91,9 +134,33 @@ que un `>` no es una vía de escritura. De ahí salen tres consecuencias:
   `rg --pre=/usr/bin/rm` hace que ripgrep lance ese programa. `grep` cubre la
   necesidad de búsqueda y no tiene equivalente.
 - `git` se queda, porque `log`/`diff`/`show` es casi todo lo que hace una tarea de
-  review, y con él se queda que `git diff --output=ruta` puede crear o truncar un
-  archivo. Hay un `--disallowedTools` que niega esas formas, pero es prefijo
-  también: sube el costo, no cierra el hueco.
+  review, y git corre programas que nombra su config: `diff.external`, el `command` o
+  el `textconv` de un driver, `core.fsmonitor`, `core.pager`, un filtro `clean` o
+  `process`, y el `gpg.program` que verifica una firma. Quien pudiera escribir
+  `.git/config` —un árbol hostil, o la misma corrida con `--edit`— convertía el piso
+  en ejecución de código. Por eso, en el piso, el `git` que alcanza el modelo es un
+  wrapper primero en el `PATH`, que:
+  - ignora la config de sistema y la global;
+  - anula `core.fsmonitor`, `core.pager`, `core.hooksPath` y `diff.external`;
+  - anula cada filtro `clean`/`smudge`/`process` y cada driver de diff
+    (`command`, `textconv`) que nombre la config del repo: los lista con
+    `git config` y los vacía con `-c`;
+  - apaga `log.showSignature` y apunta los tres `gpg.*.program` a `/bin/false`;
+  - pone `--no-ext-diff`, `--no-textconv` y `--ignore-submodules=all` **justo
+    después** del subcomando, antes de todo lo del llamador. Al final quedaban como
+    valor de una opción que lo lleva aparte: `git diff --line-prefix` (o
+    `--src-prefix`, `--dst-prefix`, `--word-diff-regex`) se tragaba el
+    `--no-ext-diff` y corría el driver del repo;
+  - rechaza toda forma y abreviatura de lo que las deshace (`--ext*`, `--textc*`,
+    `--ignore-su*`, `--sub*`), porque `git diff --no-index` acepta prefijos, y
+    `--output` en cualquier prefijo. Los submódulos se ignoran: su contenido lo lee
+    un git con la config del submódulo, que nada de esto anula.
+
+  Es defensa en profundidad, no un límite: es una lista de mecanismos **conocidos** de
+  git 2.43, y una versión de git que agregue otro helper configurable lo deja pasar. El
+  wrapper se alcanza por nombre, no por ruta absoluta. El límite real sigue siendo **no
+  delegar sobre árboles hostiles**. Con `--bash` el `git` es el de la máquina: el shell
+  sin restricción no se angosta.
 - **Una corrida de solo lectura puede leer cualquier archivo que pueda leer quien
   la invoca**, y mandarlo al proveedor. `--add-dir` agrega acceso, no confina;
   `--restricted` confina las herramientas de archivo pero no el Bash. Por eso el
@@ -109,7 +176,8 @@ de usuario.
 
 ## Superficie
 
-Ejecutable `delegate`, con `dg` como abreviación (el mismo script, no una copia).
+Ejecutable `delegate`, con `dlg` como abreviación (el mismo script por symlink, no una
+copia). No `dg`: es el nombre del CLI de Deepgram.
 Proveedor como subcomando; modo agente por defecto.
 
 ```
@@ -135,7 +203,15 @@ que `--edit` y `--bash`.
 Un archivo por proveedor en `providers.d/`, formato `clave<TAB>valor`.
 
 **En config:** `endpoint`, `auth_env`, `key_dir`, `key_pattern`, `default_account`,
-`model`, `small_model`, `timeout`, `caps`, `residency`.
+`model`, `small_model`, `context_tokens`, `timeout`, `caps`, `residency`.
+
+`context_tokens` es la ventana de contexto real de `model`, tal como la documenta el
+proveedor, y llega al hijo como `CLAUDE_CODE_MAX_CONTEXT_TOKENS` solo cuando la corrida
+usa ese `model` (un `--model` no la hereda). Sin ella, un modelo que el catálogo del
+harness no conoce se asume de 200k y se auto-compacta ahí, con un aviso. qwen lleva
+983616: el valor de la guía de Claude Code de Alibaba para el Token Plan (el máximo de
+entrada en modo thinking de una ventana de 1M); no se usa `[1m]` porque esa entrada no
+llega al millón.
 
 **En el script, no configurable:** validación de argumentos y config, el lattice de
 permisos locales, el enforcement de `caps`, `--bare`, la restricción de setting-sources,
@@ -203,11 +279,13 @@ login y **ningún token pasa por acá** — por eso su `env_passthrough` está v
 ## Cuentas
 
 `<key_dir>/api_key.<cuenta>` (modo 600) es la fuente de verdad. `--account <nombre>` y
-`DEEPSEEK_ACCOUNT` resuelven directo a uno de esos archivos. La cuenta por defecto vive
+`DELEGATE_ACCOUNT` resuelven directo a uno de esos archivos. `DEEPSEEK_ACCOUNT`, el
+nombre viejo, se **rechaza** con 2: estuvo documentado y se ignoraba, así que quien lo
+usaba pagaba con otra cuenta sin enterarse. La cuenta por defecto vive
 en un archivo de metadata no secreto, para no depender de estado global mutable.
 
 `api_key` sin sufijo se mantiene **solo como proyección de compatibilidad** para
-`cc-proveedor`, que es Python y lee esa ruta fija.
+herramientas externas que leen esa ruta fija.
 
 **Reglas duras:**
 
@@ -218,21 +296,384 @@ en un archivo de metadata no secreto, para no depender de estado global mutable.
   desvincular y después crear: dejó 28.382 observaciones de ruta inexistente contra 0 de
   `mv -T`.
 - Antes de usar una key se valida que el target esté **dentro** de `key_dir` y tenga
-  permisos 600.
+  permisos 600. La corrida valida y lee **el mismo descriptor**: abre el archivo una vez,
+  repite los chequeos sobre `/proc/$BASHPID/fd/<fd>` y lee de ese fd. Validar un nombre y
+  leerlo después dejaba cambiar el archivo entre las dos cosas.
+- `key_dir` tiene que ser del usuario y no tener bits de grupo ni de otros (700). Se
+  comprueba en **cada** uso (validar, leer, `add`), no solo cuando `add` lo crea.
+- `account add` nunca escribe sobre la ruta final: crea un temporal con punto, con
+  noclobber y `umask 077`, y lo publica con `link(2)` (`ln -T`), que falla con EEXIST en
+  vez de reemplazar o seguir un symlink. Lo que aparezca en esa ruta mientras `add`
+  espera la key se deja intacto y `add` falla.
+
+**Lo que esto NO promete:**
+
+- No hay locking de cuentas. Todo lo anterior protege contra **otros** usuarios, que con
+  `key_dir` en 700 no pueden entrar; el mismo usuario puede seguir cambiando archivos en
+  su `key_dir` mientras corre `delegate`.
+- La primera verificación es por ruta, y lo que la sigue es un `open(2)` normal. Si entre
+  ambas el archivo se cambia por un FIFO, la apertura se bloquea, y el `--timeout` de la
+  corrida no la cubre porque solo limita al hijo. Desde Bash no hay `O_NONBLOCK` ni
+  `O_NOFOLLOW`. Una vez abierto, lo leído es lo verificado.
+- Solo se revisa `key_dir` resuelto, no sus ancestros. Si un ancestro es escribible por
+  otros, pueden renombrar el directorio completo.
+- La ruta de una cuenta nunca puede ser `api_key`, `default_account` ni un archivo con
+  punto: `%s` es un `key_pattern` válido y `api_key` un nombre de cuenta válido, y
+  juntos hacían que la key **fuera** el symlink de compatibilidad.
 - Borrar la cuenta activa deja el setup **sin** cuenta activa, a propósito y con aviso
   ruidoso. Cambiar en silencio qué key se factura es peor que quedarse sin activa.
 - Ningún comando imprime el contenido de una key. Lo más que muestra es una huella
   (prefijo de sha256).
 
+## delegate-run (Fase B)
+
+`bin/delegate-run` (Python 3 de la biblioteca estándar, `lib/delegate_run/`) envuelve a
+`delegate`, no lo reemplaza: corre una tarea que **edita** en un worktree aislado,
+mide él mismo qué cambió, corre los checks que pidió quien llama y deja el resultado en
+una rama. Diseño y decisiones: `docs/specs/2026-10-10-delegate-v2-design.md`, "Fase B".
+
+```
+delegate-run < peticion.json          # resultado JSON por stdout
+delegate-run status <run_id>          # el result.json tal como se ve ahora
+delegate-run list [--limit N]
+delegate-run cancel <run_id>          # espera a que la corrida escriba su status final
+delegate-run cost [--days N]
+delegate-run stats [--days N] [--provider P] [--json]   # tabla legible; JSON con --json
+delegate-run gc [--days N] [--dry-run]
+delegate-run --remote <host> [--detach] < peticion.json   # Fase C, ver abajo
+delegate-run fetch <run_id> [--remote <host>]
+delegate-run status <run_id> --remote <host>
+```
+
+`stats` da, por proveedor/modelo y por proveedor, corridas, estados, éxito al primer
+intento, duración p50/p90, turnos, tokens, costo conocido (y cuántas corridas no lo
+tienen), archivos por corrida y corridas fuera de scope. Qué mide cada columna y
+cómo compararlo con el gasto del modelo principal (`ccusage`):
+`docs/medir-delegacion.md`.
+
+Petición (claves desconocidas o repetidas se rechazan): `v` (1), `provider`, `repo`
+(ruta absoluta), `task`, y opcionales `base` (`HEAD`), `account`, `grants` (`edit`,
+`bash`), `mcp` (solo lectura), `timeout` (60–14400, 1800), `checks` (lista de argv,
+nunca una cadena de shell), `scope` (globs relativos a la raíz: `*` no cruza `/`,
+`**` cruza segmentos, una ruta sin comodín cubre todo lo que tiene debajo),
+`snapshot` (`false`), `wait` (`true`), `run_id` (lo elige quien llama, con la forma
+de siempre; si ya existe o lo reservó un cliente remoto, exit 3 y no se crea nada;
+con `--remote` se rechaza: el id lo elige el cliente).
+
+Salida: exit 0 solo con `completed`; 1 con cualquier otro status (el JSON dice cuál);
+2 si la petición o los argumentos son inválidos, y entonces no hay corrida ni stdout.
+`status`: `completed`, `checks_failed`, `task_failed` (exit distinto de 0, o
+`is_error` del harness), `rejected` (delegate salió con 2 —`child_exit` 2— o el runner
+rechazó repo, base o árbol sucio —`child_exit` null—), `timed_out` (el reloj del
+runner o el `--timeout` de delegate, exit 124), `cancelled`, `busy`, `infra_failed`,
+`invalid_result`. `status`/`list` derivan además `abandoned` (dice `running` y nadie
+tiene el lock) y `unreadable`.
+
+**Quien llama acepta un resultado solo si** `status` es `completed`, `scope_violation`
+está vacío, lee el diff de `delegate/<run_id>` él mismo y vuelve a correr los checks
+antes de integrar. `report` es lo que dice el modelo: evidencia, no autorización.
+`scope_violation` no cambia el `status`; hay que mirar los dos.
+
+Reglas que el código cumple y los tests prueban:
+
+- Un árbol sucio, **incluidos los archivos nuevos**, se rechaza cuando la base es el
+  commit actual. `snapshot: true` lo congela con un índice temporal en
+  `refs/delegate/snapshot/<run_id>` sin tocar el índice ni el árbol del usuario. Con
+  otra base el árbol no se lee, así que no importa si está sucio. Se rechaza también
+  un índice con archivos `assume-unchanged` o `skip-worktree` presentes (git no ve sus
+  cambios) y un submódulo con cambios adentro (ni el snapshot ni el worktree los
+  llevan). El chequeo corre con `GIT_OPTIONAL_LOCKS=0`: no reescribe el índice.
+- Los cambios se miden contra la base con `-z` y sin detección de renombres: los dos
+  extremos de un rename pasan por el scope. Lo que el delegado haya commiteado da igual,
+  y las refs de reemplazo (`refs/replace/*`) se ignoran en toda llamada. Un nombre que
+  no es UTF-8 se reporta con `surrogateescape` (el JSON sale en ASCII): `b"\xff.txt"`
+  y el literal `\xff.txt` nunca se confunden en el scope.
+- Scope: `*` y `?` no cruzan `/`, `**` sí, un patrón sin comodines es un directorio, y
+  las clases `[...]` siguen al shell y a git (`!` o `^` niegan, `]` inicial es literal).
+  Un patrón que no compila se rechaza en la petición.
+- La rama es plumbing (`commit-tree` + `update-ref` que solo crea): sin hooks, sin firma,
+  autor `delegate <proveedor>`, padre la base. Lo que escriban los checks no llega a la
+  rama. Sin cambios no hay rama.
+- El git del runner nunca lee lo que el delegado puede escribir: el gitdir del worktree
+  se fija antes de lanzar al hijo y toda llamada lleva `--git-dir`/`--work-tree` (el
+  archivo `.git` del worktree reapuntado a un repo con un `filter.*.clean` corría ese
+  programa con el environment del runner). `git` y `delegate` se resuelven a ruta
+  absoluta contra las entradas absolutas del `PATH`, antes de entrar al worktree.
+- Después del hijo, la config del repo es del delegado (el worktree comparte
+  `.git/config`). Todo git de ahí en adelante, y el de `gc`, corre endurecido: sin
+  config de sistema ni global, environment construido (sin tokens del que llama),
+  hooks, `core.fsmonitor`, `diff.external` y firmas apagados, y cada filtro
+  (`clean`/`smudge`/`process`/`required`) y driver de diff (`command`/`textconv`) que
+  nombre el repo anulado vía `GIT_CONFIG_KEY_n`. Antes del hijo el repo es del usuario
+  y su config se respeta (un smudge de LFS funciona al crear el worktree).
+- Los checks corren con un environment construido (sin tokens del que llama) y un `PATH`
+  sin entradas relativas ni dentro del worktree. Ejecutan código que escribió el modelo,
+  así que con sandbox corren dentro de bubblewrap con el mismo perfil que el hijo (ver
+  "Sandbox de los checks"); sin sandbox, con los permisos del usuario: el environment se
+  limpia, los archivos no se confinan. `checks_sandbox` en `result.json` dice cuál fue.
+- Procesos: el hijo corre en su propia sesión, el runner se hace subreaper y al terminar
+  (bien, por timeout o por cancelación) manda TERM a todo el árbol y a la sesión, espera
+  la gracia y manda KILL. Recuerda la sesión y el grupo de cada proceso visto, zombis
+  incluidos, y los mata con `killpg`: una cadena de fork-y-salir que un escaneo de
+  `/proc` no alcanza a ver viva cae igual. TERM o INT al runner cuentan como
+  cancelación, también si llegan después del hijo (mientras se mide o se commitea):
+  la corrida queda `cancelled`, nunca `completed`; HUP se ignora.
+- Un lock por corrida (`flock`, lo suelta el kernel) dice si el runner vive. `gc` lo toma
+  exclusivo antes de decidir y nunca borra algo distinto de `worktrees/<run_id>`,
+  `delegate/<run_id>` y la ref del snapshot: borra refs con `--no-deref` (un symref
+  plantado no arrastra a `main`), no sigue un symlink en `worktrees/<run_id>` y no
+  corre `git worktree prune` (barre registros ajenos).
+- El costo sale de `prices.tsv` (el de `~/.local/state/delegate/` gana sobre el del
+  repo). `total_cost_usd` del harness se ignora: pone precios de Anthropic a modelos
+  que no lo son. Sin precio o sin uso, `null`, nunca 0. `cost` y `stats` recalculan
+  una corrida sin costo con la misma regla, desde el `modelUsage` de su
+  `stdout.log` y a la hora en que arrancó: si un modelo no tiene precio, sigue
+  `null`.
+- `prices.tsv` lleva solo precios copiados de la página oficial, con su URL
+  (`source`) y la fecha en que se copiaron (`as_of`). Los cuatro precios son los de
+  hora pico; `peak_utc` (`mon-fri 01-04,06-10`) y `offpeak_factor` describen la
+  tarifa por franja (DeepSeek cobra la mitad fuera de pico). Sin hora de inicio se
+  usa el precio pico. `model` es la clave de `modelUsage` tal cual, con `[1m]`.
+  Qwen (Token Plan) no tiene fila: cobra créditos de una suscripción sin tasa por
+  token publicada. **Al cambiar una tarifa:** abre la página de `source`, corrige
+  los números y `as_of` en la fila (y el comentario de arriba), y corre
+  `test/py.test.sh`. Un modelo nuevo en `providers.d/` necesita su fila, o sus
+  corridas quedan sin costo. Las corridas ya terminadas guardan el costo con el que
+  se cerraron; solo las que quedaron en `null` se recalculan con la tabla nueva.
+- El runner nunca abre una key. Por eso el resultado trae `account` (la cuenta pedida, o
+  null si decidió delegate), no una huella.
+
+**Límites:** un SIGKILL al runner deja vivo al hijo hasta el `--timeout` de delegate y la
+corrida queda `abandoned`; `gc` la recoge pasadas 5 horas. Los archivos ignorados por
+`.gitignore` ni se miden ni se commitean. Con los filtros anulados, un archivo LFS que
+el delegado modifique entra a la rama como contenido crudo, no como puntero. **Sin
+sandbox** (`sandbox: "none"`): con `bash` el delegado alcanza el `.git` compartido
+(refs, config) y cualquier archivo del usuario, y la limpieza de procesos no es
+contención del kernel (un proceso que cambie de sesión en cada fork puede escaparse).
+Con sandbox esas dos cosas se cierran; lo que queda abierto está en "Sandbox".
+
+## Sandbox (bubblewrap)
+
+`delegate-run` corre al hijo de `delegate` (el harness y todo lo que lance) dentro de
+bubblewrap cuando está disponible. `DELEGATE_SANDBOX`: `auto` (default: bwrap si
+funciona; si no, sigue sin sandbox, lo avisa por stderr y deja `sandbox: "none"` en
+`result.json`), `bwrap` (sin bwrap usable la corrida es `infra_failed`, nunca un
+downgrade callado) u `off`. `result.json` trae `sandbox`: `bwrap`, `none` o `null` si
+la corrida terminó antes de decidirlo. Por debajo es `delegate --sandbox bwrap
+--sandbox-ro <gitdir>`, que también sirve fuera del runner.
+
+**Diseño de la key:** `delegate` corre **afuera** del sandbox, lee la key de su archivo
+600 como siempre, y solo su hijo entra. El `key_dir` nunca se monta (ni las keys de
+otras cuentas); la key cruza únicamente en el environment del hijo, igual que antes.
+
+Lo que ve el hijo:
+- `/usr` (y los symlinks `/bin`, `/lib*`) y `/etc` en solo lectura, `/proc` propio,
+  `/dev` mínimo, y del `/run` solo el archivo al que apunta `/etc/resolv.conf`.
+- `/tmp` y `HOME` como tmpfs privados: del home real no hay nada salvo lo que se monta
+  encima (el directorio del binario de `claude`, en solo lectura).
+- El worktree en escritura; el gitdir del repo (común y del worktree) en solo lectura,
+  montado **después**: git lee historia, pero ni una ref, ni la config, ni un hook del
+  repo del usuario se pueden escribir (un `git commit` adentro falla, y el runner hace
+  el suyo afuera). El directorio de stubs, en solo lectura.
+- Namespaces propios de usuario, montaje, pid, ipc, uts y cgroup; `--disable-userns`,
+  `--new-session` (sin TIOCSTI a la terminal) y `--die-with-parent`. Con el namespace
+  de pid, cuando el harness sale muere todo lo que dejó, también una cadena que cambia
+  de sesión en cada fork: probado sin el runner, con un control sin sandbox donde la
+  misma cadena sobrevive.
+- Seccomp: `socket(AF_UNIX)` y `socketpair` de datagramas fallan con `EAFNOSUPPORT`,
+  `io_uring_setup`, `_enter` y `_register` con `ENOSYS`, y una arquitectura ajena mata
+  al proceso. Quedan permitidos los pares `SOCK_STREAM` y `SOCK_SEQPACKET` (las
+  tuberías de stdio de libuv): están conectados entre sí y no pueden conectarse a otra
+  dirección. Si el stdout que recibe `delegate` es un socket, el hijo recibe en su
+  lugar una tubería que `cat` reenvía desde afuera: el filtro impide crear un socket,
+  no usar uno heredado. La red es
+  compartida y con ella el espacio de sockets unix **abstractos** del host: sin el
+  filtro, el sandbox se conectaba a `@/tmp/.X11-unix/X0`, y un X que admite al usuario
+  por uid (`SI:localuser`) lo aceptaba, que es teclear en una terminal de afuera.
+  Verificado con `xdpyinfo`. Filtro solo para x86_64 y aarch64; en otra arquitectura
+  `--sandbox bwrap` se rechaza.
+- Antes de leer la key, cada montaje que va encima del HOME privado se valida
+  canónico: ni el directorio de trabajo, ni un `--sandbox-ro`, ni el del binario de
+  `claude` pueden cruzarse con el `key_dir`; un `--sandbox-ro` no puede ser el HOME ni
+  contenerlo, ni contener el directorio de trabajo. Un `claude` ELF se monta solo; un
+  script lleva su directorio, salvo que ese directorio contenga el HOME.
+- El runner fija la ruta de su `git` antes de crear el worktree: una entrada
+  absoluta del `PATH` dentro del worktree no le cambia el `git` después del hijo.
+
+Lo que **no** cierra:
+- **La red no está restringida.** El hijo alcanza internet y cualquier servicio TCP de
+  `localhost` (una base local, un servidor de desarrollo). Restringirla al host del
+  proveedor exige un proxy y `--unshare-net`: trabajo futuro.
+- La key está en el environment del harness, dentro del sandbox: con `bash` el modelo
+  la lee de `/proc/self/environ` y, con la red abierta, puede mandarla a donde quiera.
+- Los checks corren en su propio sandbox (abajo), pero con lo que se monta para la
+  toolchain: un ejecutable de esos directorios lo puede leer el código del modelo.
+- `/usr` y `/etc` completos son legibles; las herramientas instaladas en el home
+  (nvm, cargo, `~/.local/bin`) no existen adentro, así que con `bash` un `npm test`
+  puede no correr ahí.
+- El worktree y el gitdir completo (todas las ramas y objetos del repo) son legibles.
+- Un par `SOCK_STREAM` permitido puede hacer `bind()` a un nombre abstracto del host y
+  ocuparlo: un servicio que arranque después con ese nombre falla (negación de
+  servicio, no conexión; ese socket no puede escuchar). Negarlo exige negar `bind()`
+  entero o aislar la red.
+- El solo lectura del gitdir es por montaje: un symlink o un hardlink que ya existiera
+  en el gitdir apuntando al directorio de trabajo es un alias escribible. Con los
+  worktrees del runner no pasa (el worktree es nuevo y el árbol principal no se
+  monta), y un hardlink nuevo entre montajes falla con `EXDEV`; con `delegate
+  --sandbox` sobre un repo armado así, sí.
+- `sandbox: "bwrap"` dice que el probe pasó y que a `delegate` se le pidió el sandbox,
+  no una confirmación desde adentro: si bwrap falla al montar, la corrida sale
+  `task_failed` con su mensaje en `stderr.log`, y un `DELEGATE_BIN` que ignore
+  `--sandbox` corre sin confinar.
+- Un bug del kernel en lo que sigue expuesto (namespaces, syscalls permitidas).
+- En una máquina sin bwrap (`sudo apt install bubblewrap`) y con `auto`, nada de esto
+  aplica: `sandbox: "none"` es la señal.
+
+### Sandbox de los checks
+
+Con sandbox (`sandbox: "bwrap"`), cada check de la petición corre dentro de bubblewrap,
+armado por el runner (`lib/delegate_run/sandbox.py`) y no por `delegate`, con el mismo
+perfil que el hijo: `/usr`, `/etc` y el `resolv.conf` en solo lectura, `/proc` y `/dev`
+propios, `/tmp` y `HOME` como tmpfs privados, el worktree en escritura y el gitdir en
+solo lectura encima, los mismos namespaces y `--disable-userns`, `--new-session` y
+`--die-with-parent`, y el **mismo** programa seccomp (un test compara byte a byte el de
+Python con `dg_seccomp_bpf`). Con `DELEGATE_SANDBOX=off`, o `auto` sin bwrap, los checks
+corren en el host como antes. `result.json` trae `checks_sandbox`: `bwrap`, `none`, o
+`null` si no corrió ningún check (campo nuevo; `v` sigue en 1).
+
+Lo que se monta del HOME, en solo lectura y nada más:
+- **Toolchains** que existan: `~/.nvm/versions`, `~/.local/share/uv/python` (los python
+  a los que apuntan los venvs de uv), `~/.rustup/toolchains`, `~/.cargo/bin`,
+  `~/.pyenv/versions`, `~/.bun/bin`. Ninguno guarda credenciales.
+- **El ejecutable del check** cuando el host lo resuelve fuera de todo lo anterior: si
+  vive en el `bin/` de un venv (hay `pyvenv.cfg` al lado), el venv entero; si no, el
+  archivo solo. Así corre `["/ruta/repo/.venv/bin/pytest"]` sin montar el repo.
+- **`DELEGATE_CHECK_RO`**: rutas extra separadas por `:` que decide el dueño de la
+  máquina, nunca la petición (p. ej. `~/.cache/ms-playwright`). Una ruta inválida deja
+  la corrida `infra_failed` **antes** de lanzar al hijo.
+
+Dentro de todo lo montado, los archivos que pueden llevar credenciales de un registro
+(`npmrc`, `.npmrc`, `pip.conf`, `.pypirc`, `.netrc`, `.git-credentials`, `credentials`,
+`auth.json`, `uv.toml`, `.yarnrc*`, hasta 4 niveles) se tapan con un archivo vacío: nvm
+guarda la config global de npm en `~/.nvm/versions/node/<v>/etc/npmrc`, y un venv su
+`pip.conf` con el índice autenticado.
+
+Nunca se monta algo que sea, contenga o esté dentro de `~/.ssh`, `~/.gnupg`,
+`~/.config` (ahí viven los `key_dir`), `~/.aws`, `~/.kube`, `~/.docker`, `~/.claude`,
+`~/.codex`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.gitconfig`,
+`~/.local/state`, `~/.local/share/keyrings` y compañía (bajo el `HOME` y bajo el home de
+`passwd`, por ruta y por destino real si son symlinks), ni el `key_dir` de ningún
+proveedor (leído de `providers.d` como dato), ni el state dir, ni el HOME o algo que lo
+contenga, ni algo que contenga el worktree. Esa lista solo vigila lo que nombra
+quien llama o el dueño; lo que se expone por defecto es la allowlist de toolchains. Un
+ejecutable de check que cae ahí no se monta y su log lo dice.
+
+Decisiones y límites:
+- **Las caches no se montan** (`~/.npm`, `~/.cache/uv`, el store de pnpm). En solo
+  lectura no sirven (npm y uv escriben en ellas) y en escritura un check podría
+  envenenar una cache que después ejecutan las herramientas del usuario fuera de todo
+  sandbox. Cada check arranca con cache vacía en su HOME privado y descarga de la red:
+  más lento, no más inseguro.
+- **Sin config de usuario**: `~/.npmrc`, `~/.gitconfig`, `pip.conf` y `uv.toml` no
+  existen adentro, así que un registro privado o una identidad de git no están. Un
+  check que los necesite no es para el sandbox.
+- **La red sigue abierta**, igual que para el hijo: `npm ci` necesita internet y un test
+  suele necesitar una base en `localhost`. Por TCP sí; por socket unix no (seccomp), así
+  que Postgres va por `127.0.0.1`, no por `/var/run/postgresql`.
+- Fuera de `/usr`, `/etc` y lo de arriba no hay nada: `/opt`, `/var`, `/snap` y `/nix`
+  no existen adentro; lo que haga falta de ahí va por `DELEGATE_CHECK_RO`.
+- Un venv montado tal cual: un `.pth` editable que apunte al checkout del usuario no
+  se ve (y antes importaba ese código, no el del worktree).
+- Un comando que no existe sale 127 sin lanzar bwrap, igual que sin sandbox.
+- El `bwrap` de los checks se fija al decidir el sandbox, **antes** de crear el
+  worktree, y nunca dentro del state dir: una entrada del `PATH` que apunte al worktree
+  futuro le daría al runner un `bwrap` del árbol, que correría los checks en el host
+  con `checks_sandbox: "bwrap"`.
+
+Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_id>/`
+(`request.json`, `result.json`, `stdout.log`, `stderr.log`, `patch.diff`, `checks/`,
+`lock`), `worktrees/<run_id>/` y `slots/` (`DELEGATE_SLOTS`, 2 por defecto).
+
+## delegate-run remoto (Fase C)
+
+`delegate-run --remote <host> < peticion.json` corre la misma petición en otro host.
+La petición es la de siempre, con `repo` local. El cliente:
+
+1. Valida la petición, elige un `run_id` nuevo (reservado con un archivo exclusivo en
+   `state/remote/`; una petición que trae `run_id` se rechaza) y resuelve la base en
+   el repo **local** con las reglas de siempre (árbol sucio rechazado, `snapshot`
+   congela el estado local).
+2. `ssh host delegate-run mirror <nombre>`: el host crea (la primera vez) o encuentra
+   su mirror bare en `~/delegate/repos/<nombre>.git` (`DELEGATE_MIRROR_ROOT`). El
+   nombre es `<basename>-<10 hex de la ruta absoluta>`.
+3. `git push` de la base a `refs/delegate/base/<run_id>`: un namespace propio, nunca
+   forzado, nunca una rama del usuario.
+4. `ssh host delegate-run` con la petición por stdin: `repo` es el mirror, `base` el
+   sha completo, `run_id` el del cliente.
+5. Trae `delegate/<run_id>` a una ref privada (`refs/delegate/fetch/<run_id>`, que no
+   puede existir antes), verifica que sea un commit sobre la base y recién ahí crea la
+   rama con un `update-ref` que solo crea y no sigue symrefs: una rama local existente
+   nunca se mueve. Si algo no cuadra, la corrida queda `infra_failed`. Guarda una copia del
+   `result.json` en `runs/<run_id>/` con `host`, `remote_artifacts` y
+   `remote_worktree`: `status`, `list`, `stats` (`by_host`), `cost` y `gc` la ven.
+
+**Corte de conexión:** nunca se reintenta a ciegas. Se consulta `delegate-run status
+<run_id>` con backoff; solo una corrida que el host no conoce (dos veces seguidas) se
+reenvía, hasta 3 veces, y un `run_id` repetido el host lo rechaza (exit 3), así que no
+hay duplicados. Un resultado con otro proveedor o base no se adopta, y `unreadable`
+se cree solo tras 3 consultas seguidas (así se ve también una corrida que arranca). Sin contacto durante `DELEGATE_REMOTE_GIVEUP` (900 s) sale con 4 y
+deja el registro en `state/remote/<run_id>.json`: `delegate-run fetch <run_id>` la
+recoge después. `--detach` devuelve el `run_id` apenas el host registra la corrida y
+corta la sesión a propósito (el runner ignora HUP y un stdout cerrado).
+
+Lado remoto: el runner acepta un repo **bare**. Ahí no hay árbol que revisar, la base
+tiene que ser el sha completo de un commit del repo (nunca `HEAD` ni un nombre) y
+`snapshot` se rechaza. `gc` en el host borra también `refs/delegate/base/<run_id>`;
+el `gc` local borra la rama traída y el snapshot local.
+
+Seguridad: la petición viaja solo por stdin; la línea de comando remota es texto fijo
+más `run_id` o el nombre del mirror, que pasan una regex estricta y van citados. El
+host (`check_host`) no puede empezar con `-` ni llevar `:` o `/`. ssh corre con
+`BatchMode`, `ConnectTimeout`, `ServerAlive*` y sin agente, X11 ni forwarding; git
+usa el mismo ssh (`GIT_SSH_COMMAND`). El mirror verifica los objetos que recibe
+(`receive.fsckObjects`). El host tiene sus propias keys de delegación (`delegate
+account <proveedor> add` ahí), nunca las de la laptop, y ninguna credencial de
+producción ni de Claude.
+
+Instalación: `scripts/install-remote.sh [host] [rev]` manda un `git bundle` del commit
+(nada sin commit, ni config, ni keys) por scp a un directorio de `mktemp` en el host,
+lo deja en `~/delegate/src` (separado
+de `~/delegate/repos`) y enlaza `delegate`, `dlg` y `delegate-run` en
+`~/.local/bin`, sin pisar un archivo que no sea un enlace. El ssh no interactivo del
+host tiene que encontrar `node`, `claude` y `~/.local/bin` en el `PATH`: si su
+`~/.bashrc` sale temprano en shells no interactivos, el `PATH` va antes de esa salida.
+
+**Límites:** el mirror crece con cada base empujada hasta que el `gc` del host borra
+las refs (y un `git gc` en el mirror los objetos). El `report`, `stdout.log` y los
+logs de checks quedan en el host (`remote_artifacts`); la copia local trae el
+`result.json`, no los logs. `stats` local re-precia una corrida remota sin costo solo
+si su `result.json` lo permite (no tiene el `modelUsage` del host). La recuperación
+depende de que el host conserve `runs/<run_id>`: un `gc` del host antes del `fetch`
+la pierde.
+
 ## Lenguaje
 
 Bash, sin dependencias de runtime. Esto es construir un environment y hacer `exec`.
+`delegate-run` es la excepción prevista: supervisar, medir un diff y escribir JSON
+atómico es justo el caso de Python, y no toca la key.
 
 Python convendría si creciera hacia clientes HTTP portables, transformación de salida
 JSON estructurada o manejo atómico de cuentas multiplataforma. Hoy un rewrite agregaría
 riesgo de migración sin fortalecer el manejo de la key, que es lo que importa.
 
 ## Tests
+
+`test/run.sh` corre todas las suites, incluida la de Python (`test/py.test.sh`:
+`python3 -m unittest discover -s test/py -t .`). `delegate-run` se prueba con un
+`delegate` falso (`test/py/fake_delegate.py`); el smoke contra el proveedor real corre
+solo con `DELEGATE_REAL_HARNESS=1`. El modo remoto se prueba con un `ssh` falso
+(`test/py/fake_ssh.py`, vía `DELEGATE_REMOTE_SSH`) que corre el comando en un HOME y
+un state dir de "remoto" locales, y simula cortes (`FAKE_SSH_DROP`, `FAKE_SSH_FAIL`).
 
 Los invariantes son testeables y en los scripts originales no estaban testeados. Mínimo:
 
@@ -277,6 +718,89 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   servidor, y **antes** de leer la key; presente, la deja pasar. Se resuelve contra
   `--dir`, no contra el cwd del CLI. Y una entrada declarada pero **no pedida** no bloquea
   nada: la precondición de un servidor que no se alcanza no es precondición de la corrida.
+- Una entrada vacía, relativa o dentro de `--dir` en el `PATH` nunca aporta un
+  binario, ni al hijo ni al propio CLI. Hasta que `cmd_run` filtra el `PATH` del
+  llamador contra `--dir`, el CLI corre todo por nombre con `PATH=/usr/bin:/bin`: el
+  `dirname` y el `readlink` del arranque salían de una entrada absoluta dentro del
+  repo. `claude`, `timeout` y el `grep` del filtro se resuelven a ruta absoluta antes
+  del `cd`, y el `PATH` del hijo es stubs más las entradas absolutas que quedan. El
+  test planta también los helpers del arranque (`dirname`, `readlink`, `stat`, `sed`,
+  etc.).
+- El runner cuenta como fallo un test que retorna distinto de 0 aunque no haya
+  llamado a `fail`: un test de seguridad tiene que poder ponerse rojo muriendo.
+- Una tarea que parece opción (`-- --help`) llega al hijo como prompt, detrás de
+  un `--`, y `--append-system-prompt` sigue siendo la última opción.
+- En el piso, el `git` del hijo no corre ningún helper que nombre la config del
+  repo o la global (`diff.external`, `textconv`, `core.fsmonitor`, `core.pager`,
+  un filtro `clean` o `process` o el `command` de un driver en el `.git/config` del
+  repo, `gpg.program` con `log.showSignature` o `--show-signature` sobre un commit
+  firmado), tampoco con abreviaturas (`--textcon`, `--ext-dif` con `--no-index`) ni
+  con una opción que se trague el flag siguiente (`--line-prefix`, `--src-prefix`,
+  `--dst-prefix`, `--word-diff-regex`); rechaza `--ext*`, `--textc*`,
+  `--ignore-su*`, `--sub*` y todo prefijo de `--output`; con `--bash`, el `git` es
+  el de la máquina.
+- Un `env_passthrough` con cualquier nombre `GIT_*` se rechaza con 2.
+- Un rechazo de `dg_perm_resolve` o de `dg_mcp_resolve` justo después de un grant
+  no deja ningún global del grant, probado en el **mismo** shell: inspeccionar
+  los globals del padre después de correr el resolver en un subshell no prueba
+  nada.
+- `DEEPSEEK_ACCOUNT` definida, aunque esté vacía, rechaza la corrida con 2, nombrando
+  `DELEGATE_ACCOUNT`, antes de leer la key.
+- Una entrada del environ con un nombre que Bash no puede nombrar (`SECRET-TOKEN`,
+  `A.B`) no llega al hijo, y la key sigue sin aparecer en ningún argv.
+- Invocado por nombre, nada del shell que llama corre antes de la limpieza: un
+  `BASH_ENV`, una función exportada `set`, un `SHELLOPTS=xtrace` con un `PS4` que
+  expande la key, y `allexport` (por `SHELLOPTS` o por `bash -a`), cada uno con su
+  sentinela. Los tests de aislamiento ejecutan el script, no `bash bin/delegate`.
+- El `grep` que filtra stderr no lleva el environment del padre ni la key: un
+  `GITHUB_TOKEN` del shell que invoca no aparece en su `/proc/<pid>/environ`.
+- Los stubs viven en un directorio privado (700) por corrida, distinto en cada una y
+  borrado al terminar, también si al CLI le llega un TERM; un symlink o un ejecutable
+  dejados en el viejo directorio compartido no tienen efecto, un padre escribible por
+  el grupo o por todos sin sticky bit (770, 775, 730, 777) se rechaza y uno en 1770,
+  700 o 755 se acepta, y el código de salida del hijo es el de la corrida,
+  también cuando falla el borrado.
+- El hijo no hereda ningún descriptor aparte de 0, 1 y 2: la copia que bash guardaba
+  del pipe de la key (fd 63) le llegaba abierta.
+- TERM, INT y HUP enviadas al proceso de la corrida llegan al hijo como esa misma
+  señal, no todas como TERM.
+- Mientras el hijo vive, ningún proceso de la máquina tiene en su
+  `/proc/<pid>/environ` un `GITHUB_TOKEN` del shell que invoca.
+- Una cuenta cuyo archivo caería sobre `api_key`, `default_account` o un temporal con
+  punto (por ejemplo `key_pattern` `%s` con la cuenta `api_key`) se rechaza con 2, y
+  `list` nunca muestra esos archivos como cuentas.
+- Un `key_dir` en 750, 705, 770, 777 o 755 se rechaza al validar, al leer y en `add`.
+  `add` no escribe a través de un symlink, vivo o colgante, ni sobre un archivo plantado
+  en la ruta después de su chequeo. No deja temporales, tampoco si lo interrumpen TERM
+  o HUP entre el temporal y su borrado; un SIGKILL sí puede dejar uno con nombre de
+  punto en `key_dir`, que es 700. `dg_account_load` rechaza, sin imprimir la key, lo
+  mismo que `validate`, y un FIFO sin bloquearse.
+- Con bwrap usable, dentro del sandbox el hijo no lee un canario en `HOME`, ni el
+  archivo de la key, ni un archivo cualquiera fuera de los montajes; no escribe la
+  config, una ref, un hook ni el `HEAD` del gitdir; sí escribe el worktree y eso llega
+  a la rama; no crea sockets unix; no hereda descriptores aparte de 0, 1 y 2; y una
+  cadena que cambia de sesión en cada fork muere con el sandbox (con su control sin
+  sandbox, donde sobrevive). Tampoco crea un hardlink del gitdir (`EXDEV`), ni usa
+  io_uring, ni recibe como stdout un socket aunque se lo pasen a `delegate`. Un
+  `--sandbox-ro` sobre el HOME (también por symlink), el `key_dir` o la key, o que
+  contenga el directorio de trabajo, y un directorio de trabajo dentro del `key_dir`,
+  salen con 2 antes de leer la key; un `claude` script en el HOME no lo monta. Un
+  `git` plantado en una entrada del `PATH` dentro del worktree no lo corre el runner.
+  `auto` sin bwrap queda en `none`; `bwrap` sin bwrap es
+  `infra_failed` sin lanzar al hijo; un flag de sandbox inválido sale con 2 antes de
+  leer la key.
+- Con sandbox, un check no lee un canario del HOME (ni `~/.ssh`, ni `~/.npmrc`), ni el
+  checkout del usuario, ni el directorio de la corrida, y ve su HOME vacío; escribe el
+  worktree pero no la config del gitdir; no crea sockets unix; corre una herramienta de
+  `~/.nvm/versions`, el `node` real y el python de un venv fuera del worktree (sin ver
+  lo que está al lado del venv); un ejecutable bajo `~/.config` no se monta; un
+  `DELEGATE_CHECK_RO` sobre `~/.ssh`, `~/.config`, el HOME, el state dir o relativo es
+  `infra_failed` sin lanzar al hijo, igual que uno sobre el destino real de un
+  `~/.config` symlink o sobre el `key_dir` de un proveedor; el `npmrc` de nvm y el
+  `pip.conf` de un venv montados se leen vacíos; un `bwrap` en una entrada del `PATH`
+  dentro del worktree no corre; el check no hereda descriptores aparte de 0, 1 y 2 y
+  corre con seccomp; con `off` el check sí lee el canario y `checks_sandbox` es `none`.
+  El seccomp de Python es byte a byte el de Bash.
 
 ## Lo que NO se construye
 
@@ -286,18 +810,6 @@ automática de servidores MCP (el registro es declarativo y lo escribe el dueño
 máquina; nada se agrega solo), fallback o enrutamiento automático entre proveedores (manda código a la jurisdicción o a
 la cuenta equivocada), y enforcement automático a partir de `residency` — eso último es
 teatro de seguridad: la nota se muestra y la elección del proveedor queda explícita.
-
-## Migración
-
-Los scripts que esto reemplaza viven en `~/bin`: `deepseek-agent`, `qwen-agent`,
-`deepseek` y `deepseek-cuenta`. Orden, sin borrar nada hasta el final:
-
-1. `delegate` funcionando en paralelo a los scripts actuales.
-2. Los subagentes `deepseek` y `qwen` de Claude Code apuntan a `delegate`.
-3. `cc-proveedor` sigue leyendo `api_key` sin cambios.
-4. Con todo lo anterior verde, se borran los cuatro scripts.
-
-No hay urgencia: los scripts actuales funcionan.
 
 ## Qué NO delegar
 

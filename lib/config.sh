@@ -61,6 +61,12 @@
 #                      is `api_key.%s`.
 #     default_account  ^[a-z0-9][a-z0-9_-]{0,31}$
 #     timeout          Seconds, integer, 1..86400.
+#     context_tokens   Context window of `model`, integer 1000..10000000, as the
+#                      provider documents it. Exported as
+#                      CLAUDE_CODE_MAX_CONTEXT_TOKENS, only when the run uses
+#                      `model` (not a --model override): a model the harness's
+#                      catalog does not know is otherwise assumed to have 200k
+#                      and auto-compacted there.
 #     caps             Comma-separated subset of: read,edit,bash,mcp,mcp-write
 #                      No duplicates, no empty elements. `read` is implied but
 #                      may be listed. This is the provider's CEILING, enforced in
@@ -199,6 +205,10 @@ _dg_config_validate() {
         return 1
       fi
       ;;
+    context_tokens)
+      [[ "$value" =~ ^[1-9][0-9]{3,7}$ ]] && (( value <= 10000000 )) ||
+        { _dg_config_reason="line $lineno: context_tokens must be a whole number between 1000 and 10000000"; return 1; }
+      ;;
     caps)
       # Comma-separated subset, no duplicates, no empty elements. Elements are
       # matched whole, so `edit` cannot be satisfied by `mcp-write`.
@@ -284,7 +294,7 @@ dg_config_parse() {
     fi
 
     case "$key" in
-      endpoint|auth_env|key_dir|model|small_model|key_pattern|default_account|timeout|caps|residency) ;;
+      endpoint|auth_env|key_dir|model|small_model|key_pattern|default_account|timeout|context_tokens|caps|residency) ;;
       *) _dg_config_err "$provider" "line $lineno: unknown key '$key'"; return 2 ;;
     esac
 

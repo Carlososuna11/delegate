@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # delegate — manda trabajo de código acotado a un modelo más barato.
 #
 # Corre el harness de Claude Code en headless contra el endpoint
@@ -13,21 +13,37 @@
 #   delegate account deepseek list|add|use|rm|default
 #   delegate providers
 #   delegate help
+#
+# The shebang is `/bin/bash -p`, a fixed path and privileged mode, and both
+# matter. Everything below this comment runs AFTER bash has processed its own
+# startup, and three things the caller controls acted there, before any
+# cleanup in this file could: BASH_ENV (a file sourced before line one), an
+# exported function named `set` (imported, then run by the cleanup's own `set`
+# call — twice, verified), and SHELLOPTS (xtrace with a PS4 that printed the
+# parent's ANTHROPIC_API_KEY; allexport, which re-exported the account key
+# through every assignment). Privileged mode skips BASH_ENV and ENV, imports no
+# functions and ignores SHELLOPTS, BASHOPTS, CDPATH and GLOBIGNORE from the
+# environment. `env bash` would let PATH pick the interpreter, and env passes
+# no option portably. Run as `bash bin/delegate`, the shebang is ignored and
+# none of this holds; installed and invoked by name, it does.
+
+# FIRST useful line. Privileged mode already ignored an inherited SHELLOPTS, but
+# `bash -a delegate` or `bash -x delegate` set the same options from the
+# command line: allexport would export `key` through `local +x`, and xtrace
+# would print `key=<the actual key>` to the stderr that `--json 2>&1` collects.
+set +a +x +v
 set -euo pipefail
 
-# FIRST, before anything reads a key. Bash honours an inherited SHELLOPTS, so
-# `env SHELLOPTS=xtrace delegate ...` turns tracing on for this whole script and
-# prints every assignment to stderr — including `key=<the actual key>`, and into
-# the stream that `--json 2>&1` collects. Verified on this machine. BASH_ENV and
-# ENV are the same shape of problem: a file the caller chooses, sourced before
-# the script runs. CDPATH is the third: it makes a later `cd` into a relative
-# directory land somewhere else and print the path, which both misplaces the run
-# and corrupts `--json`.
-set +x +v
+# BASH_ENV and ENV are already harmless here (privileged mode did not read
+# them) and unset so nothing this script runs inherits them. CDPATH makes a
+# later `cd` into a relative directory land somewhere else and print the path,
+# which both misplaces the run and corrupts `--json`. SHELLOPTS is readonly,
+# hence the `|| true`.
 unset -v SHELLOPTS BASH_ENV ENV CDPATH 2>/dev/null || true
 
-# Exported FUNCTIONS, and here rather than next to the environment wipe further
-# down, because this script itself runs grep, ls and git long before it gets
+# Exported FUNCTIONS. Privileged mode already declined to import them; this
+# loop is for a run started as `bash bin/delegate`, where the shebang does not
+# apply. Here rather than next to the environment wipe further down, because this script itself runs grep, ls and git long before it gets
 # there. A function arriving in the environ as `BASH_FUNC_<name>%%` is imported
 # by bash and WINS over the binary of the same name, so a parent with
 # `export -f grep` was already executing its own code inside this script —
@@ -57,7 +73,40 @@ for _dg_fn in $(compgen -e); do
 done
 unset -v _dg_fn
 
-# Resolve the real script location so the `dg` symlink finds lib/ too.
+# PATH without empty or relative entries. Both resolve against whatever the
+# current directory happens to be, and this script cd's into --dir, the tree
+# under review: with `.` in PATH, `command -v claude` came back RELATIVE and the
+# tree chose what ran as claude, as `timeout` and as the stderr filter's
+# `grep`. Verified. Dropped rather than refused: a caller with `.` in PATH is
+# common and harmless everywhere except here. Entries INSIDE --dir are dropped
+# too, in cmd_run, once --dir is known.
+#   dg_clean_path <path> [root] — prints <path> keeping absolute entries only,
+#   and none that resolves to <root> or below it.
+dg_clean_path() {
+  local in="$1" root="${2-}" out='' entry real
+  local -a parts=()
+  IFS=: read -r -a parts <<<"$in"
+  for entry in ${parts[@]+"${parts[@]}"}; do
+    [[ "$entry" == /* ]] || continue
+    if [[ -n "$root" ]]; then
+      real="$(readlink -m -- "$entry")" || continue
+      [[ "$real" == "$root" || "$real" == "$root"/* ]] && continue
+    fi
+    out="${out:+$out:}$entry"
+  done
+  printf '%s\n' "${out:-/usr/bin:/bin}"
+}
+# The caller's PATH is kept aside and NOT used by this script until cmd_run
+# has removed every entry inside --dir. Until then everything this script runs
+# by name resolves against a fixed root-owned PATH: an absolute entry pointing
+# into the tree under review used to supply `dirname` and `readlink` to the
+# lines right below, which ran with the caller's whole environment before any
+# repository-aware filter existed. Verified with a planted `dirname`.
+_DG_CALLER_PATH="$(dg_clean_path "$PATH")"
+PATH=/usr/bin:/bin
+export PATH
+
+# Resolve the real script location so the `dlg` symlink finds lib/ too.
 DG_BIN="${BASH_SOURCE[0]}"
 while [[ -L "$DG_BIN" ]]; do
   DG_LINK="$(readlink "$DG_BIN")"
@@ -94,7 +143,7 @@ ok()   { printf '%s✓%s %s\n' "$GREEN" "$R" "$*" >&2; }
 
 usage() {
   cat >&2 <<EOF
-${B}delegate${R} — manda trabajo de código acotado a un modelo más barato ${D}(alias: dg)${R}
+${B}delegate${R} — manda trabajo de código acotado a un modelo más barato ${D}(alias: dlg)${R}
 
 ${B}USO${R}
   ${CYAN}delegate${R} <proveedor> [opciones] "tarea"      agente con herramientas
@@ -118,6 +167,8 @@ ${B}OPCIONES${R}
   ${CYAN}--model${R} <id>    pisa el modelo del proveedor
   ${CYAN}--timeout${R} <s>   segundos ${D}(default: el del proveedor)${R}
   ${CYAN}--json${R}          salida JSON: resultado, costo, sesión
+  ${CYAN}--sandbox${R} <m>   ${D}bwrap${R}: el hijo corre en bubblewrap ${D}(default: off; lo usa delegate-run)${R}
+  ${CYAN}--sandbox-ro${R} <r> ruta visible en solo lectura dentro del sandbox ${D}(repetible)${R}
 
 ${B}CUENTAS${R}
   delegate account <proveedor> list
@@ -378,6 +429,137 @@ cmd_mcp() {
   (( found )) || { warn "no hay servidores MCP declarados en $dir"; return 1; }
 }
 
+# ─── sandbox (bubblewrap) ────────────────────────────────────────────────────
+#
+# `--sandbox bwrap` runs the child (timeout's command: the harness and
+# everything it spawns) inside bubblewrap. The CLI itself stays OUTSIDE: it
+# reads the key from its 600 file before the sandbox exists, and the key only
+# crosses into it in the child's environment, as it always did. The key_dir,
+# the rest of the user's home, ~/.ssh and every other repository are simply not
+# mounted. See CLAUDE.md, "Sandbox".
+
+# Refusals of the sandbox flags exit 2, like every other refusal that happens
+# before the key is read: a run asked to be confined never runs unconfined.
+dg_reject() { printf '%s✗%s %s\n' "$RED" "$R" "$*" >&2; exit 2; }
+
+# True if two canonical paths are the same or one contains the other.
+dg_sbx_overlaps() { [[ "$1/" == "$2"/* || "$2/" == "$1"/* ]]; }
+
+# One classic-BPF instruction (struct sock_filter, little-endian): code, jt,
+# jf, k. Bash's printf builtin emits the \x00 bytes as they are.
+_dg_bpf_ins() {
+  local c=$1 t=$2 f=$3 k=$4 fmt
+  printf -v fmt '\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x' \
+    $(( c & 255 )) $(( c >> 8 & 255 )) "$t" "$f" \
+    $(( k & 255 )) $(( k >> 8 & 255 )) $(( k >> 16 & 255 )) $(( k >> 24 & 255 ))
+  printf "$fmt"
+}
+
+# The seccomp filter bwrap installs on the sandboxed command, for $1 (x86_64
+# or aarch64). The network namespace is SHARED (the harness needs the
+# provider's API), and the abstract unix-socket namespace belongs to the
+# network namespace: without this, the sandbox reached @/tmp/.X11-unix/X0,
+# and an X server that admits the user by uid (SI:localuser) accepted it —
+# keystrokes into a terminal outside. Verified with xdpyinfo. So:
+#   - socket(AF_UNIX, ...) fails with EAFNOSUPPORT: no unix socket can be
+#     created, so none can connect to an abstract (or any) address;
+#   - socketpair() only for SOCK_STREAM and SOCK_SEQPACKET (libuv's stdio
+#     pipes): a datagram pair can be re-connect()ed to another address;
+#   - io_uring_setup, _enter and _register fail with ENOSYS:
+#     IORING_OP_SOCKET would create a socket without the socket() syscall
+#     that this filter sees, and no ring can be used even if one were
+#     inherited;
+#   - x32 syscall numbers fail with ENOSYS, and any foreign architecture
+#     (int 0x80 on x86_64) kills the process.
+dg_seccomp_bpf() {
+  local arch nr_socket nr_pair nr_uring=425
+  case "$1" in
+    x86_64)  arch=$(( 0xC000003E )); nr_socket=41;  nr_pair=53 ;;
+    aarch64) arch=$(( 0xC00000B7 )); nr_socket=198; nr_pair=199 ;;
+    *) return 1 ;;
+  esac
+  local ld=$(( 0x20 )) jeq=$(( 0x15 )) jge=$(( 0x35 )) and=$(( 0x54 )) ret=$(( 0x06 ))
+  local allow=$(( 0x7fff0000 )) kill=$(( 0x80000000 ))
+  local eafnosupport=$(( 0x00050000 | 97 )) enosys=$(( 0x00050000 | 38 ))
+  _dg_bpf_ins $ld  0 0 4                    #  0 A = arch
+  _dg_bpf_ins $jeq 1 0 $arch                #  1 native? -> 3
+  _dg_bpf_ins $ret 0 0 $kill                #  2
+  _dg_bpf_ins $ld  0 0 0                    #  3 A = nr
+  _dg_bpf_ins $jge 15 0 $(( 0x40000000 ))   #  4 x32 -> 20
+  _dg_bpf_ins $jeq 5 0 $nr_socket           #  5 socket -> 11
+  _dg_bpf_ins $jeq 7 0 $nr_pair             #  6 socketpair -> 14
+  _dg_bpf_ins $jeq 12 0 $nr_uring           #  7 io_uring_setup -> 20
+  _dg_bpf_ins $jeq 11 0 $(( nr_uring + 1 )) #  8 io_uring_enter -> 20
+  _dg_bpf_ins $jeq 10 0 $(( nr_uring + 2 )) #  9 io_uring_register -> 20
+  _dg_bpf_ins $ret 0 0 $allow               # 10
+  _dg_bpf_ins $ld  0 0 16                   # 11 A = low word of args[0] (domain)
+  _dg_bpf_ins $jeq 5 0 1                    # 12 AF_UNIX -> 18
+  _dg_bpf_ins $ret 0 0 $allow               # 13
+  _dg_bpf_ins $ld  0 0 24                   # 14 A = low word of args[1] (type)
+  _dg_bpf_ins $and 0 0 15                   # 15 drop SOCK_CLOEXEC / SOCK_NONBLOCK
+  _dg_bpf_ins $jeq 2 0 1                    # 16 SOCK_STREAM -> 19
+  _dg_bpf_ins $jeq 1 0 5                    # 17 SOCK_SEQPACKET -> 19
+  _dg_bpf_ins $ret 0 0 $eafnosupport        # 18
+  _dg_bpf_ins $ret 0 0 $allow               # 19
+  _dg_bpf_ins $ret 0 0 $enosys              # 20
+}
+
+# Fills _DG_X_SBX with the bwrap prefix for the child. Arguments: bwrap path,
+# the resolved working directory, the stub directory, the resolved claude
+# binary, the seccomp fd, then the read-only paths. The order of the mounts is
+# the policy: system directories read-only, a private tmpfs for /tmp and HOME
+# (so nothing of the real home is there, only what is bound on top of it), the
+# harness binary and the stubs read-only, the working directory read-write,
+# and LAST the read-only paths, so a gitdir inside the tree stays read-only.
+dg_sandbox_argv() {
+  local bwrap="$1" wroot="$2" stubs="$3" claude_real="$4" sfd="$5"; shift 5
+  local d target p
+  _DG_X_SBX=("$bwrap"
+    --unshare-all --share-net --unshare-user --disable-userns
+    --die-with-parent --new-session
+    --ro-bind /usr /usr)
+  for d in /bin /sbin /lib /lib32 /lib64 /libx32; do
+    if [[ -L "$d" ]]; then
+      _DG_X_SBX+=(--symlink "$(readlink -- "$d")" "$d")
+    elif [[ -d "$d" ]]; then
+      _DG_X_SBX+=(--ro-bind "$d" "$d")
+    fi
+  done
+  _DG_X_SBX+=(--ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp)
+  # /etc/resolv.conf is usually a symlink into /run (systemd-resolved): the
+  # one file it names, never its directory (which holds resolved's varlink
+  # socket, unreachable anyway without AF_UNIX).
+  target="$(readlink -f -- /etc/resolv.conf 2>/dev/null)" || target=''
+  if [[ "$target" == /run/* && -f "$target" ]]; then
+    _DG_X_SBX+=(--ro-bind "$target" "$target")
+  fi
+  if [[ "${HOME:-}" == /?* ]]; then
+    _DG_X_SBX+=(--perms 0700 --tmpfs "$HOME")
+  fi
+  # The harness: a native (ELF) binary is mounted alone; a script (an npm
+  # install's cli.js) needs its package directory. Never a directory that is
+  # HOME or holds it: a `claude` sitting in ~/bin or ~ would mount all of it.
+  local magic=''
+  LC_ALL=C read -r -N 4 magic < "$claude_real" 2>/dev/null || true
+  if [[ "$magic" == $'\x7fELF' ]]; then
+    d="$claude_real"
+  else
+    d="$(dirname -- "$claude_real")"
+    if [[ "${HOME:-}" == /?* && "$(readlink -f -- "$HOME" 2>/dev/null || printf '%s' "$HOME")/" == "$d"/* ]] ||
+       [[ "$d" == / ]]; then
+      die "--sandbox bwrap: claude ($claude_real) no es un binario y su directorio contiene tu HOME; no lo monto en el sandbox"
+    fi
+  fi
+  if dg_sbx_overlaps "$d" "$_DG_SBX_KEYDIR"; then
+    die "--sandbox bwrap: montar $d expondría el key_dir ($_DG_SBX_KEYDIR)"
+  fi
+  _DG_X_SBX+=(--ro-bind "$d" "$d" --ro-bind "$stubs" "$stubs" --bind "$wroot" "$wroot")
+  for p in "$@"; do
+    _DG_X_SBX+=(--ro-bind "$p" "$p")
+  done
+  _DG_X_SBX+=(--setenv TMPDIR /tmp --seccomp "$sfd" --chdir "$wroot" --)
+}
+
 # ─── corrida delegada ────────────────────────────────────────────────────────
 
 cmd_run() {
@@ -388,6 +570,8 @@ cmd_run() {
   local format='text' timeout_s='' model=''
   # Repeatable, so they accumulate as comma-separated lists for lib/mcp.sh.
   local mcp_read='' mcp_write=''
+  local sandbox='off'
+  local -a sandbox_ro=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -400,6 +584,8 @@ cmd_run() {
       --dir)         workdir="${2:?--dir necesita una ruta}"; shift 2 ;;
       --model)       model="${2:?--model necesita un id}"; shift 2 ;;
       --timeout)     timeout_s="${2:?--timeout necesita segundos}"; shift 2 ;;
+      --sandbox)     sandbox="${2:?--sandbox necesita bwrap u off}"; shift 2 ;;
+      --sandbox-ro)  sandbox_ro+=("${2:?--sandbox-ro necesita una ruta}"); shift 2 ;;
       --)            shift; break ;;
       -*)            die "opción desconocida: $1" ;;
       *)             break ;;
@@ -407,9 +593,25 @@ cmd_run() {
   done
 
   [[ $# -gt 0 ]] || die "falta la tarea. Uso: delegate $PROVIDER [opciones] \"tarea\""
+
+  # DEEPSEEK_ACCOUNT was documented as choosing the account and was ignored, so
+  # a caller following the docs was billed to the default or the active one
+  # without a word. Refused, not honoured as an alias: silently changing which
+  # key pays is worse than failing, and one name is easier to keep honest.
+  # `+x`: defined counts, even empty; a stale `export DEEPSEEK_ACCOUNT=` passed.
+  if [[ -n "${DEEPSEEK_ACCOUNT+x}" ]]; then
+    printf '%s✗%s %s\n' "$RED" "$R" \
+      "DEEPSEEK_ACCOUNT ya no elige la cuenta: usa ${B}DELEGATE_ACCOUNT${R} o ${B}--account${R}, y quita DEEPSEEK_ACCOUNT del entorno" >&2
+    exit 2
+  fi
   local prompt="$*"
 
   [[ -d "$workdir" ]] || die "no existe el directorio: $workdir"
+  # No PATH entry inside the tree under review, for this script and for the
+  # child: an absolute entry pointing into --dir is `.` spelled differently.
+  local wroot
+  wroot="$(readlink -f -- "$workdir")" || die "no puedo resolver el directorio de trabajo $workdir"
+  PATH="$(dg_clean_path "$_DG_CALLER_PATH" "$wroot")"
 
   if [[ "$mode" == 'chat' ]]; then
     # chat is a mode, not a lesser agent: no tools at all, so a permission flag
@@ -422,6 +624,51 @@ cmd_run() {
   [[ -n "$timeout_s" ]] || timeout_s="${CFG[timeout]}"
   [[ "$timeout_s" =~ ^[0-9]+$ && "$timeout_s" -ge 1 ]] || die "--timeout debe ser un entero de segundos"
   [[ -n "$model" ]] || model="${CFG[model]}"
+
+  # ── sandbox: validated here, before the key is read ──
+  local bwrap_bin='' sbx_ro_real=() sp rp
+  case "$sandbox" in
+    off)
+      (( ${#sandbox_ro[@]} )) && dg_reject "--sandbox-ro solo vale con --sandbox bwrap"
+      ;;
+    bwrap)
+      bwrap_bin="$(type -P bwrap)" ||
+        dg_reject "--sandbox bwrap: no encuentro bwrap en el PATH (instálalo con 'sudo apt install bubblewrap')"
+      [[ "$bwrap_bin" == /* ]] || dg_reject "--sandbox bwrap: bwrap tiene que resolverse a una ruta absoluta"
+      case "$HOSTTYPE" in
+        x86_64|aarch64) ;;
+        *) dg_reject "--sandbox bwrap: no hay filtro seccomp para la arquitectura $HOSTTYPE" ;;
+      esac
+      # A working directory that is / or contains HOME would bind the whole
+      # home back in, read-write, over the private tmpfs.
+      if [[ "$wroot" == / ]] ||
+         { [[ "${HOME:-}" == /?* ]] && [[ "$(readlink -f -- "$HOME" 2>/dev/null || printf '%s' "$HOME")/" == "$wroot"/* ]]; }; then
+        dg_reject "--sandbox bwrap: el directorio de trabajo no puede ser / ni contener tu HOME ($wroot)"
+      fi
+      # Every mount that goes on top of the private HOME is checked, canonical,
+      # against what must stay out: the key_dir (all accounts, not just this
+      # run's) overlapping in either direction, and HOME itself or an ancestor.
+      # A read-only path that contains the working directory would also hide
+      # its read-write mount.
+      _DG_SBX_HOME="$(readlink -f -- "${HOME:-/nonexistent}" 2>/dev/null || printf '%s' "${HOME:-}")"
+      _DG_SBX_KEYDIR="$(_dg_account_dir "${CFG[key_dir]}")" || dg_reject "no puedo resolver el key_dir"
+      _DG_SBX_KEYDIR="$(readlink -f -- "$_DG_SBX_KEYDIR" 2>/dev/null || printf '%s' "$_DG_SBX_KEYDIR")"
+      dg_sbx_overlaps "$wroot" "$_DG_SBX_KEYDIR" &&
+        dg_reject "--sandbox bwrap: el directorio de trabajo se cruza con el key_dir ($_DG_SBX_KEYDIR)"
+      for sp in ${sandbox_ro[@]+"${sandbox_ro[@]}"}; do
+        [[ "$sp" == /* && -e "$sp" ]] || dg_reject "--sandbox-ro necesita una ruta absoluta que exista: $sp"
+        rp="$(readlink -f -- "$sp")" || dg_reject "no puedo resolver $sp"
+        dg_sbx_overlaps "$rp" "$_DG_SBX_KEYDIR" &&
+          dg_reject "--sandbox-ro $sp se cruza con el key_dir ($_DG_SBX_KEYDIR)"
+        [[ "$rp" == / || "$_DG_SBX_HOME/" == "$rp"/* ]] &&
+          dg_reject "--sandbox-ro $sp es tu HOME o lo contiene"
+        [[ "$wroot/" == "$rp"/* ]] &&
+          dg_reject "--sandbox-ro $sp contiene el directorio de trabajo, que quedaría en solo lectura"
+        sbx_ro_real+=("$rp")
+      done
+      ;;
+    *) dg_reject "--sandbox acepta bwrap u off, no '$sandbox'" ;;
+  esac
 
   # Permissions before the key: a run that is going to be refused must be
   # refused before anything reads a secret from disk.
@@ -468,7 +715,20 @@ cmd_run() {
             printf '%s✗%s %s\n' "$RED" "$R" \
               "un servidor MCP pidió reenviar ${B}${rn}${R}, que esta corrida define; quita ese nombre de env_passthrough" >&2
             exit 2 ;;
-          LD_*|NODE_OPTIONS|NODE_REPL_EXTERNAL_MODULE|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|IFS|PATH|HOME|PYTHONPATH|PYTHONSTARTUP|PERL5LIB|PERL5OPT|RUBYOPT|GIT_SSH_COMMAND|GIT_EXTERNAL_DIFF|GIT_PAGER|GIT_EDITOR|PAGER|EDITOR|VISUAL)
+          # GIT_* whole, not one name at a time. GIT_CONFIG_COUNT with
+          # GIT_CONFIG_KEY_0/GIT_CONFIG_VALUE_0 passed when only GIT_SSH_COMMAND
+          # and friends were listed, and forwarded `diff.external=<program>`
+          # into the child, where the floor's `git diff` ran it. Git reads
+          # dozens of these names, several as config or as commands; a list
+          # would have to keep up with git. The allowlist of safe GIT_* names
+          # is empty until one is actually needed.
+          #
+          # The proxy and TLS names are here for the same reason with a different
+          # payload: the child's HTTPS traffic carries the provider key, and a
+          # forwarded proxy (with an extra CA, or verification off) is a
+          # man-in-the-middle on it. GCONV_PATH makes glibc's iconv load a
+          # shared object from a directory of the value's choosing.
+          LD_*|GIT_*|NODE_OPTIONS|NODE_REPL_EXTERNAL_MODULE|NODE_TLS_REJECT_UNAUTHORIZED|NODE_EXTRA_CA_CERTS|HTTPS_PROXY|HTTP_PROXY|ALL_PROXY|https_proxy|http_proxy|all_proxy|GCONV_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|IFS|PATH|HOME|PYTHONPATH|PYTHONSTARTUP|PERL5LIB|PERL5OPT|RUBYOPT|PAGER|EDITOR|VISUAL)
             printf '%s✗%s %s\n' "$RED" "$R" \
               "un servidor MCP pidió reenviar ${B}${rn}${R}: su valor se interpreta como código dentro de la corrida delegada, así que no se reenvía nunca" >&2
             exit 2 ;;
@@ -535,34 +795,170 @@ cmd_run() {
   # substitution, which is not the child. Verified on Bash 5.2.
   local +x key_path key
   key_path="$(resolve_account_path "$account")"
-  # The path validate PRINTS, not the one it was given: the mode, owner, type
-  # and size checks were all made against the resolved file, and reopening the
-  # argument would follow the symlink a second time.
-  key_path="$(dg_account_validate "${CFG[key_dir]}" "$key_path")" || exit 1
-  key="$(dg_account_read "$key_path")"
+  # One descriptor for the checks and the read: validating a name and then
+  # reading it again let the file be swapped in between.
+  key="$(dg_account_load "${CFG[key_dir]}" "$key_path")" || exit 1
   [[ -n "$key" ]] || die "la key en $key_path está vacía"
 
   # Other AI CLIs are unreachable from a delegated run. Invoking codex or claude
   # from here spent the scarcest quota on reviews nobody asked for, and a rule in
   # the prompt did not stop it. Stubs first in PATH make those calls fail; claude
   # itself is resolved to an absolute path before PATH changes.
-  local claude_bin stub_dir tool
-  claude_bin="$(command -v claude)" || die "no encuentro el binario de claude en el PATH"
-  stub_dir="${XDG_CACHE_HOME:-$HOME/.cache}/delegate/stubs"
-  # 700 and owner-checked. This directory goes FIRST in the child's PATH, and
-  # its location comes from XDG_CACHE_HOME, an inherited variable. Pointed at a
-  # shared writable directory, anything a third party precreated there as
-  # `git`, `grep` or `node` would run ahead of the real binary inside the
-  # delegated process. Refused rather than repaired: silently relocating the
-  # stubs would hide the fact that the cache path is not the caller's.
-  mkdir -p -m 700 "$stub_dir"
-  [[ -O "$stub_dir" ]] || die "el directorio de stubs $stub_dir no es tuyo; revisa XDG_CACHE_HOME"
-  chmod 700 "$stub_dir"
-  for tool in codex claude delegate dg; do
+  #
+  # claude, timeout and the stderr filter's grep are resolved to absolute paths
+  # HERE, before the cd into --dir and before PATH gains the stubs: resolved
+  # later, a relative or tree-controlled PATH entry chose them.
+  local claude_bin timeout_bin grep_bin env_bin stub_dir tool
+  claude_bin="$(type -P claude)" || die "no encuentro el binario de claude en el PATH"
+  timeout_bin="$(type -P timeout)" || die "no encuentro timeout en el PATH"
+  grep_bin="$(type -P grep)" || die "no encuentro grep en el PATH"
+  env_bin="$(type -P env)" || die "no encuentro env en el PATH"
+  [[ "$claude_bin" == /* && "$timeout_bin" == /* && "$grep_bin" == /* && "$env_bin" == /* ]] ||
+    die "claude, timeout, grep y env tienen que resolverse a rutas absolutas"
+  # A private directory per run, created by mktemp (exclusive, mode 700) and
+  # removed when the run ends (not on a SIGKILL of the run's process, which
+  # nothing can trap; see CLAUDE.md). It used to be one shared directory under
+  # XDG_CACHE_HOME, rewritten by every run with `>`: a symlink precreated there
+  # was followed and its target overwritten, an extra executable left there
+  # (`node`, `git`) ran ahead of the real one in every later run, and two
+  # concurrent runs rewrote each other's `git`. Verified. XDG_RUNTIME_DIR first
+  # because it is the user's own 700 directory.
+  #
+  # Mode 700 protects what is INSIDE the directory, not its entry in the parent:
+  # whoever can write the parent can rename ours away and put their own, with a
+  # `grep` that then runs holding the delegated environment and its key. So the
+  # parent must be owned by this user or by root, and either writable by its
+  # owner alone or sticky (as /tmp is, where nobody renames another's entry).
+  # Group-writable used to be accepted, and a shared group is enough for that.
+  local stub_parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" pmode powner
+  [[ "$stub_parent" == /* && -d "$stub_parent" ]] || stub_parent=/tmp
+  read -r pmode powner < <(stat -L -c '%a %u' -- "$stub_parent") ||
+    die "no puedo leer los permisos de $stub_parent"
+  if [[ "$powner" != "$EUID" && "$powner" != 0 ]] ||
+     (( (8#$pmode & 8#0022) && !(8#$pmode & 8#1000) )); then
+    die "el directorio temporal $stub_parent no es tuyo o lo pueden escribir otros (grupo o todos) sin sticky bit; revisa XDG_RUNTIME_DIR y TMPDIR"
+  fi
+  stub_dir="$(mktemp -d -p "$stub_parent" delegate-stubs.XXXXXXXX)" ||
+    die "no pude crear el directorio de stubs en $stub_parent"
+  _DG_X_STUBS="$stub_dir"
+  # Absolute: the cleanup runs after the environment wipe, when PATH is gone.
+  _DG_X_RM="$(type -P rm)" || die "no encuentro rm en el PATH"
+  trap 'dg_cleanup_stubs' EXIT
+  # Name interception, not a sandbox: a run with --bash can still call a binary
+  # by its absolute path or rewrite PATH. Invariant 5 says exactly that.
+  for tool in codex claude delegate dlg dg deepseek-agent qwen-agent opencode gemini; do
     printf '#!/bin/sh\necho "delegate: %s está bloqueado en tareas delegadas" >&2\nexit 126\n' \
       "$tool" > "$stub_dir/$tool"
     chmod +x "$stub_dir/$tool"
   done
+
+  # git on the read-only floor. `git diff`, `log`, `show`, `status` and `blame`
+  # are allowed there, and every one of them runs programs that configuration
+  # names: diff.external and a diff driver's command, a textconv driver,
+  # core.fsmonitor, core.pager, a clean filter. Anyone who can write the
+  # repository's .git/config — a hostile tree, or this very run with --edit —
+  # turned "read-only" into code execution. Verified: each helper ran from a
+  # plain `git diff`/`status`/`blame` before this.
+  #
+  # The allowlist only lets `git <subcommand>` through by name, so a `git`
+  # first in PATH is what the model's command reaches. It ignores system and
+  # global config, overrides the executable keys of the repository's (filters,
+  # diff drivers and signature programs included), puts --no-ext-diff,
+  # --no-textconv and --ignore-submodules=all right after the subcommand, and
+  # refuses every abbreviation of the options that undo them and every prefix
+  # of --output. Defence in depth, not a boundary: it lists the helpers git
+  # 2.43 is known to run, a newer git may add one, and the real limit stays
+  # "never delegate over a hostile tree" (CLAUDE.md). Floor only: --bash is
+  # unrestricted shell, and constraining git there would be a narrower grant
+  # than the one asked for.
+  local real_git=''
+  real_git="$(type -P git 2>/dev/null)" || true
+  if [[ "$mode" == 'agent' ]] && (( ! want_bash )) && [[ "$real_git" == /* ]]; then
+    # Quoted heredoc: nothing in it is expanded here. Only the path of the real
+    # git is substituted, single-quoted for sh.
+    local wrapper
+    wrapper="$(cat <<'WRAP'
+#!/bin/sh
+# Written by delegate for the read-only floor. See bin/delegate.
+#
+# The hardening options go RIGHT AFTER the subcommand, before anything the
+# caller wrote. Appended at the end they were swallowed as the value of an
+# option that takes one: `git diff --line-prefix` (or --src-prefix,
+# --dst-prefix, --word-diff-regex...) consumed `--no-ext-diff`, and the
+# repository's diff driver ran. First, they are only defeated by a later
+# option that turns them back on, so every spelling and every abbreviation of
+# those is refused: --ext*, --textc*, --ignore-su*, --sub* (`git diff
+# --no-index` takes any unique prefix of a long option). --output is refused
+# in every prefix (it would write a file).
+for a in "$@"; do
+  case "$a" in
+    --ext*|--textc*|--ignore-su*|--sub*|--o|--o=*|--ou|--ou=*|--out|--out=*|--outp|--outp=*|--outpu|--outpu=*|--output|--output=*)
+      echo "delegate: git $a está denegado en el piso de solo lectura" >&2; exit 126 ;;
+  esac
+done
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_EXTERNAL_DIFF GIT_PAGER PAGER GIT_ATTR_SOURCE
+# Submodules: their content is read by a git running with the SUBMODULE's
+# config, whose filters and drivers nothing here overrides; it is ignored.
+case "${1-}" in
+  diff|log|show) harden='--no-ext-diff --no-textconv --ignore-submodules=all' ;;
+  status) harden='--ignore-submodules=all' ;;
+  blame) harden='--no-textconv' ;;
+  *) harden='' ;;
+esac
+if [ -n "$harden" ]; then
+  sub=$1; shift
+  # shellcheck disable=SC2086
+  set -- "$sub" $harden "$@"
+fi
+# Filters named by the repository's own config (`clean`, `smudge`, `process`)
+# run from `git diff` and `git status` through .gitattributes, and so do its
+# diff drivers (`command`, `textconv`); the global and system config being
+# ignored does nothing against them. Each one the config names is overridden
+# with an empty value, which disables it (and a `required` filter then fails
+# instead of running). A name git cannot take back through `-c` (one with
+# `=`) is refused rather than left active.
+set -f
+keys=$(@REAL_GIT@ config --name-only --get-regexp '^(filter\..*\.(clean|smudge|process)|diff\..*\.(command|textconv))$' 2>/dev/null) || keys=
+old_ifs=$IFS; IFS='
+'
+for k in $keys; do
+  case "$k" in
+    *=*) echo "delegate: la clave $k no se puede anular; git está denegado en este repo" >&2; exit 126 ;;
+  esac
+  set -- -c "$k=" "$@"
+done
+IFS=$old_ifs
+set +f
+# Signature verification runs gpg.program (or its ssh and x509 variants) from
+# `git log` and `git show` on any signed commit, with log.showSignature in the
+# repository's config or --show-signature on the command line. Verified with a
+# crafted signed commit. All three point at /bin/false.
+exec @REAL_GIT@ -c core.fsmonitor=false -c core.pager=cat -c core.hooksPath=/dev/null -c diff.external= \
+  -c log.showSignature=false -c gpg.program=/bin/false -c gpg.ssh.program=/bin/false \
+  -c gpg.x509.program=/bin/false --no-pager "$@"
+WRAP
+)"
+    printf '%s\n' "${wrapper//@REAL_GIT@/\'${real_git//\'/\'\\\'\'}\'}" > "$stub_dir/git"
+    chmod +x "$stub_dir/git"
+  fi
+  # The sandbox prefix, now that the stub directory exists. The seccomp
+  # program lives in it (private, 700) and reaches bwrap as fd 9, which the
+  # supervisor opens for the child alone; inside, the harness is started by
+  # its resolved path, since the symlink that PATH found may live in the home
+  # that the sandbox hides.
+  _DG_X_SBX=()
+  _DG_X_BPF=''
+  if [[ "$sandbox" == 'bwrap' ]]; then
+    local claude_real
+    claude_real="$(readlink -f -- "$claude_bin")" || die "no puedo resolver $claude_bin"
+    dg_seccomp_bpf "$HOSTTYPE" > "$stub_dir/.seccomp.bpf" || die "no pude escribir el filtro seccomp"
+    _DG_X_BPF="$stub_dir/.seccomp.bpf"
+    _DG_SBX_CAT="$(type -P cat)" || die "no encuentro cat en el PATH"
+    dg_sandbox_argv "$bwrap_bin" "$wroot" "$stub_dir" "$claude_real" 9 \
+      ${sbx_ro_real[@]+"${sbx_ro_real[@]}"}
+    claude_bin="$claude_real"
+  fi
   export PATH="$stub_dir:$PATH"
 
   local claude_args=(
@@ -614,7 +1010,13 @@ cmd_run() {
   # prompt argument". Ending on an option that takes exactly one value is what
   # makes the positional prompt reach the child. Anything appended after this
   # has to take exactly one value too.
-  claude_args+=(--append-system-prompt "$DG_RULES")
+  #
+  # And then `--`, so the task can never be read as an option. Without it,
+  # `delegate deepseek -- --help` handed `--help` to the harness, which printed
+  # its usage and exited 0: a run that reported success without doing the task.
+  # Verified against the installed harness that `-- --help` is taken as the
+  # prompt. The prompt itself is appended at exec time, right after this.
+  claude_args+=(--append-system-prompt "$DG_RULES" --)
 
   # Names the entries asked to forward. Values are never in the config: the
   # child inherits whatever this shell has under that name, and a name that is
@@ -641,7 +1043,21 @@ cmd_run() {
   cd "$workdir"
   # Harmless notice from Claude Code when it titles a session with a model it
   # does not know. It goes to stderr, but it dirties any `2>&1` over --json.
-  exec 2> >(grep --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
+  #
+  # Under `env -i`: this filter lives as long as the run and starts before the
+  # environment wipe, so it used to hold the parent's whole environment —
+  # GITHUB_TOKEN, AWS_* — readable in its /proc/<pid>/environ for the entire
+  # run. Verified with a sentinel. grep needs nothing from the environment, and
+  # `exec` leaves no forked copy of this shell behind it.
+  exec 2> >(exec "$env_bin" -i "$grep_bin" --line-buffered -v '\[claude-code:unrecognized_model\]' >&2)
+  # In the sandbox, stdout must not be a unix socket: the seccomp filter stops
+  # the child from CREATING one, not from using one it inherits (connect() on
+  # an unconnected socket, sendto() on a datagram one, a listener's accept()).
+  # Under delegate-run stdout is a file; a caller that hands a socket gets a
+  # pipe relayed by cat outside the sandbox.
+  if [[ "$sandbox" == 'bwrap' && -S /dev/stdout ]]; then
+    exec 1> >(exec "$env_bin" -i "$_DG_SBX_CAT")
+  fi
 
   # The environment is BUILT, not inherited. `env -u A -u B VAR=x cmd` keeps
   # everything else the parent had, so GITHUB_TOKEN, AWS_*, NODE_OPTIONS and
@@ -668,9 +1084,17 @@ cmd_run() {
   _DG_X_BIN="$claude_bin"
   _DG_X_PROMPT="$prompt"
   _DG_X_TIMEOUT="$timeout_s"
+  _DG_X_TIMEOUT_BIN="$timeout_bin"
+  _DG_X_ENV_BIN="$env_bin"
   _DG_X_ENDPOINT="${CFG[endpoint]}"
   _DG_X_MODEL="$model"
   _DG_X_SMALL="${CFG[small_model]}"
+  # The model's real context window, from the provider file, only for the
+  # model it describes: a --model override may be a different window.
+  _DG_X_CTX=()
+  if [[ -n "${CFG[context_tokens]:-}" && "$model" == "${CFG[model]}" ]]; then
+    _DG_X_CTX=("CLAUDE_CODE_MAX_CONTEXT_TOKENS=${CFG[context_tokens]}")
+  fi
   _DG_X_AUTHENV="${CFG[auth_env]}"
   _DG_X_KEY="$key"
   _DG_X_ARGS=("${claude_args[@]}")
@@ -707,29 +1131,107 @@ dg_exec_child() {
 
   # Exported functions were already dropped at the top of the script, before
   # anything ran a single external command; see the note there.
+  #
+  # The wipe above clears what bash can NAME. It cannot clear an environ entry
+  # whose name is not a valid identifier — `SECRET-TOKEN=...`, `A.B=...`, or a
+  # `BASH_FUNC_x%%` that bash declined to import — because bash never made a
+  # variable out of it, and it hands every such entry to each child untouched.
+  # Verified: `SECRET-TOKEN` crossed the wipe and reached the delegated run.
+  # So the child is started under `env -i`, and only what is named here exists
+  # on the other side.
+  #
+  # The values do NOT travel in env's argv. `env -i ANTHROPIC_API_KEY=<key> ...`
+  # puts the key in /proc/<pid>/cmdline, world-readable on Linux, for as long
+  # as env runs; the same goes for a forwarded token. They travel NUL-separated
+  # through fd 3, a pipe from a builtin `printf`, into a trampoline: a
+  # `/bin/bash -p` that started from an empty environment, exports each pair,
+  # closes the pipe and execs timeout. Its argv holds the trampoline text, the
+  # harness arguments and the prompt, which were already arguments before.
+  local -a _dg_pairs=(
+    ${_DG_X_KEEP[@]+"${_DG_X_KEEP[@]}"}
+    ${_DG_X_PASS[@]+"${_DG_X_PASS[@]}"}
+    "ANTHROPIC_BASE_URL=$_DG_X_ENDPOINT"
+    "ANTHROPIC_MODEL=$_DG_X_MODEL"
+    "ANTHROPIC_DEFAULT_OPUS_MODEL=$_DG_X_MODEL"
+    "ANTHROPIC_DEFAULT_SONNET_MODEL=$_DG_X_MODEL"
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL=$_DG_X_SMALL"
+    "CLAUDE_CODE_SUBAGENT_MODEL=$_DG_X_SMALL"
+    ${_DG_X_CTX[@]+"${_DG_X_CTX[@]}"}
+    # Last, so nothing above can shadow it.
+    "${_DG_X_AUTHENV}=$_DG_X_KEY"
+  )
+  # The supervisor, a single-quoted constant: nothing in it is expanded here.
+  #
+  # This shell does NOT stay alive to wait for the child. Unsetting variables
+  # never touches /proc/<pid>/environ, which keeps the environment a process
+  # was STARTED with, so a CLI waiting for the child held the parent's
+  # credentials there — readable by any same-user process, and by an allowed
+  # `grep` on the read-only floor — for the whole run. Verified with a
+  # sentinel. It execs instead into `env -i /bin/bash -p`, which starts from an
+  # empty environment: same pid, nothing in its environ. That bash exports the
+  # pairs for its child only, launches the child in the background, waits for
+  # it, removes the stub directory and exits with the child's code.
+  #
+  # Each signal is forwarded as itself: INT and HUP used to arrive as TERM, so a
+  # harness with its own handling for an interrupt or a hangup never saw one.
+  #
+  # The cleanup cannot change that code: this bash runs without errexit, and
+  # the status is kept in `r` and passed to `exit` explicitly. Under the CLI's
+  # `set -e`, a failing `rm` in the old EXIT trap turned a child's 7 into 1.
+  local _dg_super='
+    while IFS= read -r -d "" kv <&3; do export "$kv" || exit 125; done
+    exec 3<&-
+    # Every descriptor but 0, 1 and 2 closed before the child is launched: the
+    # process substitutions (the pairs on fd 3 and the stderr filter) left the
+    # shell holding its own copies, and the harness inherited them as fd 3 and 63.
+    for f in /proc/$BASHPID/fd/*; do
+      n=${f##*/}
+      if (( n > 2 )); then { exec {n}<&-; } 2>/dev/null; fi
+    done
+    s=$1 rm=$2 bpf=$3; shift 3
+    cleanup() { if [[ -n $s && -d $s ]]; then "$rm" -rf -- "$s" 2>/dev/null; fi; return 0; }
+    trap cleanup EXIT
+    # The traps go in BEFORE the launch. Installed after it, a signal arriving
+    # in between killed this shell untrapped: the EXIT trap removed the stubs
+    # and the child ran on without them. One that lands before `c` is known is
+    # kept in `p` and delivered right after the launch.
+    c= p=
+    for g in TERM INT HUP; do
+      trap "if [ -n \"\$c\" ]; then kill -s $g \$c 2>/dev/null; else p=$g; fi" "$g"
+    done
+    # With the sandbox, its seccomp program goes to bwrap as fd 9, opened here
+    # for the child alone, after every inherited descriptor was closed.
+    if [[ -n $bpf ]]; then "$@" 9<"$bpf" & else "$@" & fi
+    c=$!
+    if [ -n "$p" ]; then kill -s "$p" "$c" 2>/dev/null; fi
+    while :; do
+      r=0; wait "$c" || r=$?
+      kill -0 "$c" 2>/dev/null || break
+    done
+    cleanup
+    trap - EXIT
+    exit "$r"
+  '
 
-  for _dg_pair in ${_DG_X_KEEP[@]+"${_DG_X_KEEP[@]}"} ${_DG_X_PASS[@]+"${_DG_X_PASS[@]}"}; do
-    export "${_dg_pair?}"
-  done
-
-  export ANTHROPIC_BASE_URL="$_DG_X_ENDPOINT"
-  export ANTHROPIC_MODEL="$_DG_X_MODEL"
-  export ANTHROPIC_DEFAULT_OPUS_MODEL="$_DG_X_MODEL"
-  export ANTHROPIC_DEFAULT_SONNET_MODEL="$_DG_X_MODEL"
-  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$_DG_X_SMALL"
-  export CLAUDE_CODE_SUBAGENT_MODEL="$_DG_X_SMALL"
-
-  # The key enters THIS shell's environment and the exec inherits it. It is
-  # never an argument, not even to `env`: `env ANTHROPIC_API_KEY=<key> ...` puts
-  # the key in env's own argv, and /proc/<pid>/cmdline is world-readable on
-  # Linux, so until env replaced itself any user on the machine could read it.
-  # `export` with a computed name has no such window, and dropping `env`
-  # altogether means one less process that ever saw it.
-  export "${_DG_X_AUTHENV}=$_DG_X_KEY"
-
-  exec timeout "$_DG_X_TIMEOUT" \
+  # The stub directory now belongs to the supervisor: the EXIT trap of this
+  # shell goes away with the exec.
+  trap - EXIT
+  exec "$_DG_X_ENV_BIN" -i /bin/bash -p -c "$_dg_super" delegate-run \
+    "$_DG_X_STUBS" "$_DG_X_RM" "$_DG_X_BPF" \
+    "$_DG_X_TIMEOUT_BIN" "$_DG_X_TIMEOUT" \
+    ${_DG_X_SBX[@]+"${_DG_X_SBX[@]}"} \
     "$_DG_X_BIN" "${_DG_X_ARGS[@]}" "$_DG_X_PROMPT" \
+    3< <(printf '%s\0' "${_dg_pairs[@]}") \
     < /dev/null  # sin terminal, `claude -p` espera 3 s por stdin antes de arrancar
+}
+
+# Removes the run's private stub directory. Only ever a directory this run
+# created with mktemp, whose path is in _DG_X_STUBS.
+dg_cleanup_stubs() {
+  if [[ -n "${_DG_X_STUBS:-}" && -d "$_DG_X_STUBS" ]]; then
+    "${_DG_X_RM:-rm}" -rf -- "$_DG_X_STUBS"
+  fi
+  return 0
 }
 
 # ─── despacho ────────────────────────────────────────────────────────────────

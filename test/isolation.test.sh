@@ -6,7 +6,7 @@
 # command line of its parent, then exits 0 without calling a model.
 #
 # Nothing here writes outside $TMP: PATH, the providers dir, the key dir, the MCP
-# entry dir and XDG_CACHE_HOME (where the blocked-CLI stubs land) all point into
+# entry dir and XDG_CACHE_HOME (where the stubs used to land) all point into
 # the scratch directory, and the only key in the whole suite is the sentinel
 # below, written by the fixture.
 #
@@ -16,7 +16,8 @@
 #                asked for by name; of a server asked for, only the tools its
 #                entry lists; and none of the variables the run itself defines
 #   invariant 4  permissions only widen, and they reach the child
-#   invariant 5  codex, claude, delegate and dg are unreachable from the child
+#   invariant 5  codex, claude, delegate, dlg and the other AI CLIs are blocked
+#                by name in the child
 #   invariant 6  a provider file, and an MCP entry, are parsed, never sourced
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
@@ -42,6 +43,10 @@ write_fake_claude() {
 #!/usr/bin/env bash
 set -u
 dump='$TMP/dump'
+# Descriptors this process inherited beyond 0, 1 and 2, listed before this
+# script opens any of its own (a command substitution leaves bash holding a
+# pipe for a while). 255 is bash's handle on this script.
+ls -l /proc/\$\$/fd 2>/dev/null | awk '\$9 > 2 && \$9 != 255 { print \$9, \$11 }' >'$TMP/inherited_fds'
 mode="\$(cat '$TMP/fake_mode' 2>/dev/null || echo record)"
 sleep_for="\$(cat '$TMP/fake_sleep' 2>/dev/null || echo 0)"
 FAKE
@@ -52,6 +57,12 @@ if [[ -n "$dump" ]]; then
   # The child is alive from here on. The account-swap test waits for this marker
   # instead of guessing how long the CLI takes to start.
   : >"$dump/started"
+  # The process that supervises the run, the parent of our parent `timeout`:
+  # a signal test sends to it.
+  gst="$(cat "/proc/$PPID/stat" 2>/dev/null)"
+  gst="${gst##*) }"
+  read -r _ gpid _ <<<"$gst"
+  printf '%s\n' "$gpid" >"$dump/.supervisor_pid" && mv -f "$dump/.supervisor_pid" "$dump/supervisor_pid"
 fi
 
 sleep "$sleep_for"
@@ -71,15 +82,109 @@ if [[ -n "$dump" ]]; then
   # level up would still be visible in `ps`.
   cat "/proc/$PPID/comm" >"$dump/parent_comm" 2>/dev/null || true
   tr '\0' '\n' <"/proc/$PPID/cmdline" >"$dump/parent_cmdline" 2>/dev/null || true
+  # The CLI's stderr filter (a `grep` on Claude Code's unrecognized_model
+  # notice) runs alongside this process for the whole run. Its environment is
+  # readable by the same user, so whatever it inherited is exposed as long as
+  # the run lasts. Matched in bash, not with grep, so the probe never finds
+  # itself. Only a sibling of our parent `timeout`: the CLI's process starts
+  # both the filter and the child, so they share a parent — and a filter from
+  # another delegate run on this machine is not this run's.
+  gst="$(cat "/proc/$PPID/stat" 2>/dev/null)"
+  gst="${gst##*) }"
+  read -r _ gpid _ <<<"$gst"
+  for p in /proc/[0-9]*; do
+    st="$(cat "$p/stat" 2>/dev/null)" || continue
+    st="${st##*) }"
+    read -r _ ppid _ <<<"$st"
+    [[ "$ppid" == "$gpid" ]] || continue
+    c="$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)" || continue
+    if [[ "$c" == *--line-buffered*unrecognized_model* ]]; then
+      : >"$dump/filter_found"
+      tr '\0' '\n' <"$p/environ" >"$dump/filter_env" 2>/dev/null || true
+      break
+    fi
+  done
 fi
 
 if [[ "$mode" == probe-tools ]]; then
   # The child tries to reach another AI CLI by PATH; all four must be blocked.
   : >"$dump/blocked"
-  for tool in codex claude delegate dg; do
+  for tool in codex claude delegate dlg dg deepseek-agent qwen-agent opencode gemini; do
     rc=0
     "$tool" >/dev/null 2>&1 || rc=$?
     printf '%s %s\n' "$tool" "$rc" >>"$dump/blocked"
+  done
+fi
+
+if [[ "$mode" == probe-stubs ]]; then
+  # Where the stubs live for THIS run, and what a name that is not a stub
+  # resolves to: a directory shared between runs could hold anything.
+  stubs="$(dirname "$(command -v codex)")"
+  printf '%s\n' "$stubs" >"$dump/stub_dir"
+  stat -c %a "$stubs" >"$dump/stub_mode"
+  command -v node >"$dump/node_path" 2>/dev/null || :
+fi
+
+if [[ "$mode" == probe-environ ]]; then
+  # Every process of this machine whose initial environment (what any process
+  # of the same user reads in /proc/<pid>/environ) holds one of the needles.
+  # The needles come from a file, so this process and its helpers never carry
+  # them in their own environment.
+  : >"$dump/environ_hits"
+  while IFS= read -r needle; do
+    [[ -n "$needle" ]] || continue
+    for p in /proc/[0-9]*; do
+      e="$(tr '\0' '\n' <"$p/environ" 2>/dev/null)" || continue
+      [[ "$e" == *"$needle"* ]] || continue
+      printf '%s|%s|%s\n' "$needle" "${p#/proc/}" "$(cat "$p/comm" 2>/dev/null)" >>"$dump/environ_hits"
+    done
+  done <"$(dirname "$dump")/environ_needles"
+  : >"$dump/environ_scanned"
+fi
+
+if [[ "$mode" == trap-signals ]]; then
+  # Writes down which signal reached it, so a test can tell an INT from a TERM.
+  for sig in INT HUP TERM; do
+    trap "printf '%s\\n' $sig >'$dump/signal'; exit 0" "$sig"
+  done
+  : >"$dump/trapping"
+  sleep 30 & wait $!
+fi
+
+if [[ "$mode" == exit7 ]]; then
+  exit 7
+fi
+
+if [[ "$mode" == stderr-notice ]]; then
+  printf '[claude-code:unrecognized_model] aviso inofensivo\n' >&2
+  printf 'una linea de stderr que importa\n' >&2
+fi
+
+if [[ "$mode" == probe-git ]]; then
+  # The child runs git the way the model would on the read-only floor: by
+  # name, through PATH, inside a repository whose config is hostile. Every
+  # helper that config names appends to $ran, so "nothing ran" is a file that
+  # does not exist.
+  repo="$(cat "$(dirname "$dump")/fake_repo")"
+  cd "$repo" || exit 1
+  command -v git >"$dump/git_path"
+  : >"$dump/git"
+  for cmd in 'diff' 'log -p' 'show' 'status' 'blame f' 'diff --ext-diff' \
+             'diff --textconv' 'log -p --ext-diff' "diff --output=$dump/git_out" \
+             "diff --output $dump/git_out" 'diff --textcon' 'diff --ext-dif' \
+             'log -p --textc' 'show --textcon' "diff --outp=$dump/git_out" \
+             "diff --out $dump/git_out" "diff --o=$dump/git_out" \
+             'diff --no-index --textcon f .gitattributes' \
+             'diff --no-index --ext-dif f .gitattributes' 'log -p --textcon -- f' \
+             'log -1 sig' 'show -s sig' 'log --show-signature -1 sig' \
+             'diff --line-prefix' 'diff --src-prefix' 'diff --dst-prefix' \
+             'diff --word-diff-regex' 'log -p -1 --line-prefix' 'show --src-prefix' \
+             'diff --ignore-submodules=none' 'diff --ignore-su=none' \
+             'diff --submodule=diff' 'status --ignore-submodules=none'; do
+    rc=0
+    # shellcheck disable=SC2086
+    git $cmd >/dev/null 2>&1 || rc=$?
+    printf '%s|%s\n' "$cmd" "$rc" >>"$dump/git"
   done
 fi
 
@@ -158,6 +263,7 @@ activate_account() {
 
 setup() {
   mkdir -p "$TMP/bin" "$TMP/providers" "$TMP/keys" "$TMP/work" "$TMP/dump" "$TMP/mcp.d"
+  chmod 700 "$TMP/keys"   # key_dir must be private (A11)
   DG_ENV=()
   write_fake_claude
   # The ceiling a provider declares, in the current vocabulary. `mcp-write`
@@ -186,7 +292,9 @@ dg_run() {
     export DELEGATE_MCP_DIR="$TMP/mcp.d"
     local kv
     for kv in "${DG_ENV[@]+"${DG_ENV[@]}"}"; do export "$kv"; done
-    bash "$DELEGATE_BIN" "$@"
+    # Executed, not `bash "$DELEGATE_BIN"`: that ignores the shebang, and the
+    # shebang's privileged mode is part of what this suite is testing.
+    "$DELEGATE_BIN" "$@"
   )
 }
 
@@ -235,7 +343,8 @@ clear_dump() {
   # still tell "this run never reached the child" from "an earlier run did".
   rm -f "$TMP/dump/args" "$TMP/dump/argv" "$TMP/dump/env" "$TMP/dump/cmdline" \
         "$TMP/dump/parent_comm" "$TMP/dump/parent_cmdline" "$TMP/dump/blocked" \
-        "$TMP/dump/started"
+        "$TMP/dump/started" "$TMP/dump/filter_env" "$TMP/dump/filter_found" \
+        "$TMP/dump/supervisor_pid" "$TMP/dump/signal" "$TMP/dump/trapping"
 }
 
 wait_for() {
@@ -732,11 +841,154 @@ test_an_exported_function_does_not_reach_the_child() {
     export DELEGATE_MCP_DIR="$TMP/mcp.d"
     grep() { printf 'PWNED\n'; }
     export -f grep
-    bash "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea" >/dev/null 2>&1
+    "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea" >/dev/null 2>&1
   )
   require_child_ran || return 0
   assert_not_contains "$(child_env)" "BASH_FUNC" "no exported function crosses into the child"
   assert_not_contains "$(child_env)" "PWNED" "nor its body"
+}
+
+test_environ_entries_bash_cannot_name_never_reach_the_child() {
+  # `compgen -e` lists the variables bash imported, and bash does not import an
+  # environ entry whose name is not a valid identifier — but it passes it on to
+  # every child untouched. `SECRET-TOKEN=...` and `A.B=...` crossed the whole
+  # wipe and reached the delegated run. Verified with a sentinel.
+  setup
+  clear_dump
+  capture env PATH="$TMP/bin:$PATH" XDG_CACHE_HOME="$TMP/cache" \
+      DELEGATE_PROVIDERS_DIR="$TMP/providers" DELEGATE_MCP_DIR="$TMP/mcp.d" \
+      'SECRET-TOKEN=RAW-SENTINEL-9d2a' 'A.B=RAW-SENTINEL-77c0' \
+      "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  assert_not_contains "$(child_env)" "RAW-SENTINEL-9d2a" "SECRET-TOKEN does not reach the child"
+  assert_not_contains "$(child_env)" "RAW-SENTINEL-77c0" "A.B does not reach the child"
+  assert_eq "$SENTINEL" "$(env_value ANTHROPIC_API_KEY)" "the key still travels"
+  assert_not_contains "$(child_cmdline)" "$SENTINEL" "and still never as an argument"
+  assert_not_contains "$(cat "$TMP/dump/parent_cmdline")" "$SENTINEL" "not even one level up"
+}
+
+# ─── startup: nothing the caller's shell sets runs before the cleanup ────────
+
+dg_raw() {
+  # The real CLI under `env`, so a test can hand it environ entries that no
+  # `export` can create (BASH_FUNC_set%%) alongside the fixture's own.
+  env PATH="$TMP/bin:$PATH" XDG_CACHE_HOME="$TMP/cache" \
+      DELEGATE_PROVIDERS_DIR="$TMP/providers" DELEGATE_MCP_DIR="$TMP/mcp.d" \
+      "$@"
+}
+
+test_bash_env_is_never_sourced_at_startup() {
+  # Bash sources $BASH_ENV before the first line of a non-interactive script,
+  # so the `unset BASH_ENV` the script began with came too late: the file had
+  # already run. Verified with a sentinel.
+  setup
+  printf ': >%q\n' "$TMP/pwned-bash-env" >"$TMP/bash_env"
+  capture dg_raw BASH_ENV="$TMP/bash_env" ENV="$TMP/bash_env" "$DELEGATE_BIN" help
+  assert_eq 0 "$RC" "help still works"
+  [[ ! -e "$TMP/pwned-bash-env" ]] || fail "BASH_ENV was sourced"
+}
+
+test_an_exported_set_function_never_runs() {
+  # The cleanup itself is a `set` call, and a function named `set` exported by
+  # the caller was imported by bash and ran there — twice, before anything
+  # could remove it.
+  setup
+  capture dg_raw "BASH_FUNC_set%%=() { : >$TMP/pwned-set; builtin set \"\$@\"; }" \
+    "$DELEGATE_BIN" help
+  assert_eq 0 "$RC" "help still works"
+  [[ ! -e "$TMP/pwned-set" ]] || fail "an exported set function ran inside the CLI"
+}
+
+test_inherited_xtrace_never_prints_the_key() {
+  # SHELLOPTS=xtrace with a PS4 that expands a variable printed the parent's
+  # ANTHROPIC_API_KEY before `set +x` ran, and then every traced line of the
+  # run, including the one that reads the account key.
+  setup
+  capture dg_raw SHELLOPTS=xtrace 'PS4=+$ANTHROPIC_API_KEY ' ANTHROPIC_API_KEY=PARENT-KEY-c41e \
+    "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  assert_not_contains "$ERR" "PARENT-KEY-c41e" "the parent's key is not traced"
+  assert_not_contains "$ERR" "$SENTINEL" "the account key is not traced"
+  assert_not_contains "$OUT" "$SENTINEL" "nor printed on stdout"
+}
+
+test_inherited_allexport_never_exports_the_clis_variables() {
+  # With allexport on, every assignment exports: `local +x key` followed by
+  # `key=...` put the key back in the environment of every helper, and the
+  # child received it again as _DG_X_KEY next to ANTHROPIC_API_KEY. Both
+  # routes in: SHELLOPTS (ignored by privileged mode) and `bash -a` (only the
+  # script's own `set +a` covers it).
+  setup
+  clear_dump
+  capture dg_raw SHELLOPTS=allexport "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea"
+  assert_eq 0 "$RC" "SHELLOPTS=allexport: the run exits 0"
+  if require_child_ran; then
+    assert_eq 1 "$(grep -c -F -- "$SENTINEL" "$TMP/dump/env")" \
+      "SHELLOPTS=allexport: the key is in the child's environment exactly once"
+    assert_not_contains "$(child_env)" "_DG_" "SHELLOPTS=allexport: no internal variable reaches the child"
+  fi
+  clear_dump
+  capture dg_raw bash -a "$DELEGATE_BIN" testprov --dir "$TMP/work" "tarea"
+  assert_eq 0 "$RC" "bash -a: the run exits 0"
+  if require_child_ran; then
+    assert_eq 1 "$(grep -c -F -- "$SENTINEL" "$TMP/dump/env")" \
+      "bash -a: the key is in the child's environment exactly once"
+    assert_not_contains "$(child_env)" "_DG_" "bash -a: no internal variable reaches the child"
+    # The helpers the CLI starts after reading the key are the other half: with
+    # allexport, the stderr filter inherited the key for the whole run.
+    [[ -e "$TMP/dump/filter_found" ]] || fail "control: the stderr filter's environment was not found"
+    assert_not_contains "$(cat "$TMP/dump/filter_env" 2>/dev/null)" "$SENTINEL" \
+      "bash -a: the key is not in the stderr filter's environment"
+  fi
+}
+
+test_the_stderr_filter_does_not_carry_the_parents_environment() {
+  # The `grep` that hides Claude Code's unrecognized_model notice was started
+  # BEFORE the environment wipe, so it held the parent's whole environment —
+  # credentials included — readable in /proc/<pid>/environ for the entire run,
+  # after the launching shell had already unset them. Verified with a sentinel.
+  setup
+  clear_dump
+  DG_ENV=("GITHUB_TOKEN=FILTER-SENTINEL-3b1f" "AWS_SECRET_ACCESS_KEY=FILTER-SENTINEL-a0c2")
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  [[ -e "$TMP/dump/filter_found" ]] || { fail "control: the stderr filter's environment was not found"; return 0; }
+  local fenv
+  fenv="$(cat "$TMP/dump/filter_env")"
+  assert_not_contains "$fenv" "FILTER-SENTINEL" "no parent credential in the filter's environment"
+  assert_not_contains "$fenv" "$SENTINEL" "nor the account key"
+
+  # And it still does its job with nothing in its environment.
+  printf 'stderr-notice\n' >"$TMP/fake_mode"
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  assert_not_contains "$ERR" "unrecognized_model" "the notice is filtered out"
+  assert_contains "$ERR" "una linea de stderr que importa" "every other stderr line gets through"
+}
+
+test_no_process_of_the_run_keeps_the_parents_environment() {
+  # The CLI used to stay alive for the whole run as the child's supervisor.
+  # Unsetting variables does not touch a process's /proc/<pid>/environ, which
+  # keeps the environment the process was started with, so the parent's
+  # credentials stayed readable there — by a same-user process, or by an
+  # allowed `grep` on the read-only floor — for as long as the run lasted.
+  setup
+  clear_dump
+  printf 'probe-environ\n' >"$TMP/fake_mode"
+  printf '%s\n' "PARENT-ENVIRON-SENTINEL-5d2e" "ANTHROPIC_BASE_URL=https://api.example.invalid/v1" \
+    >"$TMP/environ_needles"
+  DG_ENV=("GITHUB_TOKEN=PARENT-ENVIRON-SENTINEL-5d2e")
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  [[ -e "$TMP/dump/environ_scanned" ]] || { fail "control: the scan did not finish"; return 0; }
+  local hits
+  hits="$(cat "$TMP/dump/environ_hits")"
+  # Control: the scan does find what the child itself was started with.
+  assert_contains "$hits" "ANTHROPIC_BASE_URL=https://api.example.invalid/v1|" "control: the child's own environment is found"
+  assert_not_contains "$hits" "PARENT-ENVIRON-SENTINEL-5d2e|" "no process alive during the run holds the parent's environment"
 }
 
 test_a_parent_export_cannot_shadow_the_clis_own_variables() {
@@ -807,7 +1059,7 @@ test_edit_and_bash_widen_the_allowed_tools_the_child_gets() {
 
 # ─── invariant 5: other AI CLIs are blocked in the child's PATH ──────────────
 
-test_codex_claude_delegate_and_dg_are_blocked_from_the_child() {
+test_other_ai_clis_are_blocked_from_the_child() {
   setup
   printf 'probe-tools\n' >"$TMP/fake_mode"
   capture dg_ok "tarea"
@@ -816,11 +1068,338 @@ test_codex_claude_delegate_and_dg_are_blocked_from_the_child() {
 
   local results
   results="$(cat "$TMP/dump/blocked")"
-  assert_eq 4 "$(printf '%s\n' "$results" | grep -c .)" "all four were probed"
+  assert_eq 9 "$(printf '%s\n' "$results" | grep -c .)" "all nine were probed"
   local tool
-  for tool in codex claude delegate dg; do
+  for tool in codex claude delegate dlg dg deepseek-agent qwen-agent opencode gemini; do
     assert_eq "$tool 126" "$(grep "^$tool " "$TMP/dump/blocked")" "$tool exits 126 in the child"
   done
+}
+
+# ─── the read-only floor: git cannot run what the repository configures ─────
+
+hostile_repo() {
+  # A repository whose own config, and the caller's global config, name a
+  # helper for every git hook-like mechanism the floor's git commands reach.
+  # The helper only appends to $TMP/ran, so the proof is that file's absence.
+  local repo="$TMP/repo" helper="$TMP/helper"
+  printf '#!/bin/sh\necho "ran $*" >>%q\ncat "$1" 2>/dev/null\nexit 0\n' "$TMP/ran" >"$helper"
+  chmod +x "$helper"
+  git init -q "$repo"
+  printf 'uno\n' >"$repo/f"
+  printf 'uno\n' >"$repo/p"
+  git -C "$repo" add f p
+  git -C "$repo" -c user.name=t -c user.email=t@t.invalid commit -qm init
+  printf 'f diff=evil filter=evil\np filter=evilp\n' >"$repo/.gitattributes"
+  printf 'dos\n' >>"$repo/f"
+  printf 'dos\n' >>"$repo/p"
+  # Filters in the REPOSITORY's own config: a clean filter, and a long-running
+  # `process` filter on a second file. The wrapper's GIT_CONFIG_GLOBAL does
+  # nothing against these.
+  git -C "$repo" config filter.evil.clean "$helper"
+  git -C "$repo" config filter.evilp.process "$helper"
+  # A commit carrying a signature, and a config that verifies signatures with
+  # a program of its choosing: `git log` and `git show` then run it.
+  local signed
+  signed="$(git -C "$repo" cat-file commit HEAD | awk '/^committer /{print; print "gpgsig -----BEGIN PGP SIGNATURE-----"; print " "; print " -----END PGP SIGNATURE-----"; next} 1' |
+    git -C "$repo" hash-object -t commit -w --stdin)"
+  git -C "$repo" update-ref refs/heads/sig "$signed"
+  git -C "$repo" config log.showSignature true
+  git -C "$repo" config gpg.program "$helper"
+  git -C "$repo" config gpg.ssh.program "$helper"
+  git -C "$repo" config gpg.x509.program "$helper"
+  git -C "$repo" config diff.external "$helper"
+  git -C "$repo" config diff.evil.textconv "$helper"
+  # An external diff driver of the repository's own: `git diff` runs it
+  # through the attribute unless --no-ext-diff is in effect.
+  git -C "$repo" config diff.evil.command "$helper"
+  git -C "$repo" config core.fsmonitor "$helper"
+  git -C "$repo" config core.pager "$helper"
+  # Global config: only GIT_CONFIG_GLOBAL keeps this one out.
+  mkdir -p "$TMP/home"
+  printf '[filter "evil"]\n\tclean = %s\n' "$helper" >"$TMP/home/.gitconfig"
+  printf '%s\n' "$repo" >"$TMP/fake_repo"
+}
+
+test_git_on_the_read_only_floor_runs_no_helper_the_repository_configures() {
+  # `git diff`, `log -p`, `show`, `status` and `blame` are allowed on the floor,
+  # and every one of them can run a program the repository's config names:
+  # diff.external, a textconv driver, core.fsmonitor, core.pager, a clean
+  # filter from the global config. That turned "read-only" into code execution
+  # by anyone who could write .git/config — including a run with --edit.
+  setup
+  hostile_repo
+  # Positive control: the plain git of this machine does run the helpers, so
+  # an empty $TMP/ran below is evidence and not an accident.
+  HOME="$TMP/home" git -C "$TMP/repo" --no-pager diff >/dev/null 2>&1
+  [[ -s "$TMP/ran" ]] || fail "control: the hostile repo should run its helper with plain git"
+  rm -f "$TMP/ran"
+  # And its filters alone run with no global config and no diff helpers.
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$TMP/repo" --no-pager diff --no-ext-diff --no-textconv \
+    >/dev/null 2>&1
+  [[ -s "$TMP/ran" ]] || fail "control: the repository's own filters should run with plain git"
+  rm -f "$TMP/ran"
+
+  printf 'probe-git\n' >"$TMP/fake_mode"
+  DG_ENV=("HOME=$TMP/home")
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+
+  assert_eq "" "$(cat "$TMP/ran" 2>/dev/null)" "no helper ran from the floor's git"
+  assert_ne "$(command -v git)" "$(cat "$TMP/dump/git_path")" "the child's git is not the bare binary"
+  local probe
+  probe="$(cat "$TMP/dump/git")"
+  assert_contains "$probe" "diff|0" "plain git diff still works"
+  assert_contains "$probe" "status|0" "git status still works"
+  assert_contains "$probe" "blame f|0" "git blame still works"
+  local refused
+  # Abbreviations too: `git diff --no-index` takes any unique prefix of a long
+  # option, and an exact-match blacklist let `--textcon` through — it ran the
+  # repository's textconv driver. Every prefix of --output is refused, and the
+  # textconv and ext-diff ones are overridden (covered by $TMP/ran above).
+  for refused in 'diff --ext-diff' 'diff --textconv' 'log -p --ext-diff' \
+                 "diff --output=$TMP/dump/git_out" "diff --output $TMP/dump/git_out" \
+                 "diff --outp=$TMP/dump/git_out" "diff --out $TMP/dump/git_out" \
+                 "diff --o=$TMP/dump/git_out" 'diff --ignore-submodules=none' \
+                 'diff --ignore-su=none' 'diff --submodule=diff' \
+                 'status --ignore-submodules=none'; do
+    assert_not_contains "$probe" "$refused|0" "refused: git $refused"
+  done
+  [[ ! -e "$TMP/dump/git_out" ]] || fail "git --output wrote a file from the floor"
+}
+
+test_git_with_bash_is_the_real_one() {
+  # --bash is unrestricted shell by definition; a constrained git there would
+  # be a narrower grant than the one asked for.
+  setup
+  hostile_repo
+  printf 'probe-git\n' >"$TMP/fake_mode"
+  DG_ENV=("HOME=$TMP/home")
+  capture dg_run testprov --dir "$TMP/work" --bash "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  assert_eq "$(command -v git)" "$(cat "$TMP/dump/git_path")" "the child's git is the machine's"
+}
+
+# ─── PATH: the tree under review never supplies a binary ─────────────────────
+
+# What the CLI runs by name: the four it hands to the child, and the helpers
+# its own startup and checks run before --dir is even known (dirname and
+# readlink resolved the script's location through the caller's PATH).
+PLANTED='claude timeout grep git dirname readlink stat sed awk cat tr mktemp chmod rm ln mv env sha256sum head sort'
+
+plant_binaries() {
+  # <dir>: the PLANTED names, each one only leaving a mark. If any of them
+  # runs, the delegated run executed code from the tree under review.
+  local dir="$1" name
+  mkdir -p "$dir"
+  for name in $PLANTED; do
+    printf '#!/bin/sh\n: >%q\nexit 0\n' "$TMP/pwned-$name" >"$dir/$name"
+    chmod +x "$dir/$name"
+  done
+}
+
+test_a_relative_or_tree_path_entry_never_supplies_a_binary() {
+  # With `.`, an empty entry or a relative directory in PATH, `command -v
+  # claude` returned a RELATIVE path and the CLI then cd'd into --dir, so the
+  # tree under review chose what ran as claude, timeout (resolved at exec) and
+  # the stderr-filtering grep (started after the cd). An absolute entry inside
+  # --dir is the same thing spelled differently.
+  setup
+  plant_binaries "$TMP/work"
+  plant_binaries "$TMP/work/rel"
+  plant_binaries "$TMP/work/abs"
+  DG_ENV=("PATH=.::rel:$TMP/work/abs:$TMP/bin:$PATH")
+  RC=0
+  ( cd "$TMP/work" && dg_run testprov --dir "$TMP/work" "tarea" ) >"$TMP/out" 2>"$TMP/err" || RC=$?
+  assert_eq 0 "$RC" "the run exits 0"
+  local name
+  for name in $PLANTED; do
+    [[ ! -e "$TMP/pwned-$name" ]] || fail "the tree under review supplied $name"
+  done
+  require_child_ran || return 0
+
+  local child_path entry first=1
+  child_path="$(env_value PATH)"
+  [[ -n "$child_path" ]] || fail "the child got no PATH at all"
+  IFS=: read -r -a entries <<<"$child_path"
+  for entry in "${entries[@]}"; do
+    if [[ -z "$entry" ]]; then fail "the child's PATH has an empty entry"; continue; fi
+    [[ "$entry" == /* ]] || fail "the child's PATH has a relative entry: $entry"
+    [[ "$entry" == "$TMP/work" || "$entry" == "$TMP/work/"* ]] &&
+      fail "the child's PATH has an entry inside --dir: $entry"
+    if (( first )); then
+      assert_contains "$entry" "stubs" "the stubs still come first"
+      first=0
+    fi
+  done
+  # A trailing empty entry is an empty entry too, and `read -a` drops it.
+  [[ "$child_path" != *: ]] || fail "the child's PATH ends in an empty entry"
+}
+
+test_the_stubs_live_in_a_private_directory_per_run_removed_at_exit() {
+  # The stubs used to live in one shared directory under XDG_CACHE_HOME,
+  # rewritten by every run with `>`: a symlink precreated there was followed
+  # and its target overwritten, and any extra executable left there (`node`,
+  # `git`) ran ahead of the real one in every later run. Now each run gets its
+  # own mktemp directory, and nothing of it survives the run.
+  setup
+  mkdir -p "$TMP/cache/delegate/stubs" "$TMP/run"
+  chmod 700 "$TMP/run"
+  printf 'intacto\n' >"$TMP/victim"
+  ln -s "$TMP/victim" "$TMP/cache/delegate/stubs/codex"
+  printf '#!/bin/sh\n: >%q\n' "$TMP/pwned-node" >"$TMP/cache/delegate/stubs/node"
+  chmod +x "$TMP/cache/delegate/stubs/node"
+
+  printf 'probe-stubs\n' >"$TMP/fake_mode"
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/run")
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the first run exits 0"
+  require_child_ran || return 0
+  local first
+  first="$(cat "$TMP/dump/stub_dir")"
+  assert_eq "intacto" "$(cat "$TMP/victim")" "a symlink in the old shared directory is not followed"
+  assert_ne "$TMP/cache/delegate/stubs" "$first" "the stubs are not in the shared cache directory"
+  assert_eq "700" "$(cat "$TMP/dump/stub_mode")" "the run's stub directory is private"
+  assert_not_contains "$(cat "$TMP/dump/node_path")" "$TMP/cache" "an executable left in the old directory is not on PATH"
+  [[ ! -e "$first" ]] || fail "the stub directory survives the run: $first"
+
+  clear_dump
+  capture dg_ok "tarea"
+  require_child_ran || return 0
+  assert_ne "$first" "$(cat "$TMP/dump/stub_dir")" "each run gets its own directory"
+  [[ -z "$(ls -A "$TMP/run")" ]] || fail "something was left in the runtime directory: $(ls -A "$TMP/run")"
+
+  # A parent anyone can write without the sticky bit lets them rename the
+  # run's directory away and put their own in its place: refused.
+  mkdir -p "$TMP/open"
+  chmod 777 "$TMP/open"
+  clear_dump
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/open")
+  capture dg_ok "tarea"
+  assert_ne 0 "$RC" "a world-writable, non-sticky parent is refused"
+  assert_contains "$ERR" "sticky" "and the message says why"
+  child_ran && fail "the child ran anyway"
+  return 0
+}
+
+test_a_stub_parent_others_in_the_group_can_write_is_refused() {
+  # A group member who can write the parent can rename the run's 700 directory
+  # away and put their own in its place, with a `grep` that then runs with the
+  # delegated environment and its key. Mode 700 on the directory does not
+  # protect its entry in the parent. Group-writable used to be accepted.
+  setup
+  local mode
+  for mode in 770 775 730; do
+    mkdir -p "$TMP/shared-$mode"
+    chmod "$mode" "$TMP/shared-$mode"
+    clear_dump
+    DG_ENV=("XDG_RUNTIME_DIR=$TMP/shared-$mode")
+    capture dg_ok "tarea"
+    assert_ne 0 "$RC" "a parent in mode $mode is refused"
+    child_ran && fail "mode $mode: the child ran anyway"
+  done
+
+  # The sticky bit keeps others from renaming entries they do not own, as in
+  # /tmp; and a parent only the user can write is the normal case.
+  for mode in 1770 700 755; do
+    mkdir -p "$TMP/ok-$mode"
+    chmod "$mode" "$TMP/ok-$mode"
+    clear_dump
+    DG_ENV=("XDG_RUNTIME_DIR=$TMP/ok-$mode")
+    capture dg_ok "tarea"
+    assert_eq 0 "$RC" "a parent in mode $mode is accepted"
+  done
+  return 0
+}
+
+test_a_term_to_the_cli_reaches_the_child_and_removes_the_stubs() {
+  # The CLI now waits for the child instead of exec'ing into it. A TERM sent to
+  # the CLI's process must still end the run — forwarded to the child — and
+  # the EXIT trap must still remove the stub directory.
+  setup
+  mkdir -p -m 700 "$TMP/run"
+  printf '30\n' >"$TMP/fake_sleep"
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/run")
+  dg_ok "tarea-larga-$$" >/dev/null 2>&1 &
+  local bg=$!
+  wait_for "$TMP/dump/started" || { fail "the child never started"; kill "$bg" 2>/dev/null; return 0; }
+  local pid
+  wait_for "$TMP/dump/supervisor_pid" || true
+  pid="$(cat "$TMP/dump/supervisor_pid" 2>/dev/null)"
+  [[ -n "$pid" ]] || { fail "control: the CLI's process was not found"; kill "$bg" 2>/dev/null; return 0; }
+  kill -TERM "$pid"
+  local tries=100
+  while kill -0 "$bg" 2>/dev/null && (( tries-- > 0 )); do sleep 0.1; done
+  if kill -0 "$bg" 2>/dev/null; then
+    fail "the run is still alive 10 s after TERM"
+    pkill -f -- "tarea-larga-$$" 2>/dev/null
+  fi
+  wait "$bg" 2>/dev/null
+  [[ -z "$(ls -A "$TMP/run")" ]] || fail "the stub directory survived the TERM: $(ls -A "$TMP/run")"
+  rm -f "$TMP/fake_sleep"
+  return 0
+}
+
+test_int_and_hup_reach_the_child_as_themselves() {
+  # The supervisor forwarded INT, HUP and TERM all as TERM, so a harness with
+  # its own handling for an interrupt or a hangup saw a termination instead.
+  setup
+  mkdir -p -m 700 "$TMP/run"
+  printf 'trap-signals\n' >"$TMP/fake_mode"
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/run")
+  local sig bg pid tries
+  for sig in INT HUP TERM; do
+    clear_dump
+    dg_ok "tarea-senal-$$" >/dev/null 2>&1 &
+    bg=$!
+    wait_for "$TMP/dump/trapping" || { fail "$sig: the child never got ready"; kill "$bg" 2>/dev/null; continue; }
+    pid="$(cat "$TMP/dump/supervisor_pid")"
+    kill -s "$sig" "$pid"
+    tries=100
+    while kill -0 "$bg" 2>/dev/null && (( tries-- > 0 )); do sleep 0.1; done
+    kill -0 "$bg" 2>/dev/null && { fail "$sig: the run is still alive"; pkill -f -- "tarea-senal-$$"; }
+    wait "$bg" 2>/dev/null
+    assert_eq "$sig" "$(cat "$TMP/dump/signal" 2>/dev/null)" "$sig reaches the child as $sig"
+  done
+  return 0
+}
+
+test_the_child_inherits_no_descriptor_beyond_stdio() {
+  # The key travels through a pipe on fd 3. Bash also kept the process
+  # substitution's own copy of it (fd 63) open, and the harness inherited it.
+  setup
+  clear_dump
+  capture dg_ok "tarea"
+  assert_eq 0 "$RC" "the run exits 0"
+  require_child_ran || return 0
+  [[ -e "$TMP/inherited_fds" ]] || { fail "control: the child did not list its descriptors"; return 0; }
+  assert_eq "" "$(cat "$TMP/inherited_fds")" "no descriptor beyond 0, 1 and 2 reaches the child"
+}
+
+test_the_childs_exit_code_is_the_runs_exit_code() {
+  # The CLI no longer execs into the child (it has to remove the stub
+  # directory afterwards), so the child's exit code has to be passed on.
+  setup
+  printf 'exit7\n' >"$TMP/fake_mode"
+  capture dg_ok "tarea"
+  assert_eq 7 "$RC" "the child's exit code comes back"
+}
+
+test_a_failing_cleanup_never_replaces_the_childs_exit_code() {
+  # The stub directory is removed after the child ends. Under errexit, a
+  # failing `rm` there ended the shell with ITS status, so a run whose child
+  # exited 7 reported 1. Verified with an `rm` that always fails.
+  setup
+  mkdir -p -m 700 "$TMP/run"
+  printf '#!/bin/sh\nexit 1\n' >"$TMP/bin/rm"
+  chmod +x "$TMP/bin/rm"
+  printf 'exit7\n' >"$TMP/fake_mode"
+  DG_ENV=("XDG_RUNTIME_DIR=$TMP/run")
+  capture dg_ok "tarea"
+  assert_eq 7 "$RC" "the child's exit code survives a failing cleanup"
+  command rm -f "$TMP/bin/rm"
+  return 0
 }
 
 # ─── invariant 6: a provider file is parsed, never sourced ───────────────────

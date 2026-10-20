@@ -23,7 +23,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DELEGATE="$REPO_ROOT/bin/delegate"
-DG_ALIAS="$REPO_ROOT/bin/dg"
+DG_ALIAS="$REPO_ROOT/bin/dlg"
 
 FAKE_KEY='fake-key-para-tests'
 
@@ -57,6 +57,7 @@ last=''
   printf 'MODEL:%s\n' "${ANTHROPIC_MODEL:-}"
   printf 'SMALL:%s\n' "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}"
   printf 'SUBAGENT:%s\n' "${CLAUDE_CODE_SUBAGENT_MODEL:-}"
+  printf 'CTX:%s\n' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-unset}"
 } > "$log"
 env > "$env_log"
 exit 0
@@ -314,12 +315,12 @@ test_zero_timeout_fails() {
   assert_contains "$ERR" "entero de segundos" "asks for an integer"
 }
 
-test_dg_alias_matches_delegate_help() {
+test_dlg_alias_matches_delegate_help() {
   setup_env
   capture "$DELEGATE" help
   local d_out="$OUT" d_err="$ERR" d_rc="$RC"
   capture "$DG_ALIAS" help
-  # Same output is the point: `dg` resolves the symlink back to bin/delegate and
+  # Same output is the point: `dlg` resolves the symlink back to bin/delegate and
   # therefore finds the same lib/. A copy, or a broken resolution, would differ.
   assert_eq "$d_rc" "$RC" "same exit code"
   assert_eq "$d_out" "$OUT" "same stdout"
@@ -353,6 +354,24 @@ test_agent_mode_passes_the_prompt() {
   assert_contains "$(claude_log)" "PROMPT:lista los error paths" "the prompt reaches the child"
 }
 
+test_a_task_that_looks_like_an_option_reaches_the_child_as_the_prompt() {
+  # `delegate alpha -- --help` used to hand `--help` to the harness as its last
+  # argument, where it was parsed as an option: the real `claude -p` printed
+  # its help and exited 0, a "successful" run that never did the task. The
+  # child's own `--` has to come right before the prompt, and right after the
+  # system prompt, which stays the last option.
+  setup_runnable
+  dg_run alpha --dir "$TMP/work" -- --help
+  assert_eq 0 "$RC" "the run succeeds"
+  assert_contains "$(claude_log)" "PROMPT:--help" "the task is the last argument"
+  local tail3
+  tail3="$(grep '^ARG:' "$FAKE_CLAUDE_LOG" | tail -n 3 | sed 's/^ARG://' | head -n 2 | tail -n 1)"
+  assert_eq "--" "$tail3" "a -- terminates the child's options right before the task"
+  local before
+  before="$(grep '^ARG:' "$FAKE_CLAUDE_LOG" | tail -n 4 | head -n 1 | sed 's/^ARG://')"
+  assert_eq "--append-system-prompt" "$before" "the system prompt is still the last option"
+}
+
 test_prompt_survives_quotes_dollars_accents_and_newlines() {
   setup_runnable
   # Nothing here is expanded by the test shell: $'...' only interprets the
@@ -375,6 +394,23 @@ test_model_flag_overrides_provider_model() {
   local log; log="$(claude_log)"
   assert_contains "$log" "MODEL:override-model" "--model reaches the child"
   assert_contains "$log" "SMALL:test-model-small" "the small model still comes from the provider"
+}
+
+test_context_tokens_reach_the_child_only_for_the_provider_model() {
+  setup_runnable
+  write_provider alpha $'context_tokens\t983616'
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  assert_eq 0 "$RC" "run with context_tokens succeeds"
+  assert_contains "$(claude_log)" "CTX:983616" "the provider's window reaches the child"
+  dg_run alpha --dir "$TMP/work" --model other-model "haz algo"
+  assert_eq 0 "$RC" "run with --model succeeds"
+  assert_contains "$(claude_log)" "CTX:unset" "a --model override does not inherit the window"
+}
+
+test_no_context_tokens_without_the_key() {
+  setup_runnable
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  assert_contains "$(claude_log)" "CTX:unset" "no window is invented"
 }
 
 test_provider_model_used_without_the_flag() {
@@ -665,7 +701,31 @@ test_env_passthrough_of_a_code_carrying_name_is_refused() {
   # delegated run into code execution inside it. The name comes from the entry
   # file; the value comes from this shell.
   local name
-  for name in NODE_OPTIONS LD_PRELOAD BASH_ENV PATH GIT_SSH_COMMAND PYTHONPATH; do
+  # And the ones that redirect or weaken the child's TLS traffic, which
+  # carries the provider key: a proxy, an extra CA, verification off. GCONV_PATH
+  # loads a shared object of its choosing in glibc's iconv.
+  for name in NODE_OPTIONS LD_PRELOAD BASH_ENV PATH GIT_SSH_COMMAND PYTHONPATH \
+              NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS HTTPS_PROXY HTTP_PROXY \
+              ALL_PROXY https_proxy http_proxy all_proxy GCONV_PATH; do
+    setup_runnable
+    write_mcp_http_entry docs 'get_thing' env_passthrough "$name"
+    dg_run alpha --dir "$TMP/work" --mcp docs "haz algo"
+    assert_eq 2 "$RC" "forwarding $name exits 2"
+    assert_contains "$ERR" "$name" "names the variable it refused"
+    assert_fails "nothing reached the child for $name" test -f "$FAKE_CLAUDE_LOG"
+  done
+}
+
+test_env_passthrough_of_any_git_variable_is_refused() {
+  # GIT_CONFIG_COUNT, GIT_CONFIG_KEY_0 and GIT_CONFIG_VALUE_0 passed the guard,
+  # so an http entry could forward a parent's `diff.external=<program>` into
+  # the child and every `git diff` on the read-only floor ran it — no --bash,
+  # no `trust local-exec`. Git reads dozens of GIT_* names, several of them as
+  # config or as commands, so the whole family is refused rather than a list
+  # that would have to keep up with git.
+  local name
+  for name in GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 \
+              GIT_CONFIG_PARAMETERS GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_DIR GIT_ASKPASS; do
     setup_runnable
     write_mcp_http_entry docs 'get_thing' env_passthrough "$name"
     dg_run alpha --dir "$TMP/work" --mcp docs "haz algo"
@@ -1015,6 +1075,31 @@ test_delegate_account_env_beats_default_and_active() {
   unset DELEGATE_ACCOUNT
   assert_eq 0 "$RC" "run with DELEGATE_ACCOUNT succeeds"
   assert_contains "$(claude_log)" "APIKEY:$FAKE_KEY-tres" "the env var beats default and active"
+}
+
+test_the_obsolete_deepseek_account_variable_is_refused() {
+  # DEEPSEEK_ACCOUNT was documented as selecting an account and was ignored:
+  # a caller following the docs was billed to the default or the active
+  # account without a word. Refused before any key is read, naming the
+  # variable that does work.
+  setup_runnable
+  write_key dos
+  export DEEPSEEK_ACCOUNT=dos
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  unset DEEPSEEK_ACCOUNT
+  assert_ne 0 "$RC" "a run with DEEPSEEK_ACCOUNT set fails"
+  assert_contains "$ERR" "DEEPSEEK_ACCOUNT" "names the variable it refused"
+  assert_contains "$ERR" "DELEGATE_ACCOUNT" "and the one to use instead"
+  assert_fails "nothing reached the child" test -f "$FAKE_CLAUDE_LOG"
+  assert_no_key_leak "obsolete variable"
+
+  # Defined but empty is still defined: the documented check is "set", and an
+  # empty value let a stale `export DEEPSEEK_ACCOUNT=` through unnoticed.
+  export DEEPSEEK_ACCOUNT=
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  unset DEEPSEEK_ACCOUNT
+  assert_ne 0 "$RC" "a run with DEEPSEEK_ACCOUNT set but empty fails too"
+  assert_contains "$ERR" "DEEPSEEK_ACCOUNT" "and names the variable"
 }
 
 test_default_account_beats_active_symlink() {

@@ -3,6 +3,7 @@ auth_env	ANTHROPIC_AUTH_TOKEN
 key_dir	~/.config/qwen
 model	qwen3.8-max
 small_model	qwen3.8-flash
+context_tokens	983616
 timeout	1800
 caps	read,edit,bash,mcp,mcp-write
 residency	Singapore (Alibaba Cloud)

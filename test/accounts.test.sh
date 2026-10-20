@@ -5,7 +5,10 @@
 # the harness) and fills it with fake keys. Nothing in this file may read, write
 # or delete anything under the real ~/.config/deepseek.
 source "$(dirname "${BASH_SOURCE[0]}")/lib/assert.sh"
-source "$(dirname "${BASH_SOURCE[0]}")/../lib/accounts.sh"
+# Key dirs and files are born private, as the library requires of key_dir.
+umask 077
+ACCOUNTS_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/accounts.sh"
+source "$ACCOUNTS_LIB"
 
 # make_key <path> [contents] — creates a 600 key file, dirs included.
 make_key() {
@@ -80,6 +83,33 @@ test_path_rejects_names_that_could_escape() {
   done
   # Nothing was built below $TMP because the name never reached a path.
   assert_eq '' "$(ls -A "$TMP" 2>/dev/null)" "no path was constructed under the key dir root"
+}
+
+test_path_refuses_a_name_that_lands_on_the_metadata_files() {
+  # `%s` is a legal key_pattern, and `api_key` and `default_account` are legal
+  # account names. Together the account file WAS the compatibility symlink, or
+  # the default-account metadata: adding the first such account wrote the key
+  # there, and activating it then replaced it with a symlink to itself.
+  local combo pattern account
+  for combo in '%s|api_key' '%s|default_account' 'api_%s|key' 'default_%s|account' \
+               'api_k%s|ey' '.%s|hidden'; do
+    pattern="${combo%%|*}"; account="${combo#*|}"
+    capture dg_account_path "$TMP/keys" "$pattern" "$account"
+    assert_eq 2 "$RC" "refuses pattern $pattern with account $account"
+    assert_eq '' "$OUT" "prints no path for $pattern + $account"
+  done
+  # Control: the same patterns with an ordinary name are fine.
+  capture dg_account_path "$TMP/keys" '%s' 'trabajo'
+  assert_eq 0 "$RC" "a %s pattern with an ordinary name is accepted"
+}
+
+test_list_never_reports_the_metadata_files_as_accounts() {
+  mkdir -p "$TMP/keys"
+  printf 'k\n' >"$TMP/keys/trabajo"; chmod 600 "$TMP/keys/trabajo"
+  ln -s "$TMP/keys/trabajo" "$TMP/keys/api_key"
+  printf 'trabajo\n' >"$TMP/keys/default_account"
+  capture dg_account_list "$TMP/keys" '%s'
+  assert_eq 'trabajo' "$OUT" "only the real account is listed"
 }
 
 test_path_rejects_over_long_and_accepts_32_chars() {
@@ -510,6 +540,179 @@ test_default_set_refuses_an_illegal_name() {
   assert_eq 2 "$RC" "illegal name refused"
   assert_absent "$TMP/evil" "nothing written outside"
   assert_absent "$dir/default_account" "no metadata file created"
+}
+
+# ── A11: races on key creation and on key reading ────────────────────────────
+
+# A key_dir anyone else can enter or write lets them swap a validated key for
+# another file between the check and the read, or plant a link where `add` is
+# about to write. It is checked on every use, not only when `add` creates it.
+test_a_key_dir_that_is_not_private_is_refused_on_every_use() {
+  local dir="$TMP/keys" mode
+  make_key "$dir/api_key.work" 'fake-key-a'
+  for mode in 750 705 770 777 755; do
+    chmod "$mode" "$dir"
+    capture dg_account_validate "$dir" "$dir/api_key.work"
+    assert_eq 1 "$RC" "validate refuses a key_dir in mode $mode"
+    assert_contains "$ERR" '700' "mode $mode: the error names the expected mode"
+    capture dg_account_load "$dir" "$dir/api_key.work"
+    assert_eq 1 "$RC" "load refuses a key_dir in mode $mode"
+    assert_eq '' "$OUT" "mode $mode: load prints no key"
+    run_with_stdin 'fake-key-b
+' dg_account_add "$dir" 'api_key.%s' 'other'
+    assert_eq 1 "$RC" "add refuses a key_dir in mode $mode"
+    assert_absent "$dir/api_key.other" "mode $mode: add wrote nothing"
+  done
+  chmod 700 "$dir"
+  assert_ok "control: the same key_dir in 700 is accepted" \
+    dg_account_validate "$dir" "$dir/api_key.work"
+}
+
+# The existence check runs before stdin is read, so whatever lands on the path
+# while `add` waits for the key is planted AFTER it. The writer below plants it
+# and only then sends the key. The old `printf >"$path"` followed the link and
+# wrote the key wherever it pointed.
+test_add_never_writes_through_something_planted_after_its_check() {
+  local dir="$TMP/keys" leftovers
+  mkdir -p "$dir"
+  printf 'victim-original\n' >"$TMP/victim"
+
+  dg_account_add "$dir" 'api_key.%s' 'work' \
+    < <(sleep 0.3; ln -s "$TMP/victim" "$dir/api_key.work"; printf 'fake-key-a\n') \
+    >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
+  assert_eq 1 "$RC" "a symlink planted at the destination makes add fail"
+  assert_eq 'victim-original' "$(cat "$TMP/victim")" "the link target is untouched"
+  [[ -L $dir/api_key.work ]] && pass_detail "the planted link is left as it was" ||
+    fail "the planted link was replaced"
+
+  dg_account_add "$dir" 'api_key.%s' 'ghost' \
+    < <(sleep 0.3; ln -s "$TMP/created-outside" "$dir/api_key.ghost"; printf 'fake-key-a\n') \
+    >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
+  assert_eq 1 "$RC" "a dangling symlink planted at the destination makes add fail"
+  assert_absent "$TMP/created-outside" "nothing is created through a dangling link"
+
+  dg_account_add "$dir" 'api_key.%s' 'plain' \
+    < <(sleep 0.3; printf 'planted\n' >"$dir/api_key.plain"; printf 'fake-key-a\n') \
+    >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
+  assert_eq 1 "$RC" "a file planted at the destination makes add fail"
+  assert_eq 'planted' "$(cat "$dir/api_key.plain")" "the planted file is not overwritten"
+  assert_not_contains "$(cat "$TMP/out" "$TMP/err")" 'fake-key-a' "the key is never printed"
+
+  leftovers=$(find "$dir" -maxdepth 1 -name '.*' -type f | wc -l)
+  assert_eq 0 "$leftovers" "no temporary file is left behind"
+}
+
+# dg_account_load opens the file once and checks THAT descriptor (where it
+# points, its type, mode, owner and size) before reading from it, so the file
+# read is the file checked. The cases below are the ones validate refuses.
+test_load_checks_and_reads_the_same_descriptor() {
+  local dir="$TMP/keys"
+  make_key "$dir/api_key.work" $'\n  fake-key-a \r'
+  capture dg_account_load "$dir" "$dir/api_key.work"
+  assert_eq 0 "$RC" "a good key loads"
+  assert_eq 'fake-key-a' "$OUT" "trimmed like dg_account_read"
+  assert_eq '' "$ERR" "nothing on stderr"
+
+  ln -s api_key.work "$dir/api_key.alias"
+  capture dg_account_load "$dir" "$dir/api_key.alias"
+  assert_eq 'fake-key-a' "$OUT" "a link that stays inside key_dir loads"
+
+  make_key "$TMP/outside/api_key.a" 'outside-key'
+  ln -s "$TMP/outside/api_key.a" "$dir/api_key.sneaky"
+  capture dg_account_load "$dir" "$dir/api_key.sneaky"
+  assert_eq 1 "$RC" "a link leaving key_dir is refused"
+  assert_contains "$ERR" 'outside' "the error says outside"
+  assert_not_contains "$OUT$ERR" 'outside-key' "the outside key is never printed"
+
+  make_key "$dir/api_key.wide" 'wide-key'; chmod 644 "$dir/api_key.wide"
+  capture dg_account_load "$dir" "$dir/api_key.wide"
+  assert_eq 1 "$RC" "mode 644 is refused"
+  assert_not_contains "$OUT$ERR" 'wide-key' "a refused key is never printed"
+
+  : >"$dir/api_key.empty"; chmod 600 "$dir/api_key.empty"
+  capture dg_account_load "$dir" "$dir/api_key.empty"
+  assert_eq 1 "$RC" "an empty key is refused"
+
+  mkdir -m 700 "$dir/api_key.adir"
+  capture dg_account_load "$dir" "$dir/api_key.adir"
+  assert_eq 1 "$RC" "a directory is refused"
+
+  mkfifo -m 600 "$dir/api_key.fifo"
+  capture timeout 5 bash -c 'source "$1"; dg_account_load "$2" "$3"' _ \
+    "$ACCOUNTS_LIB" "$dir" "$dir/api_key.fifo"
+  assert_eq 1 "$RC" "a fifo is refused without blocking"
+
+  capture dg_account_load "$dir" "$dir/api_key.nope"
+  assert_eq 1 "$RC" "a missing file is refused"
+}
+
+# `%F` in stat is translated: on a system in another language "regular file"
+# comes back in that language, and a check comparing it with the English text
+# refused every valid key. Simulated by a `stat` that answers in Spanish.
+test_load_does_not_depend_on_the_language_of_stat() {
+  local dir="$TMP/keys"
+  make_key "$dir/api_key.work" 'fake-key-a'
+  stat() {
+    command stat "$@" | sed -e 's/regular empty file/fichero regular vacío/' \
+                            -e 's/regular file/fichero regular/' -e 's/directory/directorio/'
+  }
+  capture dg_account_load "$dir" "$dir/api_key.work"
+  unset -f stat
+  assert_eq 0 "$RC" "a valid key loads whatever language stat answers in"
+  assert_eq 'fake-key-a' "$OUT" "and it is the key"
+}
+
+# The descriptor check looked for `|600|` anywhere in "type|mode|uid|size", so
+# for a user whose uid is 600 a 644 file passed on the uid field. That check is
+# the one meant to catch a file changed after the path checks, so the change
+# is simulated: a `stat` that reports 644 only when asked about the descriptor.
+# uid 600 comes from a user namespace.
+test_the_descriptor_mode_check_reads_the_mode_field_only() {
+  local dir="$TMP/keys"
+  make_key "$dir/api_key.work" 'fake-key-a'
+  if ! unshare -U --map-user=600 --map-group=600 true 2>/dev/null; then
+    pass_detail "skipped: no user namespaces on this machine"
+    return 0
+  fi
+  local probe='
+    source "$1"
+    stat() {
+      if [[ "$*" == */proc/*/fd/* ]]; then command stat "$@" | sed "s/|600|/|644|/"
+      else command stat "$@"; fi
+    }
+    dg_account_load "$2" "$3"'
+  capture unshare -U --map-user=600 --map-group=600 bash -c "$probe" _ \
+    "$ACCOUNTS_LIB" "$dir" "$dir/api_key.work"
+  assert_eq 1 "$RC" "a 644 descriptor is refused for uid 600"
+  assert_eq '' "$OUT" "and no key is printed"
+
+  capture unshare -U --map-user=600 --map-group=600 bash -c 'source "$1"; dg_account_load "$2" "$3"' _ \
+    "$ACCOUNTS_LIB" "$dir" "$dir/api_key.work"
+  assert_eq 'fake-key-a' "$OUT" "control: unchanged, the key loads for uid 600"
+}
+
+# `add` writes the key to a dot-named temporary and then links it into place.
+# Interrupted in between, the temporary — a copy of the key — stayed behind.
+# The interruption is made deterministic with an `ln` that takes a while.
+test_an_interrupted_add_leaves_no_temporary_key_behind() {
+  local dir="$TMP/keys" sig pid tries leftovers
+  mkdir -p "$TMP/slow"
+  printf '#!/bin/sh\nsleep 1\nexec %q "$@"\n' "$(type -P ln)" >"$TMP/slow/ln"
+  chmod +x "$TMP/slow/ln"
+  for sig in TERM INT HUP; do
+    rm -rf "$dir"; mkdir -m 700 "$dir"
+    ( PATH="$TMP/slow:$PATH"; dg_account_add "$dir" 'api_key.%s' work <<<'fake-key-a' ) \
+      >/dev/null 2>&1 &
+    pid=$!
+    tries=100
+    until compgen -G "$dir/.api_key.add.*" >/dev/null || (( tries-- <= 0 )); do sleep 0.02; done
+    compgen -G "$dir/.api_key.add.*" >/dev/null || { fail "$sig: control: the temporary never appeared"; continue; }
+    kill -s "$sig" "$pid"
+    wait "$pid" 2>/dev/null
+    sleep 1.2   # the slow ln outlives an untrapped shell
+    leftovers=$(find "$dir" -maxdepth 1 -name '.api_key.add.*' | wc -l)
+    assert_eq 0 "$leftovers" "$sig: no temporary copy of the key is left"
+  done
 }
 
 run_tests

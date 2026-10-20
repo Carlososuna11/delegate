@@ -612,6 +612,11 @@ dg_mcp_parse() {
 }
 
 dg_mcp_resolve() {
+  # Cleared on entry, before any return. The globals were only assigned on
+  # success, so a refusal kept the JSON, tools and env names of the previous
+  # call — a refused run readable as a granted one. Verified.
+  unset DG_MCP_JSON DG_MCP_TOOLS DG_MCP_RULES DG_MCP_ENV DG_MCP_NEED
+
   if (( $# != 3 )); then
     _dg_mcp_usage dg_mcp_resolve '<dir> <read_ids> <write_ids>'
     return 2

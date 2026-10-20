@@ -3,8 +3,8 @@
 #
 # The concrete file `<key_dir>/api_key.<account>` is the truth. The unsuffixed
 # `<key_dir>/api_key` is only a compatibility projection: a symlink pointing at
-# whichever account is active, kept because `cc-proveedor` is Python and reads
-# that fixed path. Nothing in this file may print the contents of a key.
+# whichever account is active, kept for tools outside delegate that read that
+# fixed path. Nothing in this file may print the contents of a key.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # CONTRACT — implement exactly this surface. bin/delegate depends on it.
@@ -45,6 +45,9 @@
 #     - its mode is exactly 600
 #     - it is owned by the current user
 #     - it is non-empty
+#     - the resolved key_dir is a directory owned by the current user with no
+#       group or other bits (700): anyone else who can enter or write it could
+#       swap the file between this check and the read
 #   Called immediately before a key is read. The containment check is what stops
 #   a hand-edited symlink from turning `delegate` into a file-exfiltration tool.
 #   On success it PRINTS the fully resolved path, and that is the path the caller
@@ -57,7 +60,15 @@
 #   Prints the key with surrounding whitespace, CR and LF stripped. The caller
 #   captures it into a variable and passes it through the child's environment.
 #   Assumes dg_account_validate already passed, and expects the path IT printed;
-#   call it first.
+#   call it first. A run uses dg_account_load instead.
+#
+# dg_account_load <key_dir> <path>
+#   validate + read on ONE descriptor: validates by path (which also refuses a
+#   fifo before it can block the open), opens the resolved file once, re-checks
+#   THAT descriptor through /proc/$BASHPID/fd (containment, regular file, 600,
+#   owner, non-empty) and reads the key from it. A swap after the path checks
+#   is either caught on the descriptor or read as the file that was checked.
+#   Prints the key like dg_account_read; returns 1 with nothing on stdout.
 #
 # dg_account_activate <key_dir> <target>
 #   Points `<key_dir>/api_key` at <target> ATOMICALLY: create a uniquely named
@@ -69,9 +80,12 @@
 # dg_account_add <key_dir> <key_pattern> <account>
 #   Reads the key from stdin. When stdin is a terminal, reads it with echo OFF
 #   (`read -rs`) and prints a prompt to stderr; otherwise reads a line plainly,
-#   so the command is scriptable. Creates key_dir if needed (mode 700). Writes
-#   the file under `umask 077`. Refuses (1) if the account already exists, or if
-#   what it read is empty. Must never echo, log or print the key.
+#   so the command is scriptable. Creates key_dir if needed (mode 700) and
+#   refuses one that is not private. Writes a private temporary in key_dir with
+#   noclobber under `umask 077`, then publishes it with link(2), which never
+#   replaces: whatever lands on the path while stdin is read is left alone and
+#   the add fails. Refuses (1) if the account already exists, or if what it read
+#   is empty. Must never echo, log or print the key.
 #
 # dg_account_remove <key_dir> <key_pattern> <account>
 #   Deletes the key file. If it was the active one, also removes the now-dangling
@@ -163,6 +177,37 @@ _dg_account_inside() {
   return 0
 }
 
+# 0 when <basename> is one of the files this library keeps NEXT TO the keys:
+# the `api_key` compatibility symlink, the `default_account` metadata, and the
+# dot-prefixed temporaries both are published through. `%s` is a legal
+# key_pattern and `api_key` a legal account name, so without this the account
+# file could BE the symlink — adding it wrote the key there and activating it
+# replaced it with a symlink to itself — or the metadata file.
+_dg_account_reserved_base() {
+  case "$1" in
+    api_key|default_account|.*) return 0 ;;
+  esac
+  return 1
+}
+
+# 0 when <rdir>, already resolved, is a directory owned by EUID with no group
+# or other permission bits. A key_dir others can enter or write lets them swap
+# a validated key for another file before it is read, or plant a link where
+# `add` is about to write; checked on every use, not only when `add` creates it.
+_dg_account_dir_private() {
+  local rdir="$1" st owner mode
+  st=$(stat -c '%u %a' -- "$rdir" 2>/dev/null) && [[ -d $rdir ]] || {
+    _dg_account_err "key dir '$rdir' is not a directory"
+    return 1
+  }
+  owner=${st%% *}; mode=${st#* }
+  if [[ $owner != "$EUID" ]] || (( 8#$mode & 8#077 )); then
+    _dg_account_err "key dir '$rdir' must be owned by you with mode 700, found owner $owner mode $mode"
+    return 1
+  fi
+  return 0
+}
+
 dg_account_path() {
   local key_dir="${1:-}" pattern="${2:-}" account="${3:-}" dir
   if [[ -z $key_dir || -z $pattern || -z $account ]]; then
@@ -179,7 +224,13 @@ dg_account_path() {
     _dg_account_err "dg_account_path: unusable key_dir"
     return 2
   }
-  printf '%s/%s\n' "$dir" "${pattern/\%s/$account}"
+  local base="${pattern/\%s/$account}"
+  if _dg_account_reserved_base "$base"; then
+    printf 'delegate: account %s with key_pattern %s lands on %s, a reserved file in key_dir\n' \
+      "$account" "$pattern" "$base" >&2
+    return 2
+  fi
+  printf '%s/%s\n' "$dir" "$base"
 }
 
 dg_account_list() {
@@ -200,6 +251,7 @@ dg_account_list() {
     [[ -f $f || -L $f ]] || continue
     base="${f##*/}"
     [[ $base == "$prefix"*"$suffix" ]] || continue
+    _dg_account_reserved_base "$base" && continue
     name="$base"
     [[ -n $prefix ]] && name="${name#"$prefix"}"
     [[ -n $suffix ]] && name="${name%"$suffix"}"
@@ -290,6 +342,7 @@ dg_account_validate() {
     _dg_account_err "key dir '$key_dir' cannot be resolved"
     return 1
   }
+  _dg_account_dir_private "$rdir" || return 1
   rpath=$(readlink -f -- "$path" 2>/dev/null) || {
     _dg_account_err "key file '$path' cannot be resolved"
     return 1
@@ -355,6 +408,64 @@ dg_account_read() {
   printf '%s\n' "$key"
 }
 
+dg_account_load() {
+  # Same `+x` reason as dg_account_read.
+  local +x key=''
+  local key_dir="${1:-}" path="${2:-}" rpath rdir fd fdp real st ok=0
+  local ftype fmode fuid fsize
+
+  if [[ -z $key_dir || -z $path ]]; then
+    _dg_account_err "dg_account_load: expects <key_dir> <path>"
+    return 1
+  fi
+  # By path first: besides the verdict, this refuses a fifo or a device before
+  # the open below, which would block on a fifo with no writer.
+  rpath=$(dg_account_validate "$key_dir" "$path") || return 1
+  rdir=$(readlink -f -- "$(_dg_account_dir "$key_dir")" 2>/dev/null) || return 1
+
+  # dg_account_validate then dg_account_read checked one name and opened it
+  # again: between the two, the file could be replaced. From here on every
+  # check is made on the descriptor, and the key is read from that descriptor.
+  # The braces scope the 2>/dev/null; on a bare `exec` it would stay.
+  { exec {fd}<"$rpath"; } 2>/dev/null || {
+    _dg_account_err "key file '$rpath' cannot be opened"
+    return 1
+  }
+  fdp="/proc/$BASHPID/fd/$fd"
+  real=$(readlink -- "$fdp" 2>/dev/null) || real=''
+  # %f, the raw mode in hex, and not %F: %F is the file type as TEXT, and it
+  # is translated, so on a system in another language "regular file" never
+  # matched and every valid key was refused.
+  st=$(stat -L -c '%f|%a|%u|%s' -- "$fdp" 2>/dev/null) || st=''
+  # Field by field: a pattern over the whole line (`*|600|*`) also matched the
+  # uid field, so for uid 600 a 644 file passed.
+  IFS='|' read -r ftype fmode fuid fsize <<<"$st"
+  if [[ -z $real || -z $st ]]; then
+    _dg_account_err "key file '$rpath' cannot be checked on its descriptor"
+  elif ! _dg_account_inside "$rdir" "$real"; then
+    _dg_account_err "key file '$real' is outside the key dir '$rdir'"
+  elif [[ ! $ftype =~ ^[0-9a-f]+$ ]] || (( (16#$ftype & 8#170000) != 8#100000 )); then
+    _dg_account_err "key file '$real' is not a regular file"
+  elif [[ $fmode != 600 ]]; then
+    _dg_account_err "key file '$real' must have mode 600"
+  elif [[ $fuid != "$EUID" ]]; then
+    _dg_account_err "key file '$real' is not owned by the current user"
+  elif [[ $fsize == 0 ]]; then
+    _dg_account_err "key file '$real' is empty"
+  else
+    IFS= read -r -d '' key <&"$fd" || true
+    ok=1
+  fi
+  exec {fd}<&-
+  (( ok )) || return 1
+  key=$(_dg_account_trim "$key")
+  [[ -n $key ]] || {
+    _dg_account_err "key file '$real' is empty"
+    return 1
+  }
+  printf '%s\n' "$key"
+}
+
 dg_account_activate() {
   local key_dir="${1:-}" target="${2:-}" link tmp tries=0
 
@@ -398,10 +509,18 @@ dg_account_activate() {
   return 0
 }
 
+# Puts back INT/TERM/HUP as `trap -p` printed them: the ones it lists are
+# re-installed, the others go back to their default.
+_dg_account_restore_traps() {
+  trap - INT TERM HUP
+  [[ -n ${1:-} ]] && eval "$1"
+  return 0
+}
+
 dg_account_add() {
   # Same `+x` reason as dg_account_read: the key must not become exported.
   local +x key
-  local key_dir="${1:-}" pattern="${2:-}" account="${3:-}" path
+  local key_dir="${1:-}" pattern="${2:-}" account="${3:-}" path rdir tmp tries=0
 
   path=$(dg_account_path "$key_dir" "$pattern" "$account") || return $?
   key_dir=$(_dg_account_dir "$key_dir") || return 2
@@ -431,16 +550,50 @@ dg_account_add() {
       return 1
     }
   fi
-
-  # umask 077 in a subshell: the file is born 600, it is never world-readable
-  # for even an instant.
-  if ! ( umask 077; printf '%s\n' "$key" >"$path" ); then
-    rm -f -- "$path"
-    _dg_account_err "cannot write key file '$path'"
+  rdir=$(readlink -f -- "$key_dir" 2>/dev/null) || {
+    _dg_account_err "key dir '$key_dir' cannot be resolved"
     return 1
+  }
+  _dg_account_dir_private "$rdir" || return 1
+
+  # A signal between creating the temporary and removing it left a copy of
+  # the key behind under a dot name. The traps remove it and then let the
+  # signal do what it would have done; the caller's traps are put back after.
+  # `made` is set only once the temporary is ours: a name that was already
+  # taken by something else is never removed.
+  local prev_traps made=''
+  prev_traps=$(trap -p INT TERM HUP)
+  trap '[[ -n ${made:-} ]] && rm -f -- "$made"; trap - INT; kill -INT $BASHPID' INT
+  trap '[[ -n ${made:-} ]] && rm -f -- "$made"; trap - TERM; kill -TERM $BASHPID' TERM
+  trap '[[ -n ${made:-} ]] && rm -f -- "$made"; trap - HUP; kill -HUP $BASHPID' HUP
+
+  # The existence check above runs BEFORE stdin is read, so anything can land
+  # on $path while add waits for the key; `printf >"$path"` then followed a
+  # planted symlink and wrote the key wherever it pointed, or overwrote a
+  # planted file. Now: a dot-named temporary (reserved, never an account) is
+  # created with noclobber under umask 077 — born 600, never opened if it
+  # exists — and published with link(2), which fails with EEXIST instead of
+  # replacing or following anything at $path.
+  while :; do
+    tmp="$rdir/.api_key.add.$$.$RANDOM$tries"
+    if ( set -C; umask 077; printf '%s\n' "$key" >"$tmp" ) 2>/dev/null; then made=$tmp; break; fi
+    if [[ ! -e $tmp && ! -L $tmp ]] || (( ++tries > 32 )); then
+      _dg_account_err "cannot write a temporary key file in '$rdir'"
+      _dg_account_restore_traps "$prev_traps"; return 1
+    fi
+  done
+  chmod 600 -- "$tmp" 2>/dev/null
+  if ! ln -T -- "$tmp" "$path" 2>/dev/null; then
+    rm -f -- "$tmp"
+    if [[ -e $path || -L $path ]]; then
+      _dg_account_err "account '$account' already exists"
+    else
+      _dg_account_err "cannot write key file '$path'"
+    fi
+    _dg_account_restore_traps "$prev_traps"; return 1
   fi
-  chmod 600 -- "$path" 2>/dev/null ||
-    _dg_account_err "warning: cannot tighten mode of '$path'"
+  rm -f -- "$tmp"
+  _dg_account_restore_traps "$prev_traps"
   return 0
 }
 
