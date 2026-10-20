@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install (or update) delegate and delegate-run on a remote host, for Fase C.
 #
-#   scripts/install-remote.sh [host] [rev]      # defaults: caracas, HEAD
+#   scripts/install-remote.sh <host> [rev]      # rev defaults to HEAD
 #
 # What crosses: a `git bundle` of <rev> (committed history only: no working
 # tree, no untracked files, no config) copied with scp, and a fixed install
@@ -17,7 +17,8 @@
 # reported: the install never overwrites something it did not create.
 set -euo pipefail
 
-host="${1:-caracas}"
+host="${1:-}"
+[[ -n "$host" ]] || { echo "uso: scripts/install-remote.sh <host> [rev]" >&2; exit 2; }
 rev="${2:-HEAD}"
 [[ "$host" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@-]*$ ]] || { echo "host inválido: $host" >&2; exit 2; }
 

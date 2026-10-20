@@ -4,3 +4,9 @@ providers.d/*.local.conf
 # Python
 __pycache__/
 *.pyc
+
+# Worktrees locales
+.claude/
+
+# Tests
+.pytest_cache/

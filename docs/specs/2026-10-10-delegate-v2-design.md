@@ -254,14 +254,14 @@ Quien llama acepta un resultado solo si: `status` es `completed`, `scope_violati
 está vacío, revisa el diff de la rama él mismo, y vuelve a correr los checks antes de
 integrar. El `report` del modelo es evidencia a investigar, no autorización.
 
-## Fase C — remoto (subproyecto caracas)
+## Fase C — remoto (host remoto)
 
 Solo la interfaz, para que la fase B no la cierre:
 
-- En caracas, un mirror bare por repo: `~/delegate/repos/<nombre>.git`.
-- La laptop empuja la base a `refs/delegate/base/<run_id>`, manda la petición por `ssh -T caracas delegate-run` (stdin) y luego hace `git fetch` de `delegate/<run_id>`.
+- En el host remoto, un mirror bare por repo: `~/delegate/repos/<nombre>.git`.
+- La laptop empuja la base a `refs/delegate/base/<run_id>`, manda la petición por `ssh -T <host> delegate-run` (stdin) y luego hace `git fetch` de `delegate/<run_id>`.
 - Si se cae la conexión, se consulta `delegate-run status <run_id>` antes de reintentar: un corte de transporte no significa que la corrida no ocurrió.
-- caracas tiene sus propias keys de delegación, no las de la laptop, y ninguna credencial de producción ni de Claude.
+- El host tiene sus propias keys de delegación, no las de la laptop, y ninguna credencial de producción ni de Claude.
 
 ### Decisiones de implementación
 
@@ -302,7 +302,7 @@ Uso y reglas en `CLAUDE.md`, "delegate-run remoto (Fase C)".
 - **Copia local con `host`** en `runs/<run_id>/`, y el registro pendiente aparte
   (`state/remote/<run_id>.json`) hasta que la corrida termina: así `status` y
   `stats` no ven como `abandoned` una corrida que sigue viva en el host.
-- **Instalación por bundle**: caracas no tiene acceso a GitHub. El código va a
+- **Instalación por bundle**: el host no necesita acceso a GitHub. El código va a
   `~/delegate/src`, separado de los mirrors en `~/delegate/repos`, para que
   actualizar o limpiar el clon no toque los mirrors.
 
@@ -313,9 +313,9 @@ tests (fetch que podía avanzar una rama existente, adopción de una corrida aje
 un corte, refs y temporales predecibles en el instalador, reserva no atómica del id,
 copia local no atómica, `unreadable` transitorio tomado como final, y un ssh falso
 que no cortaba de verdad).
-Smoke real contra caracas con el `delegate` falso (transporte, mirror, bwrap, checks,
+Smoke real contra el host remoto con el `delegate` falso (transporte, mirror, bwrap, checks,
 `--detach` con corte real de ssh y `fetch`): verde. El smoke con el modelo real queda
-pendiente de la key de DeepSeek en caracas.
+pendiente de la key de DeepSeek en el host.
 
 ## Tests
 

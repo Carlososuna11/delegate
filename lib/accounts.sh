@@ -3,8 +3,8 @@
 #
 # The concrete file `<key_dir>/api_key.<account>` is the truth. The unsuffixed
 # `<key_dir>/api_key` is only a compatibility projection: a symlink pointing at
-# whichever account is active, kept because `cc-proveedor` is Python and reads
-# that fixed path. Nothing in this file may print the contents of a key.
+# whichever account is active, kept for tools outside delegate that read that
+# fixed path. Nothing in this file may print the contents of a key.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # CONTRACT — implement exactly this surface. bin/delegate depends on it.

@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "bin" / "delegate-run"
 FAKE = Path(__file__).resolve().parent / "fake_delegate.py"
 FAKE_SSH = Path(__file__).resolve().parent / "fake_ssh.py"
-HOST = "caracas"
+HOST = "buildbox"
 
 # Remote commands the client may send. Anything else on an ssh command line
 # means a request field leaked into it.

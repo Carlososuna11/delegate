@@ -1,4 +1,4 @@
-"""Fase C: run delegate-run on another host (caracas) over ssh.
+"""Fase C: run delegate-run on another host over ssh.
 
 Client side (the laptop), `delegate-run --remote <host> < peticion.json`:
 

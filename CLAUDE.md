@@ -177,7 +177,7 @@ de usuario.
 ## Superficie
 
 Ejecutable `delegate`, con `dlg` como abreviación (el mismo script por symlink, no una
-copia). No `dg`: en esta máquina ese nombre es el CLI de Deepgram.
+copia). No `dg`: es el nombre del CLI de Deepgram.
 Proveedor como subcomando; modo agente por defecto.
 
 ```
@@ -285,7 +285,7 @@ usaba pagaba con otra cuenta sin enterarse. La cuenta por defecto vive
 en un archivo de metadata no secreto, para no depender de estado global mutable.
 
 `api_key` sin sufijo se mantiene **solo como proyección de compatibilidad** para
-`cc-proveedor`, que es Python y lee esa ruta fija.
+herramientas externas que leen esa ruta fija.
 
 **Reglas duras:**
 
@@ -596,7 +596,7 @@ Estado en `~/.local/state/delegate/` (o `$DELEGATE_STATE_DIR`), 700: `runs/<run_
 
 ## delegate-run remoto (Fase C)
 
-`delegate-run --remote caracas < peticion.json` corre la misma petición en otro host.
+`delegate-run --remote <host> < peticion.json` corre la misma petición en otro host.
 La petición es la de siempre, con `repo` local. El cliente:
 
 1. Valida la petición, elige un `run_id` nuevo (reservado con un archivo exclusivo en
@@ -644,9 +644,9 @@ Instalación: `scripts/install-remote.sh [host] [rev]` manda un `git bundle` del
 (nada sin commit, ni config, ni keys) por scp a un directorio de `mktemp` en el host,
 lo deja en `~/delegate/src` (separado
 de `~/delegate/repos`) y enlaza `delegate`, `dlg` y `delegate-run` en
-`~/.local/bin`, sin pisar un archivo que no sea un enlace. El ssh no interactivo de
-caracas encuentra `node`, `claude` y `~/.local/bin` por el bloque de arriba de su
-`~/.bashrc`.
+`~/.local/bin`, sin pisar un archivo que no sea un enlace. El ssh no interactivo del
+host tiene que encontrar `node`, `claude` y `~/.local/bin` en el `PATH`: si su
+`~/.bashrc` sale temprano en shells no interactivos, el `PATH` va antes de esa salida.
 
 **Límites:** el mirror crece con cada base empujada hasta que el `gc` del host borra
 las refs (y un `git gc` en el mirror los objetos). El `report`, `stdout.log` y los
@@ -810,18 +810,6 @@ automática de servidores MCP (el registro es declarativo y lo escribe el dueño
 máquina; nada se agrega solo), fallback o enrutamiento automático entre proveedores (manda código a la jurisdicción o a
 la cuenta equivocada), y enforcement automático a partir de `residency` — eso último es
 teatro de seguridad: la nota se muestra y la elección del proveedor queda explícita.
-
-## Migración
-
-Los scripts que esto reemplaza viven en `~/bin`: `deepseek-agent`, `qwen-agent`,
-`deepseek` y `deepseek-cuenta`. Orden, sin borrar nada hasta el final:
-
-1. `delegate` funcionando en paralelo a los scripts actuales.
-2. Los subagentes `deepseek` y `qwen` de Claude Code apuntan a `delegate`.
-3. `cc-proveedor` sigue leyendo `api_key` sin cambios.
-4. Con todo lo anterior verde, se borran los cuatro scripts.
-
-No hay urgencia: los scripts actuales funcionan.
 
 ## Qué NO delegar
 
