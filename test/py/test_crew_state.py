@@ -483,6 +483,7 @@ class ControlCharsTest(unittest.TestCase):
                          "holamundo")
         self.assertEqual(strip_control("a\tb\nc\x7f"), "a\tb\nc")
         self.assertEqual(strip_control("texto \x1b(B normal"), "texto  normal")
+        self.assertEqual(strip_control("a\x9b2Jb\x9d0;x"), "a2Jb0;x")
         self.assertIsNone(strip_control(None))
 
 

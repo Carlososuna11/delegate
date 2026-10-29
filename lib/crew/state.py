@@ -52,8 +52,9 @@ ANSI_RE = re.compile(
     "\x1b\\[[0-?]*[ -/]*[@-~]"
     "|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)?"
     "|\x1b[ -/]*[0-~]")
-# C0 controls except tab (\x09) and newline (\x0a), plus DEL.
-CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
+# C0 controls except tab (\x09) and newline (\x0a), DEL, and the C1 range
+# (8-bit CSI/OSC/DCS), which some terminals honour in UTF-8 mode.
+CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 # `owner.repo`, lowercase: safe as a file name and as a remote label.
 SLUG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
