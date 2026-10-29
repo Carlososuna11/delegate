@@ -20,17 +20,23 @@ _CONTRACT_PATH = Path(__file__).resolve().parents[2] / "crew" / "contract.md"
 # (name shown in the error, compiled pattern). Keep them in one place so the
 # error can say which backstop fired without echoing the value.
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("token de GitHub", re.compile(r"ghp_|gho_|github_pat_")),
-    ("clave de API", re.compile(r"sk-[A-Za-z0-9-]{20,}")),
+    # A bare mention ("los tokens ghp_ no se copian") has no value body, so the
+    # prefix alone is not enough: these patterns need the token characters.
+    ("token de GitHub", re.compile(
+        r"\b(?:gh[pous]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
+    # The lookbehind keeps hyphenated prose ("my-sk-learn-...") from reading as
+    # a key; a real `sk-...` value is never glued to a preceding word.
+    ("clave de API", re.compile(r"(?<![\w-])sk-[A-Za-z0-9_-]{20,}")),
     ("clave de AWS", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("clave privada", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("URL con credenciales", re.compile(r"\w+://[^\s/:@]+:[^\s/@]+@")),
-    # The composite pattern below needs something before DATABASE_URL, so a
-    # bare assignment would slip through; this backstop covers it.
-    ("URL de base de datos", re.compile(r"\bDATABASE_URL\s*[:=]\s*\S+")),
+    # Keyword anywhere in the name, any case, at the start of the name too:
+    # `API_KEY="x"`, `password=hunter2`, `AWS_SECRET_ACCESS_KEY=abc`,
+    # `DATABASE_URL=...`. A mention without `:` or `=` still passes.
     ("asignación de credencial", re.compile(
-        r"\b[A-Z][A-Z0-9_]*(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|DATABASE_URL)"
-        r"\s*[:=]\s*\S+")),
+        r"(?i)\b(?:[A-Za-z0-9_]*_)?"
+        r"(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|DATABASE_URL)"
+        r"[A-Za-z0-9_]*\s*[:=]\s*\S+")),
 ]
 
 
@@ -60,10 +66,19 @@ def _quote(text: str) -> str:
     return "\n".join(f"> {line}" if line else ">" for line in lines)
 
 
+def _flat(text: str) -> str:
+    """Collapse every run of whitespace to one space and strip the ends.
+
+    Structured fields go into the brief as a single line, so they cannot inject
+    headings, list items or markers of their own.
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _bullets(items: list[str]) -> str:
     if not items:
         return "Ninguna."
-    return "\n".join(f"- {item}" for item in items)
+    return "\n".join(f"- {_flat(item)}" for item in items)
 
 
 def build_brief(words: str, project: str, base: str, decisions: list[str],
@@ -78,8 +93,8 @@ def build_brief(words: str, project: str, base: str, decisions: list[str],
         "",
         "## Repo y rama base",
         "",
-        f"- Proyecto: {project}",
-        f"- Rama base: {base}",
+        f"- Proyecto: {_flat(project)}",
+        f"- Rama base: {_flat(base)}",
         "",
         "## Decisiones ya tomadas en el chat",
         "",

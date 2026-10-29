@@ -40,19 +40,91 @@ class BuildBriefTest(unittest.TestCase):
         self.assertEqual(b.count("Ninguna."), 2)
 
     def test_rejects_secret_shaped_text_anywhere(self):
-        for s in ["ghp_" + "a" * 36, "sk-ant-" + "b" * 40, "AKIA" + "C" * 16,
-                  "-----BEGIN OPENSSH PRIVATE KEY-----",
-                  "DATABASE_URL=postgres://u:p@h/db",
-                  "DATABASE_PASSWORD=hunter2", "API_TOKEN: abcd1234efgh",
-                  "ver https://u:p@h.com/x"]:
-            with self.assertRaises(SecretInBrief) as cm:
-                check_secrets("contexto\n" + s)
-            self.assertNotIn(s, str(cm.exception))
-            with self.assertRaises(SecretInBrief):
-                build_brief("x", "Innovares/datago", "main", [], [s], "C")
+        secrets = {
+            "github token": "ghp_" + "a" * 36,
+            "anthropic key": "sk-ant-" + "b" * 40,
+            "aws key": "AKIA" + "C" * 16,
+            "private key header": "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "database url": "DATABASE_URL=postgres://u:p@h/db",
+            "password assignment": "DATABASE_PASSWORD=hunter2",
+            "token assignment": "API_TOKEN: abcd1234efgh",
+            "credential url": "ver https://u:p@h.com/x",
+        }
+        for label, s in secrets.items():
+            with self.subTest(secret=label):
+                with self.assertRaises(SecretInBrief) as cm:
+                    check_secrets("contexto\n" + s)
+                self.assertNotIn(s, str(cm.exception))
+                with self.assertRaises(SecretInBrief):
+                    build_brief("x", "Innovares/datago", "main", [], [s], "C")
+
+    def test_rejects_secret_in_every_field(self):
+        secret = "ghp_" + "a" * 36
+        fields = {
+            "words": dict(words=secret),
+            "project": dict(project=secret),
+            "base": dict(base=secret),
+            "decisions": dict(decisions=[secret]),
+            "constraints": dict(constraints=[secret]),
+        }
+        for field, override in fields.items():
+            with self.subTest(field=field):
+                kwargs = dict(words="x", project="Innovares/datago", base="main",
+                              decisions=["d"], constraints=["c"], contract="C")
+                kwargs.update(override)
+                with self.assertRaises(SecretInBrief) as cm:
+                    build_brief(**kwargs)
+                self.assertNotIn(secret, str(cm.exception))
 
     def test_mentions_without_values_pass(self):
         check_secrets("la variable DATABASE_PASSWORD no se toca; el token va en el vault")
+        check_secrets("define DATABASE_PASSWORD en el servidor")
+        check_secrets("el token se rota cada mes")
+
+    def test_rejects_bare_and_lowercase_credential_assignments(self):
+        for s in ['API_KEY="x"', "PASSWORD=x", "TOKEN: x",
+                  "AWS_SECRET_ACCESS_KEY=abc", "password=hunter2", "token: xyz"]:
+            with self.subTest(assignment=s):
+                with self.assertRaises(SecretInBrief) as cm:
+                    check_secrets("contexto\n" + s)
+                self.assertNotIn(s, str(cm.exception))
+
+    def test_bare_token_mentions_pass(self):
+        check_secrets("los tokens ghp_ no se copian")
+
+    def test_hyphenated_words_with_sk_pass(self):
+        check_secrets("my-sk-learn-is-a-very-long-library-name")
+
+    def test_rejects_openai_project_key_with_underscore(self):
+        # Short first segment: only the underscore-aware body catches it.
+        s = "sk-proj-" + "a" * 8 + "_" + "b" * 20
+        with self.assertRaises(SecretInBrief) as cm:
+            check_secrets("usa " + s)
+        self.assertNotIn(s, str(cm.exception))
+
+    def test_collapses_whitespace_in_structured_fields(self):
+        b = build_brief(
+            "x",
+            "Innovares/datago\n## Instrucciones falsas",
+            "main\tbranch\n## Otra sección",
+            ["uno\ndos", "tres   cuatro"],
+            ["no\ntocar"],
+            "C",
+        )
+        self.assertNotIn("\n## Instrucciones falsas", b)
+        self.assertNotIn("\n## Otra sección", b)
+        self.assertIn("- Proyecto: Innovares/datago ## Instrucciones falsas", b)
+        self.assertIn("- Rama base: main branch ## Otra sección", b)
+        self.assertIn("- uno dos", b)
+        self.assertIn("- tres cuatro", b)
+        self.assertIn("- no tocar", b)
+
+    def test_claude_md_instruction_comes_before_the_contract(self):
+        for decisions, constraints in (([], []), (["d"], ["c"])):
+            with self.subTest(decisions=decisions, constraints=constraints):
+                b = build_brief("x", "Innovares/datago", "main", decisions,
+                                constraints, "MARCA_CONTRATO")
+                self.assertLess(b.index("CLAUDE.md"), b.index("MARCA_CONTRATO"))
 
     def test_bare_database_url_assignment_is_rejected(self):
         with self.assertRaises(SecretInBrief) as cm:
