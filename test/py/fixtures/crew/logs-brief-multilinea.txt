@@ -1,0 +1,7 @@
+1. **¿De qué color va el botón principal?** Te recomiendo el color primario de la marca, para que sea igual a los demás botones de acción del producto y no haya que crear un color nuevo.
+
+2. **¿Cómo se ve el botón al pasar el mouse por encima y cuando está desactivado?** Te recomiendo que al pasar el mouse se vea un tono más oscuro del mismo color y que desactivado quede en gris. El contraste del texto debe ser de al menos 4.5:1 en los dos casos.
+
+**Terminado sería esto:** el botón usa el color que elijas y cambia de tono al pasar el mouse. Desactivado se ve gris. Lo pruebas abriendo la pantalla en el navegador y pasando el mouse por encima del botón.
+
+CREW: PREGUNTAS

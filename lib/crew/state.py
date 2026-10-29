@@ -35,7 +35,9 @@ from .paseo import CrewError, ID_RE, NUMBER_RE, Paseo
 STATE_ENV = "CREW_STATE_DIR"
 TIMEOUT_ENV = "CREW_REFRESH_TIMEOUT"
 DEFAULT_TIMEOUT = 30.0
-LOGS_TAIL = 20
+# `paseo logs --tail` counts entries, not lines, and only the first line of a
+# user entry carries "[User] ": one entry is exactly the last message.
+LOGS_TAIL = 1
 
 MARKERS = ("CREW: PREGUNTAS", "CREW: ENTREGA", "CREW: BLOQUEADO")
 # States classify() derives from an idle agent; only those can be reused when
@@ -61,26 +63,22 @@ SLUG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
 def last_message(logs_text: str) -> str | None:
-    """The agent's last complete message in `paseo logs --filter text`.
+    """The agent's last message from `paseo logs --tail 1 --filter text`.
 
-    User turns are lines starting with "[User] "; the agent's text is every
-    unprefixed line after the last one (blank lines included). Trailing blank
-    lines are dropped. When the tail cut the "[User] " line off, the whole
-    output is the last message.
+    The output is a single entry. An entry whose first line starts with
+    "[User] " is the user's (the agent hasn't answered yet), so there is no
+    agent message. Trailing blank lines are dropped.
     """
     if not isinstance(logs_text, str):
         return None
     lines = logs_text.splitlines()
-    start = 0
-    for index, line in enumerate(lines):
-        if line.startswith("[User] "):
-            start = index + 1
-    message = lines[start:]
-    while message and not message[-1].strip():
-        message.pop()
-    if not message:
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or lines[0].startswith("[User] "):
         return None
-    return "\n".join(message)
+    return "\n".join(lines)
 
 
 def without_marker(message: str) -> str:

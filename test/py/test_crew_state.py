@@ -462,13 +462,27 @@ class LastMessageTest(unittest.TestCase):
         self.assertIn("La marca CREW: ENTREGA se usa", message)
         self.assertTrue(message.endswith("Listo por ahora."))
 
-    def test_tail_cut_before_the_user_line_means_the_whole_output(self):
+    def test_multiline_brief_never_leaks_into_the_message(self):
+        # Only the first line of a user entry carries "[User] ": with a
+        # multi-line brief, line-based parsing would quote the brief too.
         from crew.state import last_message
-        self.assertEqual(last_message("primera línea\ny segunda\n\n"),
+        text = (FIXTURES / "logs-brief-multilinea.txt").read_text(encoding="utf-8")
+        message = last_message(text)
+        self.assertTrue(message.startswith("1. **"))
+        self.assertTrue(message.endswith("CREW: PREGUNTAS"))
+        self.assertNotIn("Contrato", message)
+
+    def test_user_entry_means_no_agent_message(self):
+        from crew.state import last_message
+        self.assertIsNone(last_message("[User] 1 sí\n2 la b\n"))
+        self.assertEqual(last_message("\nprimera línea\ny segunda\n\n"),
                          "primera línea\ny segunda")
-        self.assertEqual(last_message("[User] x\nrespuesta"), "respuesta")
         self.assertIsNone(last_message(""))
         self.assertIsNone(last_message("\n\n"))
+
+    def test_logs_are_fetched_one_entry_at_a_time(self):
+        from crew.state import LOGS_TAIL
+        self.assertEqual(LOGS_TAIL, 1)
 
 
 class ControlCharsTest(unittest.TestCase):

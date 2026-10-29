@@ -1,4 +1,3 @@
-[User] Responde solo con dos preguntas numeradas sobre cómo nombrar un archivo de prueba, cada una con tu recomendación, y termina con una línea final que diga exactamente: CREW: PREGUNTAS
 1. ¿Usamos el sufijo del framework (`*.test.ts` / `test_*.py`) o una carpeta `tests/` aparte? Te recomiendo el sufijo junto al archivo que prueba, porque lo encuentra cualquier runner sin configurar nada.
 
 2. ¿Nombramos el archivo por el módulo (`user-service.test.ts`) o por el comportamiento (`login-flow.test.ts`)? Te recomiendo nombrarlo por el módulo en las pruebas unitarias y por el comportamiento en las E2E.
