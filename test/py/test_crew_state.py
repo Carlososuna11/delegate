@@ -49,6 +49,8 @@ class StateTest(CrewFixture):
                 "Status": spec.get("status", "idle"),
                 "UpdatedAt": spec["rev"],
             }
+            if spec.get("archived"):
+                inspect[agent["id"]]["Archived"] = True
             if "message" in spec:
                 self.set_logs(agent["id"], spec["message"])
         self.set_inspect(inspect)
@@ -257,6 +259,29 @@ class StateTest(CrewFixture):
         proc = self.crew(["refresh"])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read_cache()["agents"], {})
+
+    def test_archived_agents_never_enter_the_cache(self):
+        agents = self.seed([
+            {"n": 1, "rev": "r1", "archived": True,
+             "message": "viejo\nCREW: ENTREGA"},
+            {"n": 2, "rev": "r2", "message": "¿A o B?\nCREW: PREGUNTAS"},
+        ])
+        proc = self.crew(["refresh"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        cache = self.read_cache()
+        self.assertEqual(sorted(cache["agents"]), [agents[1]["id"]])
+        # Dropped before its logs are asked for: the archive flag is enough.
+        self.assertEqual([call["argv"][1] for call in self.paseo_calls("logs")],
+                         [agents[1]["id"]])
+
+    def test_idle_agent_with_only_a_user_message_is_unknown(self):
+        # The last entry is the user's answer: the agent has not spoken yet.
+        agents = self.seed([{"n": 1, "rev": "r1",
+                             "message": "[User] 1 sí\n2 la b\n"}])
+        proc = self.crew(["refresh"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.read_cache()["agents"][agents[0]["id"]]["state"],
+                         "desconocido")
 
     def test_refresh_and_status_refuse_an_unconfigured_org_without_ssh(self):
         self.seed([{"n": 1, "rev": "r1", "message": "x\nCREW: PREGUNTAS"}])
@@ -541,7 +566,11 @@ class ClassifyTest(unittest.TestCase):
             ({"status": "idle"}, last_message(quoted), "turno-terminado"),
             ({"status": "idle"}, "sin marca", "turno-terminado"),
             ({"status": "idle"}, "CREW: ENTREGA\nmás texto", "turno-terminado"),
-            ({"status": "idle"}, None, "turno-terminado"),
+            # No agent message (the last entry is the user's, or empty): the
+            # agent has not finished anything this turn.
+            ({"status": "idle"}, None, "desconocido"),
+            ({"status": "idle"}, "", "desconocido"),
+            ({"status": "idle"}, " \n\t\n", "desconocido"),
             ({"status": "error"}, "x", "falló"),
             ({"status": "starting"}, "x", "desconocido"),
             ({}, "x", "desconocido"),

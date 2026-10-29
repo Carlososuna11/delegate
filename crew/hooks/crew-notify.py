@@ -2,13 +2,18 @@
 """Prompt hook of crew: announce what changed in this project.
 
 The harness feeds one event on stdin (`session_id`, `cwd`,
-`hook_event_name`). The hook resolves the project of `cwd` and prints one
-`hookSpecificOutput` line listing the assignments that finished, are waiting,
-are blocked or failed since this session last looked. It never talks to the
-host: it reads the per-project cache written by `crew refresh` and, when that
-cache is missing, corrupt or older than `REFRESH_AFTER`, starts a detached
-`crew refresh --cwd <cwd>` (`CREW_BIN`, or `bin/crew` of this repo). The
-single flight is the refresh lock of Task 3.
+`hook_event_name`, and on SessionStart a `source`). The hook resolves the
+project of `cwd` and prints one `hookSpecificOutput` line listing the
+assignments that finished, are waiting, are blocked or failed since this
+session last looked. A session seen for the first time is told only about the
+actionable ones (the finished history is seeded silently), and SessionStart
+with `source: compact` repeats the actionable ones because the context that
+carried them is gone. It never talks to the host: it reads the per-project
+cache written by `crew refresh` and, when that cache is missing, corrupt or
+older than `REFRESH_AFTER`, starts a detached `crew refresh --cwd <cwd>`
+(`CREW_BIN`, or `bin/crew` of this repo). A project whose owner is not in the
+personal config is silent and spawns nothing: the host is never contacted for
+it. The single flight is the refresh lock of Task 3.
 
 The line carries only fixed phrases and validated integers: never a title or
 any text an agent wrote, so nothing an agent says reaches the context this
@@ -56,6 +61,9 @@ PREFIX = "Encargos de este proyecto: "
 SUFFIX = '. Usa "crew status" para verlos.'
 # Only these states are announced; `trabajando` and `desconocido` are not.
 FINISHED = ("entregado", "turno-terminado")
+# States that ask something of the user. A session seen for the first time is
+# told only about these; after a compaction they are repeated.
+ACTIONABLE = ("esperando", "bloqueado", "falló")
 
 
 # The only events this hook is registered for; anything else stays silent, so
@@ -64,7 +72,11 @@ EVENTS = ("UserPromptSubmit", "SessionStart")
 
 
 def _event(raw):
-    """(session_id, cwd, event name) from the hook's stdin, or None."""
+    """(session_id, cwd, event name, source) from stdin, or None.
+
+    `source` is only meaningful on SessionStart ("startup", "compact", ...);
+    an unexpected value is treated as absent instead of dropping the event.
+    """
     try:
         data = json.loads(raw)
     except ValueError:
@@ -79,7 +91,10 @@ def _event(raw):
     session, cwd, name = values
     if name not in EVENTS or not os.path.isdir(cwd):
         return None
-    return session, cwd, name
+    source = data.get("source")
+    if not isinstance(source, str) or len(source) > MAX_FIELD:
+        source = None
+    return session, cwd, name, source
 
 
 def _number(value):
@@ -149,20 +164,30 @@ def _seen_with(seen, session, fresh, now):
     return kept
 
 
-def _announce(cache, session, now):
+def _announce(cache, session, now, compact=False):
     """The line for this session's novelties, marking them as seen.
 
-    Mutates `cache["seen"]` when there is something to announce and returns
-    the line; returns None (and touches nothing) otherwise.
+    A session seen for the first time is seeded with the revs of the agents
+    that already finished, without announcing them: a new session is not
+    flooded with history, but it is told about the actionable ones (and so is
+    every later turn). With `compact`, an actionable agent is announced again
+    even if its rev was already seen, because the context that carried the
+    line is gone; it stays marked as seen.
+
+    Mutates `cache["seen"]`; returns (line or None, changed). The caller
+    writes the cache when `changed`, so a first sighting is recorded even
+    when there is nothing to announce.
     """
     agents = cache.get("agents")
     agents = agents if isinstance(agents, dict) else {}
     seen = cache.get("seen")
     seen = seen if isinstance(seen, dict) else {}
     previous = seen.get(session)
-    revs = previous.get("revs") if isinstance(previous, dict) else None
+    known = isinstance(previous, dict)
+    revs = previous.get("revs") if known else None
     revs = revs if isinstance(revs, dict) else {}
     fresh = []
+    seeded = []
     for agent_id, agent in agents.items():
         if not isinstance(agent_id, str) or not isinstance(agent, dict):
             continue
@@ -170,19 +195,25 @@ def _announce(cache, session, now):
         rev = agent.get("rev")
         if number is None or not isinstance(rev, str) or not rev:
             continue
-        if revs.get(agent_id) == rev:
-            continue
         phrase = _phrase(agent.get("state"), number, agent.get("updated_at"),
                          now)
         if phrase is None:
             continue
-        fresh.append((number, phrase, agent_id, rev))
-    if not fresh:
-        return None
+        actionable = agent.get("state") in ACTIONABLE
+        item = (number, phrase, agent_id, rev)
+        if not known:
+            (fresh if actionable else seeded).append(item)
+            continue
+        if revs.get(agent_id) != rev or (compact and actionable):
+            fresh.append(item)
+    if known and not fresh and not seeded:
+        return None, False
     fresh.sort(key=lambda item: item[0])
-    cache["seen"] = _seen_with(seen, session, fresh, now)
+    cache["seen"] = _seen_with(seen, session, fresh + seeded, now)
+    if not fresh:
+        return None, True
     parts = " · ".join(item[1] for item in fresh)
-    return f"{PREFIX}{parts}{SUFFIX}"
+    return f"{PREFIX}{parts}{SUFFIX}", True
 
 
 def _spawn_refresh(cwd):
@@ -201,7 +232,7 @@ def _spawn_refresh(cwd):
         pass
 
 
-def _line(session, cwd):
+def _line(session, cwd, compact=False):
     """The line to inject for this event, or None when there is nothing new."""
     project = project_of(cwd)
     if project is None:
@@ -221,8 +252,8 @@ def _line(session, cwd):
         # with refreshed_at 0, so it is stale and silent at once.
         cache = state._read(slug)
         stale = now - cache.get("refreshed_at", 0.0) > REFRESH_AFTER
-        line = _announce(cache, session, now)
-        if line is not None:
+        line, changed = _announce(cache, session, now, compact)
+        if changed:
             state._write(slug, cache)
     if stale:
         _spawn_refresh(cwd)
@@ -236,8 +267,9 @@ def main():
         event = _event(sys.stdin.read())
         if event is None:
             return 0
-        session, cwd, name = event
-        line = _line(session, cwd)
+        session, cwd, name, source = event
+        compact = name == "SessionStart" and source == "compact"
+        line = _line(session, cwd, compact)
         if line is not None:
             payload = {"hookSpecificOutput": {"hookEventName": name,
                                               "additionalContext": line}}

@@ -15,9 +15,11 @@ hook (Task 4). `refresh` is the only writer here:
 
 `paseo ls` has no `UpdatedAt`, so the rev of each turn comes from one batched
 `paseo inspect` call per refresh. A rev is a turn, not a state: the same
-question asked in another turn is announced again. Logs are only fetched for
-idle agents whose rev changed (or whose cached state is not an idle one); a
-running agent is `trabajando` without asking for its text.
+question asked in another turn is announced again. `paseo ls -a` includes
+archived agents (so numbers are never reused), but an agent whose inspect says
+`Archived` never enters the cache. Logs are only fetched for idle agents whose
+rev changed (or whose cached state is not an idle one); a running agent is
+`trabajando` without asking for its text.
 """
 from __future__ import annotations
 
@@ -108,7 +110,11 @@ def strip_control(text: str | None) -> str | None:
 
 def classify(agent: dict, last_msg: str | None) -> str:
     """One of trabajando, esperando, entregado, bloqueado, turno-terminado,
-    falló or desconocido. Only the last non-empty line of `last_msg` counts."""
+    falló or desconocido. Only the last non-empty line of `last_msg` counts.
+
+    An idle agent with no agent message (the last log entry is the user's, or
+    it is empty) is `desconocido`: there is no finished turn to report.
+    """
     status = agent.get("status") if isinstance(agent, dict) else None
     status = status.lower() if isinstance(status, str) else ""
     if "error" in status:
@@ -118,6 +124,8 @@ def classify(agent: dict, last_msg: str | None) -> str:
     if status != "idle":
         return "desconocido"
     marker = _last_line(last_msg)
+    if marker is None:
+        return "desconocido"
     return {
         "CREW: PREGUNTAS": "esperando",
         "CREW: ENTREGA": "entregado",
@@ -248,6 +256,11 @@ def _collect(paseo: Paseo, slug: str, before: dict,
     result: dict[str, dict] = {}
     for agent_id, number, status in numbered:
         detail = details.get(agent_id)
+        if isinstance(detail, dict) and detail.get("Archived") is True:
+            # `paseo ls -a` includes archived agents so numbers are never
+            # reused, but an archived one never enters the cache: `status`
+            # and the hook only see live assignments.
+            continue
         rev = detail.get("UpdatedAt") if isinstance(detail, dict) else None
         if not isinstance(rev, str) or not rev:
             rev = None
