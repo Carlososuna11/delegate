@@ -309,6 +309,36 @@ class HookTest(CrewFixture):
         seen = self.read_cache()["seen"]
         self.assertEqual(sorted(seen), ["otra", "reciente"])
 
+    def test_expired_own_session_keeps_its_revs(self):
+        now = time.time()
+        self.write_cache(
+            {"a": self.entry(1, "entregado", "r1", 600),
+             "b": self.entry(2, "entregado", "r3", 5)},
+            seen={"sesion-1": {"at": now - 8 * 24 * 3600,
+                               "revs": {"a": "r1", "b": "r2"}}})
+        self.assertEqual(
+            self.run_context(self.event()),
+            'Encargos de este proyecto: #2 terminó. Usa "crew status" para verlos.')
+        # #1 did not change: the next turn must not announce it as new.
+        proc = self.run_hook(self.event())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(self.read_cache()["seen"]["sesion-1"]["revs"],
+                         {"a": "r1", "b": "r3"})
+
+    def test_never_refreshed_cache_does_not_register_the_session(self):
+        # The first event finds no cache: nothing is known yet, so the
+        # session must stay unseen and be seeded by the first real cache.
+        self.state.mkdir(parents=True, exist_ok=True)
+        proc = self.run_hook(self.event())
+        self.assertEqual(proc.stdout, "")
+        self.assertNotIn("sesion-1", self.read_cache().get("seen", {})
+                         if self.cache_file().exists() else {})
+        self.write_cache({"a": self.entry(1, "entregado", "r1", 600)})
+        proc = self.run_hook(self.event())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
     # -- staleness and refresh -----------------------------------------------
 
     def test_fresh_cache_does_not_spawn_refresh(self):

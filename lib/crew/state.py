@@ -150,7 +150,8 @@ def _last_line(message: str | None) -> str | None:
 
 def state_dir() -> Path:
     raw = os.environ.get(STATE_ENV) or ""
-    directory = Path(raw) if raw else Path.home() / ".local" / "state" / "crew"
+    directory = (Path(raw).expanduser() if raw
+                 else Path.home() / ".local" / "state" / "crew")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         os.chmod(directory, 0o700)
@@ -251,6 +252,19 @@ def refresh(slug: str, paseo: Paseo, timeout: float | None = None) -> dict:
         with lock(f"{slug}.cache.lock", blocking=True):
             current = _read(slug)
             current["refreshed_at"] = time.time()
+            # An answer sent while the host was being asked marked its agent
+            # working: the snapshot predates that mark, so it wins for the
+            # same rev. Only a mark made during this refresh counts.
+            earlier = before.get("agents")
+            earlier = earlier if isinstance(earlier, dict) else {}
+            for agent_id, entry in agents.items():
+                old = current["agents"].get(agent_id)
+                was = earlier.get(agent_id)
+                if (isinstance(old, dict) and old.get("state") == "trabajando"
+                        and old.get("rev") == entry.get("rev")
+                        and not (isinstance(was, dict)
+                                 and was.get("state") == "trabajando")):
+                    entry["state"] = "trabajando"
             current["agents"] = agents
             if not isinstance(current.get("seen"), dict):
                 current["seen"] = {}

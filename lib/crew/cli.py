@@ -72,7 +72,9 @@ def _options(args: list[str], spec: dict[str, bool]) -> dict:
         name = args[i]
         if name not in spec:
             raise CrewError(f"opción desconocida: {name}", 2)
-        if i + 1 >= len(args) or not args[i + 1] or args[i + 1].startswith("-"):
+        # A value may start with a dash ("- no tocar migraciones"); only an
+        # option name is never taken as one.
+        if i + 1 >= len(args) or not args[i + 1] or args[i + 1] in spec:
             raise CrewError(f"{name} necesita un valor", 2)
         value = args[i + 1]
         if spec[name]:
@@ -147,9 +149,13 @@ def cmd_brief(opts: dict) -> int:
     cwd = os.getcwd()
     project = _project_for(cwd)
     base = opts.get("--base") or _current_branch(cwd)
+    try:
+        contract = load_contract()
+    except OSError:
+        raise CrewError("no pude leer el contrato de crew", 2) from None
     brief = build_brief(words, f"{project.owner}/{project.repo}", base,
                         opts.get("--decision", []), opts.get("--constraint", []),
-                        load_contract())
+                        contract)
     sys.stdout.write(brief)
     return 0
 
@@ -243,9 +249,10 @@ def cmd_questions(args: list[str]) -> int:
     paseo = _paseo_for(project)
     agent = resolve(paseo.ls(project.slug), number)
     message = last_message(paseo.logs(agent["id"], LOGS_TAIL))
-    if message is None:
+    text = without_marker(message) if message is not None else ""
+    if not (strip_control(text) or "").strip():
         raise CrewError(f"el encargo #{number} no tiene un mensaje que mostrar", 1)
-    sys.stdout.write(_quoted(number, without_marker(message)))
+    sys.stdout.write(_quoted(number, text))
     return 0
 
 
@@ -291,37 +298,49 @@ def cmd_cancel(args: list[str]) -> int:
     return 0
 
 
+def _dispatch(command: str, rest: list[str]) -> int:
+    if command == "launch":
+        opts = _options(rest, _LAUNCH_OPTIONS)
+        _require(opts, ("--title", "--brief-file"))
+        return cmd_launch(opts)
+    if command == "brief":
+        opts = _options(rest, _BRIEF_OPTIONS)
+        _require(opts, ("--words-file",))
+        return cmd_brief(opts)
+    if command == "refresh":
+        return cmd_refresh(_options(rest, _CWD_OPTIONS))
+    if command == "status":
+        return cmd_status(_options(rest, _CWD_OPTIONS))
+    if command == "questions":
+        return cmd_questions(rest)
+    if command == "answer":
+        return cmd_answer(rest)
+    if command == "cancel":
+        return cmd_cancel(rest)
+    raise CrewError(f"subcomando desconocido: {command}", 2)
+
+
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help", "help"):
         sys.stdout.write(USAGE)
         return 0
-    command, rest = argv[0], argv[1:]
     try:
-        if command == "launch":
-            opts = _options(rest, _LAUNCH_OPTIONS)
-            _require(opts, ("--title", "--brief-file"))
-            return cmd_launch(opts)
-        if command == "brief":
-            opts = _options(rest, _BRIEF_OPTIONS)
-            _require(opts, ("--words-file",))
-            return cmd_brief(opts)
-        if command == "refresh":
-            return cmd_refresh(_options(rest, _CWD_OPTIONS))
-        if command == "status":
-            return cmd_status(_options(rest, _CWD_OPTIONS))
-        if command == "questions":
-            return cmd_questions(rest)
-        if command == "answer":
-            return cmd_answer(rest)
-        if command == "cancel":
-            return cmd_cancel(rest)
-        raise CrewError(f"subcomando desconocido: {command}", 2)
+        code = _dispatch(argv[0], argv[1:])
+        # Flushed here, not at exit: a reader that went away must land in
+        # the handler below, not in an "Exception ignored" at shutdown.
+        sys.stdout.flush()
+        return code
     except SecretInBrief as exc:
         _error(str(exc))
         return 2
     except CrewError as exc:
         _error(str(exc))
         return exc.code
+    except BrokenPipeError:
+        # Whoever read us went away (a pager, `head`): the work is done.
+        # Point stdout at /dev/null so the exit flush does not fail again.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 0
     except OSError:
         # The state directory could not be used (permissions, a file in the
         # way): a short line, never a traceback.

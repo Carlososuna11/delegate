@@ -146,7 +146,8 @@ def resolve(agents: list[dict], n: int) -> dict:
     """The single agent titled `#<n> · ...`."""
     matches = [agent for agent in agents
                if isinstance(agent.get("name"), str)
-               and agent["name"].startswith(f"#{n} · ")]
+               and agent["name"].startswith(f"#{n} · ")
+               and isinstance(agent.get("id"), str) and agent["id"]]
     if not matches:
         raise CrewError(f"no hay encargo #{n} en este proyecto", 2)
     if len(matches) > 1:

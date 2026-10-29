@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from test.py.test_crew_launch import BIN, CrewFixture, SLUG
@@ -344,6 +345,28 @@ class StateTest(CrewFixture):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("no hay encargo #9 en este proyecto", proc.stderr)
 
+    def test_questions_with_only_the_marker_says_there_is_nothing(self):
+        self.seed([{"n": 2, "rev": "r1", "message": "CREW: PREGUNTAS"}])
+        proc = self.crew(["questions", "2"])
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("no tiene un mensaje que mostrar", proc.stderr)
+
+    def test_closed_stdout_is_not_reported_as_a_state_dir_error(self):
+        self.seed([{"n": 2, "rev": "r1", "message": "¿A o B?\nCREW: PREGUNTAS"}])
+        # The reader goes away before crew writes (a pager, `head`).
+        proc = subprocess.Popen([str(BIN), "questions", "2"], cwd=str(self.repo),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=self.environment())
+        proc.stdout.close()
+        stderr = proc.stderr.read()
+        proc.wait(timeout=60)
+        proc.stderr.close()
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertNotIn("directorio de estado", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertNotIn("BrokenPipe", stderr)
+
     def test_status_lists_open_questions(self):
         self.seed([
             {"n": 1, "rev": "r1", "message": "nada que ver\nCREW: ENTREGA"},
@@ -605,3 +628,50 @@ class ClassifyTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class RefreshMergeTest(unittest.TestCase):
+    """An answer sent while a refresh asks the host is not undone by it."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = unittest.mock.patch.dict(
+            os.environ, {"CREW_STATE_DIR": self.tmp.name})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def fake(self, during_inspect):
+        agent_id = "a" * 8
+
+        class Fake:
+            def ls(self, slug, timeout=20):
+                return [{"id": agent_id, "name": "#1 · x", "status": "idle"}]
+
+            def inspect_many(self, ids, timeout=20):
+                during_inspect()
+                return {agent_id: {"UpdatedAt": "r1"}}
+
+            def logs(self, agent_id, tail, timeout=20):
+                return "¿A o B?\nCREW: PREGUNTAS"
+
+        return agent_id, Fake()
+
+    def test_a_mark_made_during_the_refresh_survives(self):
+        from crew import state
+        marks = []
+        agent_id, paseo = self.fake(lambda: [state.mark_working("o.r", agent_id, 1)
+                                             for _ in marks])
+        state.refresh("o.r", paseo)  # the cache now says esperando, rev r1
+        marks.append(1)  # the answer lands while the next refresh asks
+        cache = state.refresh("o.r", paseo)
+        self.assertEqual(cache["agents"][agent_id]["state"], "trabajando")
+
+    def test_an_older_mark_is_replaced_by_what_the_host_says(self):
+        from crew import state
+        agent_id, paseo = self.fake(lambda: None)
+        state.mark_working("o.r", agent_id, 1)
+        cache = state.refresh("o.r", paseo)
+        self.assertEqual(cache["agents"][agent_id]["state"], "esperando")

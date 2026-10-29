@@ -32,7 +32,7 @@ def parse_remote(url: str | None) -> Project | None:
     if not match:
         return None
     owner, repo = match.group("owner"), match.group("repo")
-    if owner in (".", "..") or repo in (".", ".."):
+    if repo in (".", ".."):
         return None
     return Project(owner=owner, repo=repo, slug=f"{owner}.{repo}".lower())
 

@@ -543,6 +543,23 @@ class CrewTest(CrewFixture):
         self.assertIn("- nada de migraciones", proc.stdout)
         self.assertIn("- no toques el módulo de exports", proc.stdout)
 
+    def test_brief_values_may_start_with_a_dash(self):
+        words = self.tmp / "words.md"
+        words.write_text("arregla el botón X\n", encoding="utf-8")
+        proc = self.crew(["brief", "--words-file", str(words), "--base", "main",
+                          "--decision", "- no tocar migraciones",
+                          "--constraint", "--force nunca"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("- - no tocar migraciones", proc.stdout)
+        self.assertIn("- --force nunca", proc.stdout)
+
+    def test_an_option_name_is_never_taken_as_a_value(self):
+        words = self.tmp / "words.md"
+        words.write_text("x\n", encoding="utf-8")
+        proc = self.crew(["brief", "--decision", "--words-file", str(words)])
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--decision necesita un valor", proc.stderr)
+
     def test_brief_command_refuses_a_secret(self):
         words = self.tmp / "words.md"
         words.write_text("usa la key ghp_" + "a" * 36 + "\n", encoding="utf-8")
@@ -575,6 +592,9 @@ class NumberingAndResolveTest(unittest.TestCase):
         with self.assertRaises(CrewError) as cm:
             resolve([one, two], 5)
         self.assertIn("hay dos encargos #5; usa el id", str(cm.exception))
+        # An entry without an id is not an encargo crew can act on.
+        with self.assertRaises(CrewError):
+            resolve([{"name": "#7 · sin id"}], 7)
 
 
 class ProjectTest(unittest.TestCase):

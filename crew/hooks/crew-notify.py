@@ -155,10 +155,12 @@ def _seen_with(seen, session, fresh, now):
         if not isinstance(at, (int, float)) or now - at > SEEN_TTL:
             continue
         kept[key] = value
-    previous = kept.get(session)
+    # Read from the unpruned map: a session idle past the TTL is still
+    # rewritten below with `at = now`, and must keep the revs it had.
+    previous = seen.get(session)
     revs = previous.get("revs") if isinstance(previous, dict) else None
     revs = dict(revs) if isinstance(revs, dict) else {}
-    for _number_, _phrase_, agent_id, rev in fresh:
+    for _, _, agent_id, rev in fresh:
         revs[agent_id] = rev
     kept[session] = {"at": now, "revs": revs}
     return kept
@@ -184,6 +186,10 @@ def _announce(cache, session, now, compact=False):
     seen = seen if isinstance(seen, dict) else {}
     previous = seen.get(session)
     known = isinstance(previous, dict)
+    if not known and not cache.get("refreshed_at"):
+        # A cache that was never refreshed knows nothing: registering the
+        # session now would make the whole history look new later.
+        return None, False
     revs = previous.get("revs") if known else None
     revs = revs if isinstance(revs, dict) else {}
     fresh = []
@@ -206,7 +212,7 @@ def _announce(cache, session, now, compact=False):
             continue
         if revs.get(agent_id) != rev or (compact and actionable):
             fresh.append(item)
-    if known and not fresh and not seeded:
+    if known and not fresh:
         return None, False
     fresh.sort(key=lambda item: item[0])
     cache["seen"] = _seen_with(seen, session, fresh + seeded, now)
