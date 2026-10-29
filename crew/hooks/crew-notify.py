@@ -41,6 +41,7 @@ def _bootstrap():
 try:
     _ROOT = _bootstrap()
     from crew import state  # noqa: E402
+    from crew.config import destination_for, load_config  # noqa: E402
     from crew.project import project_of  # noqa: E402
 except Exception:  # an installed tree out of place: never break the session
     sys.exit(0)
@@ -204,6 +205,14 @@ def _line(session, cwd):
     """The line to inject for this event, or None when there is nothing new."""
     project = project_of(cwd)
     if project is None:
+        return None
+    # A project with no destination in the personal config is not crew's:
+    # stay silent and spawn nothing, so the host is never contacted for it.
+    try:
+        config = load_config()
+    except Exception:
+        return None
+    if destination_for(config, project.owner) is None:
         return None
     slug = project.slug
     now = time.time()

@@ -127,6 +127,35 @@ class HookTest(CrewFixture):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
 
+    def test_org_not_in_config_is_silent_and_spawns_nothing(self):
+        self.set_origin("git@github.com:Carlososuna11/x.git")
+        bad_config = self.tmp / "config-mala.json"
+        bad_config.write_text("{no json", encoding="utf-8")
+        cases = {
+            "otra organización": {},
+            "config ausente": {"CREW_CONFIG": str(self.tmp / "sin-config.json")},
+            "config inválida": {"CREW_CONFIG": str(bad_config)},
+        }
+        for label, env in cases.items():
+            with self.subTest(case=label):
+                # A stale cache would be refreshed by a hook that got that
+                # far, so an empty mark afterwards means no contact at all.
+                self.write_cache({"a": self.entry(1, "esperando", "r1", 40)},
+                                 refreshed_at=time.time() - 3600)
+                if self.mark.exists():
+                    self.mark.unlink()
+                proc = self.run_hook(self.event(), env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                time.sleep(0.3)
+                self.assertEqual(self.mark_lines(), [])
+
+    def test_owner_is_matched_case_insensitively(self):
+        self.set_origin("git@github.com:innovares/datago.git")
+        self.write_cache({"a": self.entry(1, "esperando", "r1", 40)})
+        line = self.run_context(self.event())
+        self.assertIn("#1 espera tu respuesta", line)
+
     def test_invalid_event_is_silent(self):
         good = self.event()
         cases = {

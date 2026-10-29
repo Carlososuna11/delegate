@@ -484,6 +484,19 @@ class CrewTest(CrewFixture):
         self.assertIn("este proyecto no tiene destino en caracas", proc.stderr)
         self.assertEqual(self.calls(), [])
 
+    def test_owner_match_is_case_insensitive(self):
+        # GitHub owners are case-insensitive, and so is the config lookup.
+        cases = [("git@github.com:innovares/datago.git", "Innovares"),
+                 ("git@github.com:INNOVARES/datago.git", "innovares")]
+        for origin, owner in cases:
+            with self.subTest(origin=origin, owner=owner):
+                self.set_origin(origin)
+                self.config.write_text(json.dumps({
+                    "host": "caracas", "orgs": {owner: REMOTE_CWD},
+                }), encoding="utf-8")
+                proc = self.launch()
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_no_origin_refuses(self):
         self.git("remote", "remove", "origin")
         proc = self.launch()

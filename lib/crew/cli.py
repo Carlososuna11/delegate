@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .brief import SecretInBrief, build_brief, check_secrets, load_contract
+from .config import NO_DESTINATION, destination_for, load_config
 from .paseo import (CrewError, Paseo, check_brief, next_number, resolve,
                     ssh_prefix)
 from .project import project_of
@@ -47,9 +48,6 @@ USAGE = """uso: crew launch --title T --brief-file F [--cwd DIR]
        crew cancel N
 """
 
-DEFAULT_HOST = "caracas"
-CONFIG_ENV = "CREW_CONFIG"
-
 _LAUNCH_OPTIONS = {"--title": False, "--brief-file": False, "--cwd": False}
 _BRIEF_OPTIONS = {"--words-file": False, "--base": False,
                   "--decision": True, "--constraint": True}
@@ -58,33 +56,6 @@ _CWD_OPTIONS = {"--cwd": False}
 
 def _error(message: str) -> None:
     sys.stderr.write(f"crew: {message}\n")
-
-
-def config_path() -> Path:
-    raw = os.environ.get(CONFIG_ENV) or ""
-    return Path(raw).expanduser() if raw else Path.home() / ".config" / "crew" / "config.json"
-
-
-def load_config() -> dict:
-    """The personal destinations. A missing file means no destinations."""
-    path = config_path()
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return {"host": DEFAULT_HOST, "orgs": {}}
-    except (OSError, ValueError) as exc:
-        raise CrewError(f"no pude leer la config de crew ({path}): {exc}", 2) from None
-    if not isinstance(data, dict):
-        raise CrewError("la config de crew tiene que ser un objeto JSON", 2)
-    orgs = data.get("orgs", {})
-    if not isinstance(orgs, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in orgs.items()):
-        raise CrewError("orgs en la config de crew tiene que ser un objeto de textos", 2)
-    host = data.get("host", DEFAULT_HOST)
-    if not isinstance(host, str):
-        raise CrewError("host en la config de crew tiene que ser texto", 2)
-    return {"host": host, "orgs": orgs}
 
 
 @contextmanager
@@ -163,12 +134,8 @@ def cmd_launch(opts: dict) -> int:
     project = project_of(cwd)
     if project is None:
         raise CrewError("no encuentro el repo de esta carpeta", 2)
-    config = load_config()
-    destination = config["orgs"].get(project.owner)
-    if destination is None:
-        raise CrewError("este proyecto no tiene destino en caracas", 2)
+    paseo, destination = _target(project)
 
-    paseo = Paseo(config["host"], ssh_prefix())
     with _launch_lock(project.slug):
         number = next_number(paseo.ls(project.slug))
         full_title = f"#{number} · {title}"
@@ -200,8 +167,21 @@ def _project_for(cwd: str):
     return project
 
 
-def _paseo() -> Paseo:
-    return Paseo(load_config()["host"], ssh_prefix())
+def _target(project) -> tuple[Paseo, str]:
+    """The runtime for this project and its remote cwd, or a refusal.
+
+    A project whose owner is not in the config never reaches the host: the
+    same refusal is used by every command that would talk to it.
+    """
+    config = load_config()
+    destination = destination_for(config, project.owner)
+    if destination is None:
+        raise CrewError(NO_DESTINATION, 2)
+    return Paseo(config["host"], ssh_prefix()), destination
+
+
+def _paseo_for(project) -> Paseo:
+    return _target(project)[0]
 
 
 def _number_arg(args: list[str]) -> int:
@@ -242,13 +222,13 @@ def _question_block(number: int, agent_id: str, paseo: Paseo) -> str:
 
 def cmd_refresh(opts: dict) -> int:
     project = _project_for(opts.get("--cwd") or os.getcwd())
-    refresh(project.slug, _paseo())
+    refresh(project.slug, _paseo_for(project))
     return 0
 
 
 def cmd_status(opts: dict) -> int:
     project = _project_for(opts.get("--cwd") or os.getcwd())
-    paseo = _paseo()
+    paseo = _paseo_for(project)
     cache = refresh(project.slug, paseo)
     entries = sorted(
         ((int(entry["n"]), agent_id, entry)
@@ -273,7 +253,7 @@ def cmd_status(opts: dict) -> int:
 def cmd_questions(args: list[str]) -> int:
     number = _number_arg(args)
     project = _project_for(os.getcwd())
-    paseo = _paseo()
+    paseo = _paseo_for(project)
     agent = resolve(paseo.ls(project.slug), number)
     message = last_message(paseo.logs(agent["id"], LOGS_TAIL))
     if message is None:
@@ -290,7 +270,7 @@ def cmd_answer(args: list[str]) -> int:
     if not answer.strip():
         raise CrewError("la respuesta está vacía; escribe lo que quieres responder", 2)
     project = _project_for(os.getcwd())
-    paseo = _paseo()
+    paseo = _paseo_for(project)
     # The launch lock serializes answers (and launches): two chats must not
     # answer the same turn twice.
     with _launch_lock(project.slug):
@@ -317,7 +297,7 @@ def cmd_answer(args: list[str]) -> int:
 def cmd_cancel(args: list[str]) -> int:
     number = _number_arg(args)
     project = _project_for(os.getcwd())
-    paseo = _paseo()
+    paseo = _paseo_for(project)
     agent = resolve(paseo.ls(project.slug), number)
     paseo.stop(agent["id"])
     sys.stdout.write(f"encargo #{number} cancelado\n")

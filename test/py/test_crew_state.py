@@ -258,6 +258,28 @@ class StateTest(CrewFixture):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read_cache()["agents"], {})
 
+    def test_refresh_and_status_refuse_an_unconfigured_org_without_ssh(self):
+        self.seed([{"n": 1, "rev": "r1", "message": "x\nCREW: PREGUNTAS"}])
+        self.set_origin("git@github.com:Carlososuna11/x.git")
+        for command in ("refresh", "status"):
+            with self.subTest(command=command):
+                proc = self.crew([command])
+                self.assertEqual(proc.returncode, 2)
+                self.assertIn("este proyecto no tiene destino en caracas",
+                              proc.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_refresh_and_status_refuse_a_missing_config_without_ssh(self):
+        self.seed([{"n": 1, "rev": "r1", "message": "x\nCREW: PREGUNTAS"}])
+        env = {"CREW_CONFIG": str(self.tmp / "sin-config.json")}
+        for command in ("refresh", "status"):
+            with self.subTest(command=command):
+                proc = self.crew([command], env=env)
+                self.assertEqual(proc.returncode, 2)
+                self.assertIn("este proyecto no tiene destino en caracas",
+                              proc.stderr)
+                self.assertEqual(self.calls(), [])
+
     # -- questions and status -------------------------------------------------
 
     def test_questions_are_quoted_untrusted(self):
