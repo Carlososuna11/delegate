@@ -28,6 +28,11 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # a key; a real `sk-...` value is never glued to a preceding word.
     ("clave de API", re.compile(r"(?<![\w-])sk-[A-Za-z0-9_-]{20,}")),
     ("clave de AWS", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("clave de Stripe", re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}")),
+    ("token de Slack", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("clave de Google", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
+    ("token JWT", re.compile(
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("clave privada", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("URL con credenciales", re.compile(r"\w+://[^\s/:@]+:[^\s/@]+@")),
     # Keyword anywhere in the name, any case, at the start of the name too:

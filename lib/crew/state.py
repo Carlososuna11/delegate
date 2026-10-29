@@ -59,6 +59,9 @@ ANSI_RE = re.compile(
 # C0 controls except tab (\x09) and newline (\x0a), DEL, and the C1 range
 # (8-bit CSI/OSC/DCS), which some terminals honour in UTF-8 mode.
 CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Bidi overrides, embeddings and isolates, zero-width characters and the BOM:
+# they do not print, but they can reorder or hide the text that does.
+INVISIBLE_RE = re.compile("[\u200b-\u200d\u2060\u202a-\u202e\u2066-\u2069\ufeff]")
 
 # `owner.repo`, lowercase: safe as a file name and as a remote label.
 SLUG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
@@ -96,16 +99,19 @@ def without_marker(message: str) -> str:
 
 
 def strip_control(text: str | None) -> str | None:
-    """The text without ANSI escapes or C0 controls (tab and newline stay).
+    """The text without ANSI escapes, controls or invisible characters.
 
     Agent text is untrusted and may carry terminal control sequences; the CLI
     only shows it as a quote, so the bytes that would act on a terminal (or
-    hide content) are removed before quoting. DEL goes too. An unterminated
+    hide or reorder content) are removed before quoting. Tab and newline
+    stay; DEL and the bidi/zero-width characters go too. An unterminated
     escape sequence consumes what follows it, as a terminal would.
     """
     if not isinstance(text, str):
         return None
-    return CONTROL_RE.sub("", ANSI_RE.sub("", text))
+    text = ANSI_RE.sub("", text)
+    text = CONTROL_RE.sub("", text)
+    return INVISIBLE_RE.sub("", text)
 
 
 def classify(agent: dict, last_msg: str | None) -> str:
@@ -160,8 +166,26 @@ def cache_path(slug: str) -> Path:
 def load_cache(slug: str) -> dict:
     """The project cache under the short cache lock."""
     slug = _check_slug(slug)
-    with _lock(f"{slug}.cache.lock", blocking=True):
+    with lock(f"{slug}.cache.lock", blocking=True):
         return _read(slug)
+
+
+@contextmanager
+def locked_cache(slug: str):
+    """The cache under the short write lock, plus a function that stores it.
+
+    One critical section for a read-modify-write from outside this module
+    (the hook): the cache read here cannot lose a `seen` written meanwhile,
+    and `write` publishes it atomically with the same rules as `refresh`.
+    """
+    slug = _check_slug(slug)
+    with lock(f"{slug}.cache.lock", blocking=True):
+        cache = _read(slug)
+
+        def write(data: dict) -> None:
+            _write(slug, data)
+
+        yield cache, write
 
 
 def fresh_state(paseo: Paseo, agent: dict) -> str:
@@ -194,7 +218,7 @@ def mark_working(slug: str, agent_id: str, number: int) -> None:
         raise CrewError(f"id de encargo inválido: {agent_id!r}", 2)
     if not isinstance(number, int):
         raise CrewError("número de encargo inválido", 2)
-    with _lock(f"{slug}.cache.lock", blocking=True):
+    with lock(f"{slug}.cache.lock", blocking=True):
         cache = _read(slug)
         entry = cache["agents"].get(agent_id)
         if isinstance(entry, dict):
@@ -214,7 +238,7 @@ def refresh(slug: str, paseo: Paseo, timeout: float | None = None) -> dict:
     """
     slug = _check_slug(slug)
     limit = _limit(timeout)
-    with _lock(f"{slug}.refresh.lock", blocking=False) as acquired:
+    with lock(f"{slug}.refresh.lock", blocking=False) as acquired:
         if not acquired:
             return load_cache(slug)
         before = load_cache(slug)
@@ -224,7 +248,7 @@ def refresh(slug: str, paseo: Paseo, timeout: float | None = None) -> dict:
         except CrewError as exc:
             raise CrewError(f"{exc}; la caché anterior quedó igual",
                             exc.code) from None
-        with _lock(f"{slug}.cache.lock", blocking=True):
+        with lock(f"{slug}.cache.lock", blocking=True):
             current = _read(slug)
             current["refreshed_at"] = time.time()
             current["agents"] = agents
@@ -315,8 +339,12 @@ def _check_slug(slug: str) -> str:
 
 
 @contextmanager
-def _lock(name: str, blocking: bool):
-    """An flock on `<state>/<name>`, yielding whether it was acquired."""
+def lock(name: str, blocking: bool = True):
+    """An flock on `<state>/<name>`, yielding whether it was acquired.
+
+    Public because the CLI serializes launches with the same primitive, in
+    the same directory, instead of duplicating the flock dance.
+    """
     path = state_dir() / name
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     acquired = False

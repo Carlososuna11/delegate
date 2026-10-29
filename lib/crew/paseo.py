@@ -28,7 +28,9 @@ import uuid
 # optionally user@, never an option and never something ssh reads as host:path.
 HOST_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9_.-]{0,252}"
                      r"(?:@[A-Za-z0-9_][A-Za-z0-9_.-]{0,252})?\Z")
-ID_RE = re.compile(r"\A[0-9a-f-]{7,36}\Z")
+# 7-36 characters of a UUID-shaped id, starting with a hex digit: a leading
+# "-" would read as an option on the host's command line.
+ID_RE = re.compile(r"\A[0-9a-f][0-9a-f-]{6,35}\Z")
 # Rest of a `~/...` destination: plain path characters, no `..` segment.
 TILDE_PATH_RE = re.compile(r"\A[A-Za-z0-9._/-]+\Z")
 # A title starts with the assignment number: "#4 · algo".
@@ -249,11 +251,7 @@ class Paseo:
         details: dict[str, dict | None] = {}
         for index, agent_id in enumerate(ids):
             raw = blocks[index + 1] if index + 1 < len(blocks) else ""
-            detail = _parse_inspect(raw)
-            if isinstance(detail, dict) and isinstance(detail.get("Id"), str) \
-                    and detail["Id"] != agent_id:
-                detail = None
-            details[agent_id] = detail
+            details[agent_id] = _checked_inspect(raw, agent_id)
         return details
 
     def inspect_and_logs(self, agent_id: str, tail: int,
@@ -289,10 +287,7 @@ class Paseo:
                 logs_lines.append(line)
             else:
                 inspect_lines.append(line)
-        detail = _parse_inspect("\n".join(inspect_lines))
-        if isinstance(detail, dict) and isinstance(detail.get("Id"), str) \
-                and detail["Id"] != agent_id:
-            detail = None
+        detail = _checked_inspect("\n".join(inspect_lines), agent_id)
         return detail, "\n".join(logs_lines)
 
     def launch(self, title: str, cwd: str, slug: str, brief: str) -> str:
@@ -382,6 +377,15 @@ def _parse_inspect(raw: str) -> dict | None:
     except ValueError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _checked_inspect(raw: str, agent_id: str) -> dict | None:
+    """`_parse_inspect` of `raw`, refusing a block that names another agent."""
+    detail = _parse_inspect(raw)
+    if isinstance(detail, dict) and isinstance(detail.get("Id"), str) \
+            and detail["Id"] != agent_id:
+        return None
+    return detail
 
 
 def _last_id(stdout: str) -> str | None:

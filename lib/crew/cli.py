@@ -22,7 +22,6 @@ Locks live in `$CREW_STATE_DIR` or `~/.local/state/crew`.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import subprocess
@@ -36,7 +35,7 @@ from .paseo import (CrewError, Paseo, check_brief, next_number, resolve,
                     ssh_prefix)
 from .project import project_of
 from .state import (LOGS_TAIL, QUESTIONS_HEADER, fresh_state, last_message,
-                    mark_working, refresh, state_dir, strip_control,
+                    lock, mark_working, refresh, strip_control,
                     without_marker)
 
 USAGE = """uso: crew launch --title T --brief-file F [--cwd DIR]
@@ -61,16 +60,8 @@ def _error(message: str) -> None:
 @contextmanager
 def _launch_lock(slug: str):
     """One launch at a time per project: the number is read and consumed here."""
-    path = state_dir() / f"{slug}.launch.lock"
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with lock(f"{slug}.launch.lock", blocking=True):
         yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
 
 
 def _options(args: list[str], spec: dict[str, bool]) -> dict:
@@ -121,6 +112,13 @@ def _current_branch(cwd: str) -> str:
     return proc.stdout.strip()
 
 
+def _project_for(cwd: str):
+    project = project_of(cwd)
+    if project is None:
+        raise CrewError("no encuentro el repo de esta carpeta", 2)
+    return project
+
+
 def cmd_launch(opts: dict) -> int:
     title = opts["--title"]
     # The title travels in the remote argv, quoted: it goes through the same
@@ -131,9 +129,7 @@ def cmd_launch(opts: dict) -> int:
     check_brief(brief)
 
     cwd = opts.get("--cwd") or os.getcwd()
-    project = project_of(cwd)
-    if project is None:
-        raise CrewError("no encuentro el repo de esta carpeta", 2)
+    project = _project_for(cwd)
     paseo, destination = _target(project)
 
     with _launch_lock(project.slug):
@@ -149,22 +145,13 @@ def cmd_launch(opts: dict) -> int:
 def cmd_brief(opts: dict) -> int:
     words = _read_text(opts["--words-file"], "el dictado")
     cwd = os.getcwd()
-    project = project_of(cwd)
-    if project is None:
-        raise CrewError("no encuentro el repo de esta carpeta", 2)
+    project = _project_for(cwd)
     base = opts.get("--base") or _current_branch(cwd)
     brief = build_brief(words, f"{project.owner}/{project.repo}", base,
                         opts.get("--decision", []), opts.get("--constraint", []),
                         load_contract())
     sys.stdout.write(brief)
     return 0
-
-
-def _project_for(cwd: str):
-    project = project_of(cwd)
-    if project is None:
-        raise CrewError("no encuentro el repo de esta carpeta", 2)
-    return project
 
 
 def _target(project) -> tuple[Paseo, str]:
@@ -335,3 +322,10 @@ def main(argv: list[str]) -> int:
     except CrewError as exc:
         _error(str(exc))
         return exc.code
+    except OSError:
+        # The state directory could not be used (permissions, a file in the
+        # way): a short line, never a traceback.
+        _error("no pude usar el directorio de estado")
+        return 2
+    except KeyboardInterrupt:
+        return 130

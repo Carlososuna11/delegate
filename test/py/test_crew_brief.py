@@ -102,6 +102,23 @@ class BuildBriefTest(unittest.TestCase):
             check_secrets("usa " + s)
         self.assertNotIn(s, str(cm.exception))
 
+    def test_rejects_more_provider_secrets(self):
+        secrets = {
+            "stripe live": "sk_" + "live_" + "A" * 24,
+            "stripe restricted": "rk_" + "test_" + "b" * 24,
+            "slack bot": "xoxb-" + "1234567890" + "-abcdefghij",
+            "google api": "AIza" + "C" * 35,
+            "jwt": "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12,
+        }
+        for label, s in secrets.items():
+            with self.subTest(secret=label):
+                with self.assertRaises(SecretInBrief) as cm:
+                    check_secrets("contexto\n" + s)
+                self.assertNotIn(s, str(cm.exception))
+
+    def test_provider_prefixes_without_a_value_pass(self):
+        check_secrets("los prefijos sk_live_, xoxb-, AIza y eyJ no se copian")
+
     def test_collapses_whitespace_in_structured_fields(self):
         b = build_brief(
             "x",

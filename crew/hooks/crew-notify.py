@@ -247,14 +247,13 @@ def _line(session, cwd, compact=False):
         return None
     slug = project.slug
     now = time.time()
-    with state._lock(f"{slug}.cache.lock", blocking=True):
+    with state.locked_cache(slug) as (cache, write):
         # Task 3's reader: a missing or corrupt cache comes back empty and
         # with refreshed_at 0, so it is stale and silent at once.
-        cache = state._read(slug)
         stale = now - cache.get("refreshed_at", 0.0) > REFRESH_AFTER
         line, changed = _announce(cache, session, now, compact)
         if changed:
-            state._write(slug, cache)
+            write(cache)
     if stale:
         _spawn_refresh(cwd)
     return line

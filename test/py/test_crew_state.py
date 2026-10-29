@@ -283,6 +283,16 @@ class StateTest(CrewFixture):
         self.assertEqual(self.read_cache()["agents"][agents[0]["id"]]["state"],
                          "desconocido")
 
+    def test_unusable_state_dir_exits_2_without_traceback(self):
+        blocker = self.tmp / "blocker"
+        blocker.write_text("no es un directorio", encoding="utf-8")
+        proc = self.crew(["refresh"],
+                         env={"CREW_STATE_DIR": str(blocker / "state")})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("directorio de estado", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_refresh_and_status_refuse_an_unconfigured_org_without_ssh(self):
         self.seed([{"n": 1, "rev": "r1", "message": "x\nCREW: PREGUNTAS"}])
         self.set_origin("git@github.com:Carlososuna11/x.git")
@@ -546,6 +556,14 @@ class ControlCharsTest(unittest.TestCase):
         self.assertEqual(strip_control("texto \x1b(B normal"), "texto  normal")
         self.assertEqual(strip_control("a\x9b2Jb\x9d0;x"), "a2Jb0;x")
         self.assertIsNone(strip_control(None))
+
+    def test_strips_bidi_and_zero_width_controls(self):
+        from crew.state import strip_control
+        self.assertEqual(strip_control("a\u202eb\u2066c\u200bd\u2060e\ufeff"),
+                         "abcde")
+        self.assertEqual(strip_control("\u202a\u202b\u202c\u202d\u202e"), "")
+        self.assertEqual(strip_control("\u2066\u2067\u2068\u2069"), "")
+        self.assertEqual(strip_control("\u200b\u200c\u200d"), "")
 
 
 class ClassifyTest(unittest.TestCase):

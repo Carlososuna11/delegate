@@ -10,6 +10,7 @@ Run from the repo root:
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import shlex
@@ -19,7 +20,9 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "bin" / "crew"
@@ -616,6 +619,49 @@ class ProjectTest(unittest.TestCase):
             with self.subTest(url=url):
                 self.origin(url)
                 self.assertIsNone(project_of(str(self.repo)))
+
+
+class IdPatternTest(unittest.TestCase):
+    """Agent ids never start with `-`: a dash there reads as an option."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+
+    def test_ids_start_with_a_hex_digit(self):
+        from crew.paseo import ID_RE
+        for value in ("abc1234", "0" * 36, "1234567-abc", "deadbeef-0001"):
+            with self.subTest(id=value):
+                self.assertIsNotNone(ID_RE.match(value))
+        for value in ("", "-", "-abcdef", "-deadbeef", " abc1234", "xyz1234"):
+            with self.subTest(id=value):
+                self.assertIsNone(ID_RE.match(value))
+
+
+class MainErrorTest(unittest.TestCase):
+    """main reports local failures as exit codes, never as a traceback."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+
+    def run_main(self, error: BaseException) -> tuple[int, str]:
+        from crew import cli
+        stderr = io.StringIO()
+        with mock.patch.object(cli, "cmd_refresh", side_effect=error), \
+                redirect_stderr(stderr):
+            code = cli.main(["refresh"])
+        return code, stderr.getvalue()
+
+    def test_keyboard_interrupt_exits_130_without_output(self):
+        code, err = self.run_main(KeyboardInterrupt())
+        self.assertEqual(code, 130)
+        self.assertNotIn("Traceback", err)
+
+    def test_oserror_exits_2_with_a_short_line(self):
+        code, err = self.run_main(OSError("boom"))
+        self.assertEqual(code, 2)
+        self.assertIn("directorio de estado", err)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("boom", err)
 
 
 class PaseoLaunchTest(unittest.TestCase):
