@@ -3,9 +3,10 @@
 Every remote command line is fixed text plus values that were validated first
 (agent ids match `ID_RE`) or quoted with `shlex.quote`. Text that can be
 arbitrary — the brief, an answer — travels on ssh's stdin and is read on the
-remote side with `"$(cat)"`. That puts it in the remote argv (visible in the
-host's `ps`) and strips trailing newlines, which is why briefs carry no
-secrets: lib/crew/brief.py refuses them before they get here.
+remote side with `"$(cat)"`, behind a `--` so it is never taken for an option.
+That puts it in the remote argv (visible in the host's `ps`) and strips
+trailing newlines, which is why briefs carry no secrets: lib/crew/brief.py
+refuses them before they get here.
 
 The remote `run --no-wait -q` prints only the agent id on stdout and writes
 its notices ("Created workspace ...", "Tip: ...") on stderr. That stderr is
@@ -50,6 +51,7 @@ SSH_OPTIONS = (
 
 LAUNCH_TIMEOUT = 60
 RECONCILE_SECONDS = 5.0
+EMPTY_BRIEF = "el brief está vacío; escribe el encargo antes de lanzarlo"
 
 
 class CrewError(Exception):
@@ -58,6 +60,10 @@ class CrewError(Exception):
     def __init__(self, message: str, code: int = 1):
         super().__init__(message)
         self.code = code
+
+
+class LocalExecError(CrewError):
+    """The local ssh process never started, so nothing reached the host."""
 
 
 def check_host(host: str) -> str:
@@ -105,6 +111,12 @@ def quote_cwd(cwd: str) -> str:
     return shlex.quote(cwd)
 
 
+def check_brief(brief: str) -> None:
+    """Refuse a brief with nothing in it: there is no assignment to send."""
+    if not isinstance(brief, str) or not brief.strip():
+        raise CrewError(EMPTY_BRIEF, 2)
+
+
 def _quote_id(agent_id: str) -> str:
     if not isinstance(agent_id, str) or not ID_RE.match(agent_id):
         raise CrewError(f"id de encargo inválido: {agent_id!r}", 2)
@@ -143,10 +155,9 @@ class Paseo:
     def __init__(self, host: str, ssh: list[str]):
         self.host = check_host(host)
         self.ssh = list(ssh)
-        self.last_stderr = ""
 
     def run(self, cmd: str, stdin: str | None = None, timeout: int = 20) -> str:
-        """Run one remote command; return its stdout. Stderr is kept, not shown."""
+        """Run one remote command; return its stdout. Stderr is discarded."""
         argv = [*self.ssh, "--", self.host, cmd]
         try:
             proc = subprocess.run(
@@ -155,8 +166,8 @@ class Paseo:
         except subprocess.TimeoutExpired:
             raise CrewError("el host no respondió a tiempo", 1) from None
         except OSError as exc:
-            raise CrewError(f"no se pudo ejecutar ssh: {exc}", 2) from exc
-        self.last_stderr = proc.stderr.decode("utf-8", "replace")
+            # The request never left: the ssh executable did not start at all.
+            raise LocalExecError(f"no se pudo ejecutar ssh: {exc}", 2) from exc
         if proc.returncode != 0:
             raise CrewError(f"el host remoto falló (código {proc.returncode})", 1)
         return proc.stdout.decode("utf-8", "replace")
@@ -180,16 +191,23 @@ class Paseo:
     def launch(self, title: str, cwd: str, slug: str, brief: str) -> str:
         """Start an agent with `brief` as its prompt; return its id.
 
-        The request is labelled with a fresh uuid so a dropped connection can
-        be reconciled: the agent may exist even when its id never came back.
+        The brief goes on ssh's stdin and is read on the host with `"$(cat)"`,
+        behind `--` so a brief that starts with a dash is a plain word and not
+        an option of the runtime. The request is labelled with a fresh uuid so
+        a dropped connection can be reconciled: the agent may exist even when
+        its id never came back. A failure to start ssh locally is different:
+        nothing reached the host, so there is nothing to reconcile.
         """
+        check_brief(brief)
         request = str(uuid.uuid4())
         cmd = ("paseo run --no-wait -q --provider claude --mode auto "
                f"--title {shlex.quote(title)} --cwd {quote_cwd(cwd)} "
                f"--label crew=1 --label crew-project={shlex.quote(slug)} "
-               f"--label crew-req={shlex.quote(request)} \"$(cat)\"")
+               f"--label crew-req={shlex.quote(request)} -- \"$(cat)\"")
         try:
             out = self.run(cmd, stdin=brief, timeout=LAUNCH_TIMEOUT)
+        except LocalExecError:
+            raise
         except CrewError:
             found = self._find_by_request(request)
             if found:

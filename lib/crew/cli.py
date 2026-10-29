@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .brief import SecretInBrief, build_brief, check_secrets, load_contract
-from .paseo import CrewError, Paseo, next_number, ssh_prefix
+from .paseo import CrewError, Paseo, check_brief, next_number, ssh_prefix
 from .project import project_of
 
 USAGE = """uso: crew launch --title T --brief-file F [--cwd DIR]
@@ -123,6 +123,8 @@ def _read_text(path: str, what: str) -> str:
         return Path(path).read_text(encoding="utf-8")
     except OSError as exc:
         raise CrewError(f"no pude leer {what}: {exc}", 2) from None
+    except ValueError:  # UnicodeDecodeError, on anything that is not UTF-8
+        raise CrewError(f"no pude leer {what}: el archivo no es texto UTF-8", 2) from None
 
 
 def _current_branch(cwd: str) -> str:
@@ -139,8 +141,12 @@ def _current_branch(cwd: str) -> str:
 
 def cmd_launch(opts: dict) -> int:
     title = opts["--title"]
+    # The title travels in the remote argv, quoted: it goes through the same
+    # secret backstop, before anything leaves this machine.
+    check_secrets(title)
     brief = _read_text(opts["--brief-file"], "el brief")
     check_secrets(brief)  # the file is re-checked here, not only when built
+    check_brief(brief)
 
     cwd = opts.get("--cwd") or os.getcwd()
     project = project_of(cwd)

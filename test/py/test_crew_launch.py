@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -298,11 +299,11 @@ class CrewTest(unittest.TestCase):
                                        "crew-project=innovares.datago", "--label"])
         self.assertTrue(argv[16].startswith("crew-req="))
         self.assertRegex(argv[16][len("crew-req="):], UUID4)
-        # The brief is the last argument of the remote command, read with
-        # "$(cat)" from ssh's stdin; command substitution took the trailing
-        # newlines. (The fake paseo sees stdin at EOF because that `cat`
-        # already consumed it, as with the real thing.)
-        self.assertEqual(argv[17:], [brief.rstrip("\n")])
+        # The brief is the last argument of the remote command, behind `--` and
+        # read with "$(cat)" from ssh's stdin; command substitution took the
+        # trailing newlines. (The fake paseo sees stdin at EOF because that
+        # `cat` already consumed it, as with the real thing.)
+        self.assertEqual(argv[17:], ["--", brief.rstrip("\n")])
         self.assertEqual(runs[0]["labels"]["crew-project"], "innovares.datago")
 
         # It travelled on stdin and never on the local ssh command line.
@@ -311,7 +312,7 @@ class CrewTest(unittest.TestCase):
             self.assertNotIn("agrega el botón X", call["cmd"])
         run_calls = [c for c in self.calls() if c["cmd"].startswith("paseo run")]
         self.assertEqual(len(run_calls), 1)
-        self.assertTrue(run_calls[0]["cmd"].endswith('"$(cat)"'))
+        self.assertTrue(run_calls[0]["cmd"].endswith('-- "$(cat)"'))
 
     def test_ssh_options_disable_forwarding(self):
         self.assertEqual(self.launch().returncode, 0)
@@ -358,6 +359,15 @@ class CrewTest(unittest.TestCase):
         self.assertEqual(len(self.paseo_calls("run")), 1)
         self.assertEqual([a["id"] for a in self.agents_on_remote()], [out["id"]])
 
+    def test_brief_starting_with_dash_arrives_literal_after_double_dash(self):
+        brief = "- revisa el botón X\n"
+        proc = self.launch(brief=brief)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        argv = self.paseo_calls("run")[0]["argv"]
+        # `--` closes paseo's own options, so the brief cannot be read as one.
+        self.assertEqual(argv[-2], "--")
+        self.assertEqual(argv[-1], "- revisa el botón X")
+
     def test_shell_metacharacters_stay_literal(self):
         title = 'x"; touch "$HOME/pwned-title"; echo "'
         brief = '$(touch "$HOME/pwned-brief")\n'
@@ -369,6 +379,34 @@ class CrewTest(unittest.TestCase):
         self.assertEqual(run["argv"][-1], '$(touch "$HOME/pwned-brief")')
 
     # -- launch: refusals before any ssh ---------------------------------------
+
+    def test_secret_in_title_refuses(self):
+        proc = self.launch(title="revisa con ghp_" + "a" * 36)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("secreto", proc.stderr)
+        self.assertNotIn("ghp_", proc.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.paseo_calls(), [])
+
+    def test_non_utf8_brief_file_refuses(self):
+        path = self.tmp / "brief-latin1.md"
+        path.write_bytes(b"# Encargo\n\n> ca\xf1a\xf1a\n")
+        proc = self.crew(["launch", "--title", "Botón X",
+                          "--brief-file", str(path)])
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("no pude leer el brief", proc.stderr)
+        self.assertIn("UTF-8", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_empty_brief_refuses(self):
+        for brief in ("", " \n\t\n"):
+            with self.subTest(brief=brief):
+                proc = self.launch(brief=brief)
+                self.assertEqual(proc.returncode, 2)
+                self.assertIn("brief está vacío", proc.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.paseo_calls(), [])
 
     def test_secret_in_brief_file_refuses(self):
         proc = self.launch(brief="contexto\nDATABASE_PASSWORD=hunter2\n")
@@ -503,6 +541,94 @@ class ProjectTest(unittest.TestCase):
             with self.subTest(url=url):
                 self.origin(url)
                 self.assertIsNone(project_of(str(self.repo)))
+
+
+class PaseoLaunchTest(unittest.TestCase):
+    """Unit tests for Paseo.launch: what happens before (and after) ssh runs."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="crew-paseo-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_empty_brief_refuses_before_ssh(self):
+        from crew.paseo import CrewError, Paseo
+        # The executable does not exist: reaching ssh at all would surface the
+        # exec error instead.
+        paseo = Paseo("caracas", [str(self.tmp / "no-such-ssh")])
+        for brief in ("", " ", "\n\t \n"):
+            with self.subTest(brief=brief):
+                with self.assertRaises(CrewError) as cm:
+                    paseo.launch("t", "~/x", "a.b", brief)
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("brief está vacío", str(cm.exception))
+
+    def test_local_ssh_oserror_fails_without_reconcile(self):
+        from crew.paseo import CrewError, Paseo
+
+        class Recorder(Paseo):
+            def __init__(self, host, ssh):
+                super().__init__(host, ssh)
+                self.commands = []
+
+            def run(self, cmd, stdin=None, timeout=20):
+                self.commands.append(cmd)
+                return super().run(cmd, stdin=stdin, timeout=timeout)
+
+        paseo = Recorder("caracas", [str(self.tmp / "no-such-ssh")])
+        started = time.monotonic()
+        with self.assertRaises(CrewError) as cm:
+            paseo.launch("t", "~/x", "a.b", "brief")
+        elapsed = time.monotonic() - started
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("no se pudo ejecutar ssh", str(cm.exception))
+        # ssh never started, so the request cannot be on the host: exactly one
+        # attempt, and no `ls` by crew-req afterwards (nor its 5 s wait).
+        self.assertEqual(len(paseo.commands), 1)
+        self.assertLess(elapsed, 2.0)
+
+
+class QuoteCwdTest(unittest.TestCase):
+    """quote_cwd refuses what would not stay one safe word on the host."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+
+    def test_refuses_tilde_path_with_dotdot(self):
+        from crew.paseo import CrewError, quote_cwd
+        for cwd in ("~/a/../b", "~/..", "~/innovares/../secret"):
+            with self.subTest(cwd=cwd):
+                with self.assertRaises(CrewError) as cm:
+                    quote_cwd(cwd)
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("destino inválido en la config", str(cm.exception))
+
+    def test_refuses_metacharacters_in_tilde_path(self):
+        from crew.paseo import CrewError, quote_cwd
+        for cwd in ("~/a;b", "~/a$(id)", '~/a"b', "~/a b"):
+            with self.subTest(cwd=cwd):
+                with self.assertRaises(CrewError) as cm:
+                    quote_cwd(cwd)
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("destino inválido en la config", str(cm.exception))
+
+    def test_refuses_relative_path(self):
+        from crew.paseo import CrewError, quote_cwd
+        with self.assertRaises(CrewError) as cm:
+            quote_cwd("innovares/x")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("ruta absoluta", str(cm.exception))
+
+    def test_quotes_absolute_path(self):
+        from crew.paseo import quote_cwd
+        for cwd in ("/opt/innovares/agent", "/opt/innovares/agent b"):
+            with self.subTest(cwd=cwd):
+                self.assertEqual(quote_cwd(cwd), shlex.quote(cwd))
+
+    def test_keeps_tilde_expandable(self):
+        from crew.paseo import quote_cwd
+        self.assertEqual(quote_cwd("~/innovares/innovares-agent"),
+                         "~/innovares/innovares-agent")
 
 
 if __name__ == "__main__":  # pragma: no cover
