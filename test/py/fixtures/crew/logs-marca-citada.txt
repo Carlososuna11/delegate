@@ -1,0 +1,2 @@
+[User] Escribe un párrafo corto que explique que la marca CREW: ENTREGA se usa al terminar, citándola en medio del texto, y termina con la frase: Listo por ahora. No escribas ninguna marca al final.
+La marca CREW: ENTREGA se usa al terminar un trabajo. Su función es avisar que la tarea quedó completa y que el resultado ya se puede revisar. No hace falta repetirla en cada mensaje, solo en el cierre real de la tarea. Listo por ahora.

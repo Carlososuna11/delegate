@@ -46,6 +46,9 @@ STATE = os.path.join(HOME, "paseo-state")
 LOG = os.path.join(HOME, "paseo.log")
 AGENTS = os.path.join(STATE, "agents.json")
 LOCK = os.path.join(STATE, "lock")
+INSPECT = os.path.join(HOME, "paseo-inspect.json")
+LOGS = os.path.join(HOME, "paseo-logs")
+PIDS = os.path.join(HOME, "paseo.pids")
 KEYS = ("id", "shortId", "name", "provider", "thinking", "status", "cwd", "created")
 
 
@@ -92,6 +95,8 @@ def notice(text):
 
 def main(argv):
     cmd = argv[0] if argv else ""
+    with open(PIDS, "a", encoding="utf-8") as f:
+        f.write(str(os.getpid()) + "\n")
     stdin = sys.stdin.read() if cmd in ("run", "send") else ""
     labels, options = {}, {}
     i = 1
@@ -130,11 +135,11 @@ def main(argv):
         return agents
 
     agents = locked(act)
+    # Recorded before the delay so a dropped ssh can still be reconciled.
+    delay = float(os.environ.get("FAKE_PASEO_DELAY", "0") or 0)
+    if delay and cmd == os.environ.get("FAKE_PASEO_DELAY_CMD", "run"):
+        time.sleep(delay)
     if cmd == "run":
-        # Recorded before the delay so a dropped ssh can still be reconciled.
-        delay = float(os.environ.get("FAKE_PASEO_DELAY", "0") or 0)
-        if delay:
-            time.sleep(delay)
         notice("Created workspace " + options.get("cwd", HOME))
         notice("Tip: revisa el avance con `paseo logs`")
         emit(agents[-1]["id"])
@@ -142,6 +147,29 @@ def main(argv):
         public = [{k: a.get(k) for k in KEYS} for a in agents
                   if all(a.get("labels", {}).get(k) == v for k, v in labels.items())]
         emit(json.dumps(public))
+    elif cmd == "inspect":
+        target = argv[1] if len(argv) > 1 else ""
+        try:
+            with open(INSPECT, encoding="utf-8") as f:
+                found = json.load(f).get(target)
+        except (OSError, ValueError):
+            found = None
+        if found is None:
+            notice("inspect: no such agent")
+            return 1
+        emit(found if isinstance(found, str) else json.dumps(found, indent=2))
+    elif cmd == "logs":
+        target = argv[1] if len(argv) > 1 else ""
+        try:
+            with open(os.path.join(LOGS, target + ".txt"), encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except OSError:
+            pass
     elif cmd == "stop":
         target = argv[1] if len(argv) > 1 else ""
 
@@ -163,7 +191,13 @@ if __name__ == "__main__":
 '''
 
 
-class CrewTest(unittest.TestCase):
+class CrewFixture(unittest.TestCase):
+    """The sandbox shared by the crew suites: repo, config, state and remote.
+
+    It has no tests of its own; test_crew_state builds on it so both suites use
+    one fake remote and one set of helpers.
+    """
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="crew-launch-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -277,6 +311,8 @@ class CrewTest(unittest.TestCase):
     def pwned(self):
         return sorted(p.name for p in self.rhome.glob("pwned*"))
 
+
+class CrewTest(CrewFixture):
     # -- launch: transport and labels -----------------------------------------
 
     def test_launch_sends_brief_on_ssh_stdin_with_labels(self):

@@ -1,10 +1,17 @@
-"""Command line of crew: `crew launch` and `crew brief`.
+"""Command line of crew.
 
 `launch` never asks questions: it reads a finished brief from a file (the
 skill builds it with `crew brief`), refuses anything secret-shaped, picks the
 destination from the personal config by GitHub owner, and starts one agent
 under a project-wide numbering lock. Numbering is serialized locally so two
 launches of the same project never pick the same `#n`.
+
+`refresh`, `status`, `questions`, `answer` and `cancel` work on the state of
+the project in the current directory (`--cwd` moves it for the first two).
+`status` and `questions` quote the agent's text as untrusted: a fixed header,
+every line behind `> `, and no end-of-turn marker. `answer` takes the
+project launch lock, refreshes, and only sends when the assignment is still
+waiting, so two chats cannot answer the same turn twice.
 
 The config lives outside the repo, in `$CREW_CONFIG` or
 `~/.config/crew/config.json`:
@@ -22,20 +29,28 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .brief import SecretInBrief, build_brief, check_secrets, load_contract
-from .paseo import CrewError, Paseo, check_brief, next_number, ssh_prefix
+from .paseo import (CrewError, Paseo, check_brief, next_number, resolve,
+                    ssh_prefix)
 from .project import project_of
+from .state import (LOGS_TAIL, QUESTIONS_HEADER, last_message, refresh,
+                    state_dir, without_marker)
 
 USAGE = """uso: crew launch --title T --brief-file F [--cwd DIR]
        crew brief --words-file W [--decision D]... [--constraint C]... [--base B]
+       crew refresh [--cwd DIR]
+       crew status [--cwd DIR]
+       crew questions N
+       crew answer N     (la respuesta va por stdin)
+       crew cancel N
 """
 
 DEFAULT_HOST = "caracas"
 CONFIG_ENV = "CREW_CONFIG"
-STATE_ENV = "CREW_STATE_DIR"
 
 _LAUNCH_OPTIONS = {"--title": False, "--brief-file": False, "--cwd": False}
 _BRIEF_OPTIONS = {"--words-file": False, "--base": False,
                   "--decision": True, "--constraint": True}
+_CWD_OPTIONS = {"--cwd": False}
 
 
 def _error(message: str) -> None:
@@ -67,13 +82,6 @@ def load_config() -> dict:
     if not isinstance(host, str):
         raise CrewError("host en la config de crew tiene que ser texto", 2)
     return {"host": host, "orgs": orgs}
-
-
-def state_dir() -> Path:
-    raw = os.environ.get(STATE_ENV) or ""
-    directory = Path(raw) if raw else Path.home() / ".local" / "state" / "crew"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return directory
 
 
 @contextmanager
@@ -182,6 +190,131 @@ def cmd_brief(opts: dict) -> int:
     return 0
 
 
+def _project_for(cwd: str):
+    project = project_of(cwd)
+    if project is None:
+        raise CrewError("no encuentro el repo de esta carpeta", 2)
+    return project
+
+
+def _paseo() -> Paseo:
+    return Paseo(load_config()["host"], ssh_prefix())
+
+
+def _number_arg(args: list[str]) -> int:
+    if not args:
+        raise CrewError("falta el número del encargo", 2)
+    if len(args) > 1:
+        raise CrewError(f"argumento de más: {args[1]}", 2)
+    try:
+        number = int(args[0])
+    except ValueError:
+        raise CrewError(f"número de encargo inválido: {args[0]}", 2) from None
+    if number < 1:
+        raise CrewError(f"número de encargo inválido: {args[0]}", 2)
+    return number
+
+
+def _quoted(number: int, text: str) -> str:
+    """The agent's text as a quote: fixed header, every line behind `> `."""
+    lines = "\n".join(f"> {line}" if line.strip() else ">"
+                      for line in text.splitlines())
+    return f"{QUESTIONS_HEADER.format(n=number)}\n{lines}\n"
+
+
+def _question_block(number: int, agent_id: str, paseo: Paseo) -> str:
+    message = last_message(paseo.logs(agent_id, LOGS_TAIL))
+    if message is None:
+        return ""
+    text = without_marker(message)
+    if not text.strip():
+        return ""
+    return _quoted(number, text)
+
+
+def cmd_refresh(opts: dict) -> int:
+    project = _project_for(opts.get("--cwd") or os.getcwd())
+    refresh(project.slug, _paseo())
+    return 0
+
+
+def cmd_status(opts: dict) -> int:
+    project = _project_for(opts.get("--cwd") or os.getcwd())
+    paseo = _paseo()
+    cache = refresh(project.slug, paseo)
+    entries = sorted(
+        ((int(entry["n"]), agent_id, entry)
+         for agent_id, entry in cache.get("agents", {}).items()
+         if isinstance(entry, dict) and isinstance(entry.get("n"), int)),
+        key=lambda item: item[0])
+    if not entries:
+        sys.stdout.write("no hay encargos en este proyecto\n")
+        return 0
+    out = "".join(f"#{number} — {entry.get('state', 'desconocido')}\n"
+                  for number, _agent_id, entry in entries)
+    for number, agent_id, entry in entries:
+        if entry.get("state") != "esperando":
+            continue
+        block = _question_block(number, agent_id, paseo)
+        if block:
+            out += "\n" + block
+    sys.stdout.write(out)
+    return 0
+
+
+def cmd_questions(args: list[str]) -> int:
+    number = _number_arg(args)
+    project = _project_for(os.getcwd())
+    paseo = _paseo()
+    agent = resolve(paseo.ls(project.slug), number)
+    message = last_message(paseo.logs(agent["id"], LOGS_TAIL))
+    if message is None:
+        raise CrewError(f"el encargo #{number} no tiene un mensaje que mostrar", 1)
+    sys.stdout.write(_quoted(number, without_marker(message)))
+    return 0
+
+
+def cmd_answer(args: list[str]) -> int:
+    number = _number_arg(args)
+    answer = sys.stdin.read()
+    # The answer travels on ssh's stdin: refuse a secret before it can.
+    check_secrets(answer)
+    if not answer.strip():
+        raise CrewError("la respuesta está vacía; escribe lo que quieres responder", 2)
+    project = _project_for(os.getcwd())
+    paseo = _paseo()
+    # The launch lock serializes answers (and launches): two chats must not
+    # answer the same turn twice.
+    with _launch_lock(project.slug):
+        cache = refresh(project.slug, paseo)
+        agents = [{"id": agent_id, "name": f"#{entry['n']} · "}
+                  for agent_id, entry in cache.get("agents", {}).items()
+                  if isinstance(entry, dict) and isinstance(entry.get("n"), int)]
+        agent = resolve(agents, number)
+        state = cache["agents"][agent["id"]].get("state")
+        if state != "esperando":
+            if state == "trabajando":
+                raise CrewError(
+                    f"el encargo #{number} ya está trabajando; "
+                    "tu respuesta no se envió", 2)
+            raise CrewError(
+                f"el encargo #{number} no está esperando respuesta "
+                f"(estado: {state}); tu respuesta no se envió", 2)
+        paseo.send(agent["id"], answer)
+    sys.stdout.write(f"respuesta enviada al encargo #{number}\n")
+    return 0
+
+
+def cmd_cancel(args: list[str]) -> int:
+    number = _number_arg(args)
+    project = _project_for(os.getcwd())
+    paseo = _paseo()
+    agent = resolve(paseo.ls(project.slug), number)
+    paseo.stop(agent["id"])
+    sys.stdout.write(f"encargo #{number} cancelado\n")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help", "help"):
         sys.stdout.write(USAGE)
@@ -196,6 +329,16 @@ def main(argv: list[str]) -> int:
             opts = _options(rest, _BRIEF_OPTIONS)
             _require(opts, ("--words-file",))
             return cmd_brief(opts)
+        if command == "refresh":
+            return cmd_refresh(_options(rest, _CWD_OPTIONS))
+        if command == "status":
+            return cmd_status(_options(rest, _CWD_OPTIONS))
+        if command == "questions":
+            return cmd_questions(rest)
+        if command == "answer":
+            return cmd_answer(rest)
+        if command == "cancel":
+            return cmd_cancel(rest)
         raise CrewError(f"subcomando desconocido: {command}", 2)
     except SecretInBrief as exc:
         _error(str(exc))

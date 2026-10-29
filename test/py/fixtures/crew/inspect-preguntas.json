@@ -1,0 +1,51 @@
+{
+  "Id": "e1ef3bc9-d5e5-4689-bbce-72c4b76ff3d1",
+  "Name": "crew fixture 1",
+  "Provider": "claude",
+  "Model": "claude-opus-5-5",
+  "Thinking": "auto",
+  "Status": "idle",
+  "Archived": false,
+  "ArchivedAt": null,
+  "Mode": "auto",
+  "Cwd": "/tmp",
+  "CreatedAt": "2026-10-29T05:23:07.092Z",
+  "UpdatedAt": "2026-10-29T05:23:12.425Z",
+  "LastUsage": {
+    "InputTokens": 2,
+    "OutputTokens": 257,
+    "CachedTokens": 12322,
+    "CostUsd": 0.10217240000000001
+  },
+  "Capabilities": {
+    "Streaming": true,
+    "Persistence": true,
+    "DynamicModes": true,
+    "McpServers": true
+  },
+  "AvailableModes": [
+    {
+      "id": "plan",
+      "label": "Plan Mode"
+    },
+    {
+      "id": "default",
+      "label": "Always Ask"
+    },
+    {
+      "id": "acceptEdits",
+      "label": "Accept File Edits"
+    },
+    {
+      "id": "auto",
+      "label": "Auto mode"
+    },
+    {
+      "id": "bypassPermissions",
+      "label": "Bypass"
+    }
+  ],
+  "PendingPermissions": [],
+  "Worktree": null,
+  "ParentAgentId": null
+}

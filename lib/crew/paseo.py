@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -52,6 +53,8 @@ SSH_OPTIONS = (
 LAUNCH_TIMEOUT = 60
 RECONCILE_SECONDS = 5.0
 EMPTY_BRIEF = "el brief está vacío; escribe el encargo antes de lanzarlo"
+# Fixed line printed between the `inspect` blocks of one batched ssh call.
+INSPECT_DELIM = "---crew-inspect---"
 
 
 class CrewError(Exception):
@@ -156,24 +159,48 @@ class Paseo:
         self.host = check_host(host)
         self.ssh = list(ssh)
 
-    def run(self, cmd: str, stdin: str | None = None, timeout: int = 20) -> str:
-        """Run one remote command; return its stdout. Stderr is discarded."""
+    def run(self, cmd: str, stdin: str | None = None,
+            timeout: float = 20) -> str:
+        """Run one remote command; return its stdout. Stderr is discarded.
+
+        The ssh child gets its own session, so a timeout kills the whole
+        process group (ssh and whatever it started locally) and is reaped
+        here. The caller never inherits a stray process from a hung host.
+        """
         argv = [*self.ssh, "--", self.host, cmd]
         try:
-            proc = subprocess.run(
-                argv, input=(stdin or "").encode("utf-8"),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise CrewError("el host no respondió a tiempo", 1) from None
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, start_new_session=True)
         except OSError as exc:
             # The request never left: the ssh executable did not start at all.
             raise LocalExecError(f"no se pudo ejecutar ssh: {exc}", 2) from exc
+        try:
+            out, _err = proc.communicate(
+                input=(stdin or "").encode("utf-8"), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            # A grandchild in its own session may hold the pipes open; after
+            # the group is dead, closing our ends is what unblocks us.
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            raise CrewError("el host no respondió a tiempo", 1) from None
         if proc.returncode != 0:
             raise CrewError(f"el host remoto falló (código {proc.returncode})", 1)
-        return proc.stdout.decode("utf-8", "replace")
+        return out.decode("utf-8", "replace")
 
-    def _ls_label(self, label: str) -> list[dict]:
-        out = self.run(f"paseo ls -g -a --label {shlex.quote(label)} --json")
+    def _ls_label(self, label: str, timeout: float = 20) -> list[dict]:
+        out = self.run(f"paseo ls -g -a --label {shlex.quote(label)} --json",
+                       timeout=timeout)
         try:
             agents = json.loads(out)
         except ValueError:
@@ -182,11 +209,50 @@ class Paseo:
             raise CrewError("el host no devolvió la lista de encargos", 1)
         return [agent for agent in agents if isinstance(agent, dict)]
 
-    def ls(self, slug: str) -> list[dict]:
+    def ls(self, slug: str, timeout: float = 20) -> list[dict]:
         """Every agent labelled with the project."""
         if not isinstance(slug, str) or not slug:
             raise CrewError("proyecto inválido", 2)
-        return self._ls_label(f"crew-project={slug}")
+        return self._ls_label(f"crew-project={slug}", timeout=timeout)
+
+    def inspect_many(self, agent_ids: list[str],
+                     timeout: float = 20) -> dict[str, dict | None]:
+        """`UpdatedAt` (and the rest) of several agents, in one ssh call.
+
+        The ids are validated and quoted, and the remote line is fixed text
+        with those words: a loop that prints the delimiter and then one
+        `inspect` per id. `|| true` keeps a single failed inspect from taking
+        down the batch; its empty block parses as None for that agent.
+        """
+        ids = list(agent_ids)
+        for agent_id in ids:
+            _quote_id(agent_id)
+        if not ids:
+            return {}
+        words = " ".join(shlex.quote(agent_id) for agent_id in ids)
+        cmd = (f"for i in {words}; do echo '{INSPECT_DELIM}'; "
+               "paseo inspect \"$i\" --json || true; done")
+        out = self.run(cmd, timeout=timeout)
+        blocks: list[str] = []
+        current: list[str] = []
+        for line in out.splitlines():
+            # A line, not a substring: a JSON string value is never a bare
+            # delimiter line, so a title cannot shift the blocks.
+            if line.strip() == INSPECT_DELIM:
+                blocks.append("\n".join(current))
+                current = []
+            else:
+                current.append(line)
+        blocks.append("\n".join(current))
+        details: dict[str, dict | None] = {}
+        for index, agent_id in enumerate(ids):
+            raw = blocks[index + 1] if index + 1 < len(blocks) else ""
+            detail = _parse_inspect(raw)
+            if isinstance(detail, dict) and isinstance(detail.get("Id"), str) \
+                    and detail["Id"] != agent_id:
+                detail = None
+            details[agent_id] = detail
+        return details
 
     def launch(self, title: str, cwd: str, slug: str, brief: str) -> str:
         """Start an agent with `brief` as its prompt; return its id.
@@ -237,19 +303,44 @@ class Paseo:
                 return None
             time.sleep(0.1)
 
-    def logs(self, agent_id: str, tail: int) -> str:
+    def logs(self, agent_id: str, tail: int, timeout: float = 20) -> str:
         """The last `tail` messages of the agent, as text."""
         if not isinstance(tail, int) or tail <= 0:
             raise CrewError("tail inválido", 2)
-        return self.run(f"paseo logs {_quote_id(agent_id)} --tail {tail} --filter text")
+        return self.run(f"paseo logs {_quote_id(agent_id)} --tail {tail} "
+                        "--filter text", timeout=timeout)
 
-    def send(self, agent_id: str, text: str) -> str:
+    def send(self, agent_id: str, text: str,
+             timeout: float = LAUNCH_TIMEOUT) -> str:
         """Deliver `text` to the agent without waiting for its turn."""
-        return self.run(f"paseo send --no-wait {_quote_id(agent_id)} \"$(cat)\"",
-                        stdin=text, timeout=LAUNCH_TIMEOUT)
+        return self.run(f"paseo send --no-wait {_quote_id(agent_id)} "
+                        "-- \"$(cat)\"", stdin=text, timeout=timeout)
 
-    def stop(self, agent_id: str) -> str:
-        return self.run(f"paseo stop {_quote_id(agent_id)}")
+    def stop(self, agent_id: str, timeout: float = 20) -> str:
+        return self.run(f"paseo stop {_quote_id(agent_id)}", timeout=timeout)
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill the child's whole process group (it was started as its leader)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _parse_inspect(raw: str) -> dict | None:
+    """One inspect block, or None when the host did not return an object."""
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _last_id(stdout: str) -> str | None:
