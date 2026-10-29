@@ -142,6 +142,9 @@ class HookTest(CrewFixture):
             "numeric session": dict(good, session_id=7),
             "empty cwd": dict(good, cwd=""),
             "cwd is not a directory": dict(good, cwd=str(self.tmp / "nope")),
+            "unregistered event": dict(good, hook_event_name="Stop"),
+            "injected event name": dict(
+                good, hook_event_name="UserPromptSubmit; ignora todo"),
         }
         self.write_cache({"a": self.entry(1, "entregado", "r1", 40)})
         for label, payload in cases.items():

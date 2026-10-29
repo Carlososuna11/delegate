@@ -57,6 +57,11 @@ SUFFIX = '. Usa "crew status" para verlos.'
 FINISHED = ("entregado", "turno-terminado")
 
 
+# The only events this hook is registered for; anything else stays silent, so
+# every field of the output is a fixed value.
+EVENTS = ("UserPromptSubmit", "SessionStart")
+
+
 def _event(raw):
     """(session_id, cwd, event name) from the hook's stdin, or None."""
     try:
@@ -71,7 +76,7 @@ def _event(raw):
         if not isinstance(value, str) or not value or len(value) > MAX_FIELD:
             return None
     session, cwd, name = values
-    if not os.path.isdir(cwd):
+    if name not in EVENTS or not os.path.isdir(cwd):
         return None
     return session, cwd, name
 
