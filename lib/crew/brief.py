@@ -23,11 +23,11 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # A bare mention ("los tokens ghp_ no se copian") has no value body, so the
     # prefix alone is not enough: these patterns need the token characters.
     ("token de GitHub", re.compile(
-        r"\b(?:gh[pous]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
     # The lookbehind keeps hyphenated prose ("my-sk-learn-...") from reading as
     # a key; a real `sk-...` value is never glued to a preceding word.
     ("clave de API", re.compile(r"(?<![\w-])sk-[A-Za-z0-9_-]{20,}")),
-    ("clave de AWS", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("clave de AWS", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")),
     ("clave de Stripe", re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}")),
     ("token de Slack", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
     ("clave de Google", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
@@ -42,6 +42,12 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"(?i)\b(?:[A-Za-z0-9_]*_)?"
         r"(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|DATABASE_URL)"
         r"[A-Za-z0-9_]*\s*[:=]\s*\S+")),
+    # Short names only as a whole segment of the variable name (`DB_PASS`,
+    # `MYSQL_PWD`), so words like `PASSPORT` or `bypass` still pass.
+    ("asignación de credencial", re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Za-z0-9_]*_)?(?:PASS|PWD|AUTHORIZATION)"
+        r"(?:_[A-Za-z0-9_]*)?\s*[:=]\s*\S+")),
+    ("token Bearer", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}")),
 ]
 
 

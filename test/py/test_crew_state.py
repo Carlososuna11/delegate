@@ -275,6 +275,37 @@ class StateTest(CrewFixture):
         self.assertEqual([call["argv"][1] for call in self.paseo_calls("logs")],
                          [agents[1]["id"]])
 
+    def test_marker_followed_by_an_invisible_character_still_counts(self):
+        agents = self.seed([{"n": 1, "rev": "r1",
+                             "message": "\u200f¿A o B?\nCREW: PREGUNTAS\u200b"}])
+        proc = self.crew(["refresh"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.read_cache()["agents"][agents[0]["id"]]["state"],
+                         "esperando")
+        proc = self.crew(["questions", "1"])
+        self.assertNotIn("\u200f", proc.stdout)
+
+    def test_inspect_status_wins_over_the_listing(self):
+        # The listing said idle; by the time of the inspect it was running.
+        agents = self.seed([{"n": 1, "rev": "r1", "message": "x\nCREW: PREGUNTAS"}])
+        self.set_inspect({agents[0]["id"]: {"Id": agents[0]["id"],
+                                            "Status": "running",
+                                            "UpdatedAt": "r2"}})
+        proc = self.crew(["refresh"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.read_cache()["agents"][agents[0]["id"]]["state"],
+                         "trabajando")
+
+    def test_answer_that_is_not_utf8_is_refused(self):
+        self.seed([{"n": 2, "rev": "r1", "message": "x\nCREW: PREGUNTAS"}])
+        proc = subprocess.run([str(BIN), "answer", "2"], cwd=str(self.repo),
+                              input=b"\xff\xfe", capture_output=True,
+                              env=self.environment(), timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("UTF-8", proc.stderr.decode())
+        self.assertNotIn("Traceback", proc.stderr.decode())
+        self.assertEqual(self.calls(), [])
+
     def test_idle_agent_with_only_a_user_message_is_unknown(self):
         # The last entry is the user's answer: the agent has not spoken yet.
         agents = self.seed([{"n": 1, "rev": "r1",
@@ -563,6 +594,30 @@ class LastMessageTest(unittest.TestCase):
     def test_logs_are_fetched_one_entry_at_a_time(self):
         from crew.state import LOGS_TAIL
         self.assertEqual(LOGS_TAIL, 1)
+
+
+class RealFixturesTest(unittest.TestCase):
+    """The parsers against captures from the real host."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+
+    def test_ls_capture_has_the_fields_crew_reads(self):
+        agents = json.loads((FIXTURES / "ls.json").read_text(encoding="utf-8"))
+        self.assertIsInstance(agents, list)
+        for agent in agents:
+            self.assertIsInstance(agent.get("id"), str)
+            self.assertIsInstance(agent.get("name"), str)
+            self.assertIsInstance(agent.get("status"), str)
+
+    def test_inspect_capture_parses(self):
+        from crew.paseo import _checked_inspect
+        raw = (FIXTURES / "inspect-preguntas.json").read_text(encoding="utf-8")
+        detail = _checked_inspect(raw, json.loads(raw)["Id"])
+        self.assertIsInstance(detail["UpdatedAt"], str)
+        self.assertIsInstance(detail["Status"], str)
+        self.assertIs(detail["Archived"], False)
+        self.assertIsNone(_checked_inspect(raw, "otro-id"))
 
 
 class ControlCharsTest(unittest.TestCase):

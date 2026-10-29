@@ -61,7 +61,8 @@ ANSI_RE = re.compile(
 CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 # Bidi overrides, embeddings and isolates, zero-width characters and the BOM:
 # they do not print, but they can reorder or hide the text that does.
-INVISIBLE_RE = re.compile("[\u200b-\u200d\u2060\u202a-\u202e\u2066-\u2069\ufeff]")
+INVISIBLE_RE = re.compile(
+    "[\u061c\u200b-\u200f\u2060\u202a-\u202e\u2066-\u2069\ufeff]")
 
 # `owner.repo`, lowercase: safe as a file name and as a remote label.
 SLUG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
@@ -72,7 +73,8 @@ def last_message(logs_text: str) -> str | None:
 
     The output is a single entry. An entry whose first line starts with
     "[User] " is the user's (the agent hasn't answered yet), so there is no
-    agent message. Trailing blank lines are dropped.
+    agent message. Trailing blank lines are dropped. Control and invisible
+    characters are removed first, so a marker followed by one still counts.
     """
     if not isinstance(logs_text, str):
         return None
@@ -83,7 +85,7 @@ def last_message(logs_text: str) -> str | None:
         lines.pop()
     if not lines or lines[0].startswith("[User] "):
         return None
-    return "\n".join(lines)
+    return strip_control("\n".join(lines)).strip("\n") or None
 
 
 def without_marker(message: str) -> str:
@@ -302,6 +304,10 @@ def _collect(paseo: Paseo, slug: str, before: dict,
         rev = detail.get("UpdatedAt") if isinstance(detail, dict) else None
         if not isinstance(rev, str) or not rev:
             rev = None
+        # The inspect is later than the listing and travels with the rev.
+        fresh = detail.get("Status") if isinstance(detail, dict) else None
+        if isinstance(fresh, str) and fresh:
+            status = fresh.lower()
         state = "desconocido"
         if rev is not None:
             if "error" in status:

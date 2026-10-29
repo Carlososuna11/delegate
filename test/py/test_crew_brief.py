@@ -116,6 +116,25 @@ class BuildBriefTest(unittest.TestCase):
                     check_secrets("contexto\n" + s)
                 self.assertNotIn(s, str(cm.exception))
 
+    def test_rejects_env_style_and_header_credentials(self):
+        secrets = {
+            "db pass": "DB_" + "PASS=hunter2",
+            "mysql pwd": "MYSQL_" + "PWD=abc123xyz",
+            "authorization": "AUTHORIZATION" + "=Basic dXNlcjpwYXNz",
+            "bearer": "Authorization: " + "Bearer " + "a" * 24,
+            "github refresh": "ghr" + "_" + "a" * 36,
+            "aws temporary": "AS" + "IA" + "B" * 16,
+        }
+        for label, s in secrets.items():
+            with self.subTest(secret=label):
+                with self.assertRaises(SecretInBrief) as cm:
+                    check_secrets("contexto\n" + s)
+                self.assertNotIn(s, str(cm.exception))
+
+    def test_words_that_contain_pass_still_pass(self):
+        check_secrets("revisa el PASSPORT_NUMBER: campo nuevo del formulario")
+        check_secrets("el bypass=true del flag de pruebas")
+
     def test_provider_prefixes_without_a_value_pass(self):
         check_secrets("los prefijos sk_live_, xoxb-, AIza y eyJ no se copian")
 

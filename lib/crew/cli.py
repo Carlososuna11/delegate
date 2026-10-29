@@ -258,7 +258,11 @@ def cmd_questions(args: list[str]) -> int:
 
 def cmd_answer(args: list[str]) -> int:
     number = _number_arg(args)
-    answer = sys.stdin.read()
+    try:
+        answer = sys.stdin.buffer.read().decode("utf-8")
+    except UnicodeDecodeError:
+        raise CrewError("la respuesta no es texto UTF-8; tu respuesta no se envió",
+                        2) from None
     # The answer travels on ssh's stdin: refuse a secret before it can.
     check_secrets(answer)
     if not answer.strip():
