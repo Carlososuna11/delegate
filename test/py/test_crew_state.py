@@ -10,6 +10,7 @@ Run from the repo root:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -61,6 +62,31 @@ class StateTest(CrewFixture):
         directory = self.rhome / "paseo-logs"
         directory.mkdir(exist_ok=True)
         (directory / f"{agent_id}.txt").write_text(text, encoding="utf-8")
+
+    def set_status(self, agent_id, status, rev=None):
+        """Change the fake remote's view of an agent after the cache was built."""
+        path = self.rhome / "paseo-state" / "agents.json"
+        agents = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        for agent in agents:
+            if agent.get("id") == agent_id:
+                agent["status"] = status
+        path.write_text(json.dumps(agents), encoding="utf-8")
+        inspect = json.loads(
+            (self.rhome / "paseo-inspect.json").read_text(encoding="utf-8"))
+        entry = inspect.get(agent_id)
+        if isinstance(entry, dict):
+            entry["Status"] = status
+            if rev is not None:
+                entry["UpdatedAt"] = rev
+            self.set_inspect(inspect)
+
+    def hold_refresh_lock(self):
+        """Hold the project's refresh lock, as a concurrent refresh would."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.state / f"{SLUG}.refresh.lock",
+                     os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
 
     def cache_file(self):
         return self.state / f"{SLUG}.json"
@@ -244,6 +270,17 @@ class StateTest(CrewFixture):
         self.assertEqual(proc.stdout, expected)
         self.assertEqual(self.pwned(), [])
 
+    def test_questions_strip_ansi_and_control_characters(self):
+        self.seed([{"n": 2, "rev": "r1",
+                    "message": "\x1b[2J\x1b]0;pwn\x07hola\rmundo\nCREW: PREGUNTAS"}])
+        proc = self.crew(["questions", "2"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for bad in ("\x1b", "\x07", "\r"):
+            self.assertNotIn(bad, proc.stdout)
+        self.assertNotIn("pwn", proc.stdout)
+        self.assertIn("hola", proc.stdout)
+        self.assertIn("mundo", proc.stdout)
+
     def test_questions_refuses_an_unknown_number(self):
         self.seed([{"n": 2, "rev": "r1", "message": "x\nCREW: PREGUNTAS"}])
         proc = self.crew(["questions", "9"])
@@ -289,6 +326,43 @@ class StateTest(CrewFixture):
         self.assertIn("el encargo #2 ya está trabajando; tu respuesta no se envió",
                       proc.stderr)
         self.assertEqual(self.paseo_calls("send"), [])
+
+    def test_answer_ignores_a_stale_cache_and_uses_fresh_state(self):
+        agents = self.seed([{"n": 2, "rev": "r1",
+                             "message": "¿Sigo?\nCREW: PREGUNTAS"}])
+        self.assertEqual(self.crew(["refresh"]).returncode, 0)
+        self.assertEqual(self.read_cache()["agents"][agents[0]["id"]]["state"],
+                         "esperando")
+        # The agent started working, but the cache still says it is waiting.
+        self.set_status(agents[0]["id"], "running", rev="r2")
+        fd = self.hold_refresh_lock()
+        try:
+            proc = self.crew_stdin(["answer", "2"], "una respuesta")
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("el encargo #2 ya está trabajando; tu respuesta no se envió",
+                      proc.stderr)
+        self.assertEqual(self.paseo_calls("send"), [])
+
+    def test_answer_marks_the_agent_working_and_keeps_its_rev(self):
+        agents = self.seed([{"n": 2, "rev": "r1",
+                             "message": "¿Sigo?\nCREW: PREGUNTAS"}])
+        self.assertEqual(self.crew(["refresh"]).returncode, 0)
+        proc = self.crew_stdin(["answer", "2"], "sí")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        entry = self.read_cache()["agents"][agents[0]["id"]]
+        self.assertEqual(entry["state"], "trabajando")
+        self.assertEqual(entry["rev"], "r1")
+
+        # The fresh check (not the cache) refuses the second answer: the first
+        # send already started a turn on the fake remote.
+        second = self.crew_stdin(["answer", "2"], "otra")
+        self.assertEqual(second.returncode, 2)
+        self.assertIn("el encargo #2 ya está trabajando; tu respuesta no se envió",
+                      second.stderr)
+        self.assertEqual(len(self.paseo_calls("send")), 1)
 
     def test_answer_with_secret_refuses(self):
         self.seed([{"n": 2, "rev": "r1",
@@ -395,6 +469,21 @@ class LastMessageTest(unittest.TestCase):
         self.assertEqual(last_message("[User] x\nrespuesta"), "respuesta")
         self.assertIsNone(last_message(""))
         self.assertIsNone(last_message("\n\n"))
+
+
+class ControlCharsTest(unittest.TestCase):
+    """Agent text loses escapes and control bytes before it is quoted."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+
+    def test_strips_ansi_and_control_bytes_but_keeps_tab_and_newline(self):
+        from crew.state import strip_control
+        self.assertEqual(strip_control("\x1b[2J\x1b]0;pwn\x07hola\rmundo"),
+                         "holamundo")
+        self.assertEqual(strip_control("a\tb\nc\x7f"), "a\tb\nc")
+        self.assertEqual(strip_control("texto \x1b(B normal"), "texto  normal")
+        self.assertIsNone(strip_control(None))
 
 
 class ClassifyTest(unittest.TestCase):

@@ -9,9 +9,11 @@ launches of the same project never pick the same `#n`.
 `refresh`, `status`, `questions`, `answer` and `cancel` work on the state of
 the project in the current directory (`--cwd` moves it for the first two).
 `status` and `questions` quote the agent's text as untrusted: a fixed header,
-every line behind `> `, and no end-of-turn marker. `answer` takes the
-project launch lock, refreshes, and only sends when the assignment is still
-waiting, so two chats cannot answer the same turn twice.
+every line behind `> `, no end-of-turn marker, and no terminal escapes or
+control bytes. `answer` takes the project launch lock, asks the host for the
+target agent's state directly (never the cache, which a lost single-flight
+refresh can leave stale), and only sends when the assignment is still waiting,
+so two chats cannot answer the same turn twice.
 
 The config lives outside the repo, in `$CREW_CONFIG` or
 `~/.config/crew/config.json`:
@@ -32,8 +34,9 @@ from .brief import SecretInBrief, build_brief, check_secrets, load_contract
 from .paseo import (CrewError, Paseo, check_brief, next_number, resolve,
                     ssh_prefix)
 from .project import project_of
-from .state import (LOGS_TAIL, QUESTIONS_HEADER, last_message, refresh,
-                    state_dir, without_marker)
+from .state import (LOGS_TAIL, QUESTIONS_HEADER, fresh_state, last_message,
+                    mark_working, refresh, state_dir, strip_control,
+                    without_marker)
 
 USAGE = """uso: crew launch --title T --brief-file F [--cwd DIR]
        crew brief --words-file W [--decision D]... [--constraint C]... [--base B]
@@ -216,7 +219,12 @@ def _number_arg(args: list[str]) -> int:
 
 
 def _quoted(number: int, text: str) -> str:
-    """The agent's text as a quote: fixed header, every line behind `> `."""
+    """The agent's text as a quote: fixed header, every line behind `> `.
+
+    Terminal escapes and control bytes are dropped first: the text is
+    untrusted and must not act on the terminal that shows the quote.
+    """
+    text = strip_control(text) or ""
     lines = "\n".join(f"> {line}" if line.strip() else ">"
                       for line in text.splitlines())
     return f"{QUESTIONS_HEADER.format(n=number)}\n{lines}\n"
@@ -286,12 +294,11 @@ def cmd_answer(args: list[str]) -> int:
     # The launch lock serializes answers (and launches): two chats must not
     # answer the same turn twice.
     with _launch_lock(project.slug):
-        cache = refresh(project.slug, paseo)
-        agents = [{"id": agent_id, "name": f"#{entry['n']} · "}
-                  for agent_id, entry in cache.get("agents", {}).items()
-                  if isinstance(entry, dict) and isinstance(entry.get("n"), int)]
-        agent = resolve(agents, number)
-        state = cache["agents"][agent["id"]].get("state")
+        # The number and the state both come from the host right now. A
+        # refresh could lose the single flight and return a stale cache that
+        # says `esperando` for an agent that already started working.
+        agent = resolve(paseo.ls(project.slug), number)
+        state = fresh_state(paseo, agent)
         if state != "esperando":
             if state == "trabajando":
                 raise CrewError(
@@ -301,6 +308,8 @@ def cmd_answer(args: list[str]) -> int:
                 f"el encargo #{number} no está esperando respuesta "
                 f"(estado: {state}); tu respuesta no se envió", 2)
         paseo.send(agent["id"], answer)
+        # `send` started a turn: the cached state is stale from here on.
+        mark_working(project.slug, agent["id"], number)
     sys.stdout.write(f"respuesta enviada al encargo #{number}\n")
     return 0
 

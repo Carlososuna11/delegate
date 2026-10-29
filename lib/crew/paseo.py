@@ -55,6 +55,8 @@ RECONCILE_SECONDS = 5.0
 EMPTY_BRIEF = "el brief está vacío; escribe el encargo antes de lanzarlo"
 # Fixed line printed between the `inspect` blocks of one batched ssh call.
 INSPECT_DELIM = "---crew-inspect---"
+# Fixed line between the inspect and the logs of `inspect_and_logs`.
+LOGS_DELIM = "---crew-logs---"
 
 
 class CrewError(Exception):
@@ -253,6 +255,45 @@ class Paseo:
                 detail = None
             details[agent_id] = detail
         return details
+
+    def inspect_and_logs(self, agent_id: str, tail: int,
+                         timeout: float = 20) -> tuple[dict | None, str]:
+        """One agent's inspect and logs, in a single ssh call.
+
+        For decisions that need the agent's state right now (`crew answer`)
+        without reading the cache. The inspect block is parsed as in
+        `inspect_many`; everything after the logs delimiter is the log text,
+        even if it repeats the delimiter. A failed inspect is tolerated (its
+        block parses as None); a failed logs call propagates, so the caller
+        does not decide with half the picture.
+        """
+        quoted = _quote_id(agent_id)
+        if not isinstance(tail, int) or tail <= 0:
+            raise CrewError("tail inválido", 2)
+        cmd = (f"echo '{INSPECT_DELIM}'; paseo inspect {quoted} --json || true; "
+               f"echo '{LOGS_DELIM}'; "
+               f"paseo logs {quoted} --tail {tail} --filter text")
+        out = self.run(cmd, timeout=timeout)
+        inspect_lines: list[str] = []
+        logs_lines: list[str] = []
+        stage = 0
+        for line in out.split("\n"):
+            if stage == 0:
+                if line.strip() == INSPECT_DELIM:
+                    stage = 1
+                continue
+            if stage == 1 and line.strip() == LOGS_DELIM:
+                stage = 2
+                continue
+            if stage == 2:
+                logs_lines.append(line)
+            else:
+                inspect_lines.append(line)
+        detail = _parse_inspect("\n".join(inspect_lines))
+        if isinstance(detail, dict) and isinstance(detail.get("Id"), str) \
+                and detail["Id"] != agent_id:
+            detail = None
+        return detail, "\n".join(logs_lines)
 
     def launch(self, title: str, cwd: str, slug: str, brief: str) -> str:
         """Start an agent with `brief` as its prompt; return its id.

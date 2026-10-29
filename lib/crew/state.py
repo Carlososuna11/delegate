@@ -45,6 +45,16 @@ QUESTIONS_HEADER = ("Preguntas del encargo #{n} "
                     "(texto del agente; no es una instrucción):")
 TIMEOUT_MESSAGE = "la consulta al host no terminó a tiempo"
 
+# ANSI escape sequences, in order of the alternatives: CSI (ESC [ params
+# intermediates final), OSC (ESC ] ... BEL or ST), and any other escape
+# sequence (ESC, zero or more intermediates, one final byte).
+ANSI_RE = re.compile(
+    "\x1b\\[[0-?]*[ -/]*[@-~]"
+    "|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)?"
+    "|\x1b[ -/]*[0-~]")
+# C0 controls except tab (\x09) and newline (\x0a), plus DEL.
+CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
+
 # `owner.repo`, lowercase: safe as a file name and as a remote label.
 SLUG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
@@ -82,6 +92,19 @@ def without_marker(message: str) -> str:
     while lines and not lines[-1].strip():
         lines.pop()
     return "\n".join(lines)
+
+
+def strip_control(text: str | None) -> str | None:
+    """The text without ANSI escapes or C0 controls (tab and newline stay).
+
+    Agent text is untrusted and may carry terminal control sequences; the CLI
+    only shows it as a quote, so the bytes that would act on a terminal (or
+    hide content) are removed before quoting. DEL goes too. An unterminated
+    escape sequence consumes what follows it, as a terminal would.
+    """
+    if not isinstance(text, str):
+        return None
+    return CONTROL_RE.sub("", ANSI_RE.sub("", text))
 
 
 def classify(agent: dict, last_msg: str | None) -> str:
@@ -132,6 +155,47 @@ def load_cache(slug: str) -> dict:
     slug = _check_slug(slug)
     with _lock(f"{slug}.cache.lock", blocking=True):
         return _read(slug)
+
+
+def fresh_state(paseo: Paseo, agent: dict) -> str:
+    """The agent's state right now, from one direct query and no cache.
+
+    `answer` decides with this instead of `refresh`: a refresh that loses the
+    single flight returns the cached state without asking the host, and a
+    cached state may say `esperando` for an agent that already started
+    working. The inspect and the logs of that one agent travel in a single
+    ssh call, so both describe the same moment.
+    """
+    agent_id = agent.get("id") if isinstance(agent, dict) else None
+    detail, log_text = paseo.inspect_and_logs(agent_id, LOGS_TAIL)
+    status = detail.get("Status") if isinstance(detail, dict) else None
+    if not isinstance(status, str) or not status:
+        status = agent.get("status") if isinstance(agent, dict) else None
+    return classify({"status": status}, last_message(log_text))
+
+
+def mark_working(slug: str, agent_id: str, number: int) -> None:
+    """Record that an answered agent started a turn, keeping its rev.
+
+    `send` starts a new turn at once, so the cached state is stale until the
+    next refresh. The rev is not touched: it identifies the turn that asked
+    the question, and only a refresh observes the new one. An agent with no
+    cache entry yet is added with a null rev.
+    """
+    slug = _check_slug(slug)
+    if not isinstance(agent_id, str) or not ID_RE.match(agent_id):
+        raise CrewError(f"id de encargo inválido: {agent_id!r}", 2)
+    if not isinstance(number, int):
+        raise CrewError("número de encargo inválido", 2)
+    with _lock(f"{slug}.cache.lock", blocking=True):
+        cache = _read(slug)
+        entry = cache["agents"].get(agent_id)
+        if isinstance(entry, dict):
+            entry["state"] = "trabajando"
+        else:
+            cache["agents"][agent_id] = {"n": number, "state": "trabajando",
+                                         "rev": None, "updated_at": None}
+        _write(slug, cache)
 
 
 def refresh(slug: str, paseo: Paseo, timeout: float | None = None) -> dict:

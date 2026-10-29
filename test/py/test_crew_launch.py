@@ -170,6 +170,32 @@ def main(argv):
             sys.stdout.flush()
         except OSError:
             pass
+    elif cmd == "send":
+        # Like the real thing, a send starts a turn: the agent is running now
+        # and its UpdatedAt moves.
+        target = argv[2] if len(argv) > 2 else ""
+
+        def start_turn():
+            current = load()
+            for agent in current:
+                if agent.get("id") == target:
+                    agent["status"] = "running"
+            store(current)
+            try:
+                with open(INSPECT, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                data = {}
+            entry = data.get(target) if isinstance(data, dict) else None
+            if isinstance(entry, dict):
+                entry["Status"] = "running"
+                entry["UpdatedAt"] = "sent-{:f}".format(time.time())
+                tmp = INSPECT + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                os.replace(tmp, INSPECT)
+        locked(start_turn)
+        emit("")
     elif cmd == "stop":
         target = argv[1] if len(argv) > 1 else ""
 
