@@ -811,6 +811,34 @@ máquina; nada se agrega solo), fallback o enrutamiento automático entre provee
 la cuenta equivocada), y enforcement automático a partir de `residency` — eso último es
 teatro de seguridad: la nota se muestra y la elección del proveedor queda explícita.
 
+## Crew
+
+Crew dirige al equipo: convierte lo que se dicta en un chat en encargos para agentes
+que corren en paralelo en un host remoto (Paseo), y los sigue. Spec:
+`docs/specs/2026-10-29-crew-design.md`.
+
+- **Es un cliente aparte.** Vive en `bin/crew`, `lib/crew/` y `crew/` (contrato, skill,
+  hook). No toca `delegate`, `delegate-run` ni `lib/delegate_run`, y sus invariantes no
+  cambian: lo que Crew hace y `delegate` prohíbe (elegir destino, lanzar agentes de
+  Claude en Paseo) vive solo en el código de Crew.
+- **Config:** `~/.config/crew/config.json` (`CREW_CONFIG`): `{"host": ..., "orgs":
+  {"<owner de GitHub>": "<cwd remoto>"}}`. Un repo cuyo owner no está ahí no tiene destino.
+- **Encargos:** título `#<n> · <título>`, etiquetas `crew=1`, `crew-project=<owner.repo>`
+  y `crew-req=<uuid>`. El estado real está en Paseo; la caché por proyecto
+  (`~/.local/state/crew/`, `CREW_STATE_DIR`) es solo una copia para el hook y nunca
+  guarda títulos.
+- **Contrato** (`crew/contract.md`, va al final de cada brief): el agente termina cada
+  turno con una marca en la última línea: `CREW: PREGUNTAS`, `CREW: ENTREGA` o
+  `CREW: BLOQUEADO`. Sin marca, el turno cuenta como terminado sin más.
+- **Texto que no es de confianza:** lo que escribe un agente se muestra citado bajo una
+  cabecera fija y nunca llega al hook; el hook solo emite frases fijas con números
+  validados. Todo texto que sale (brief, título, respuesta) pasa por `check_secrets`, y
+  el error nunca repite el valor.
+- **Tests:** `test/py/test_crew_*.py`, dentro de `test/run.sh`. Sin red: `CREW_SSH`
+  apunta a `test/py/fake_ssh.py` con un `paseo` falso en el `$HOME` remoto,
+  `CREW_STATE_DIR` y `CREW_CONFIG` a directorios temporales, y `CREW_BIN` al binario que
+  el hook lanza para refrescar.
+
 ## Qué NO delegar
 
 Vale para la herramienta y para quien la use: secrets, PII de clientes, datos o consultas

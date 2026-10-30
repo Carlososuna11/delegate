@@ -1,0 +1,5 @@
+1. ¿Usamos el sufijo del framework (`*.test.ts` / `test_*.py`) o una carpeta `tests/` aparte? Te recomiendo el sufijo junto al archivo que prueba, porque lo encuentra cualquier runner sin configurar nada.
+
+2. ¿Nombramos el archivo por el módulo (`user-service.test.ts`) o por el comportamiento (`login-flow.test.ts`)? Te recomiendo nombrarlo por el módulo en las pruebas unitarias y por el comportamiento en las E2E.
+
+CREW: PREGUNTAS

@@ -1,0 +1,1 @@
+La marca CREW: ENTREGA se usa al terminar un trabajo. Su función es avisar que la tarea quedó completa y que el resultado ya se puede revisar. No hace falta repetirla en cada mensaje, solo en el cierre real de la tarea. Listo por ahora.

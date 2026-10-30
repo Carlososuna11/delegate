@@ -1,0 +1,22 @@
+[
+  {
+    "id": "60aa9fa8-39a4-4f0a-b7d6-95f49d309de7",
+    "shortId": "60aa9fa",
+    "name": "crew fixture 2",
+    "provider": "claude/claude-opus-5-5",
+    "thinking": "auto",
+    "status": "idle",
+    "cwd": "/tmp",
+    "created": "just now"
+  },
+  {
+    "id": "e1ef3bc9-d5e5-4689-bbce-72c4b76ff3d1",
+    "shortId": "e1ef3bc",
+    "name": "crew fixture 1",
+    "provider": "claude/claude-opus-5-5",
+    "thinking": "auto",
+    "status": "idle",
+    "cwd": "/tmp",
+    "created": "just now"
+  }
+]
