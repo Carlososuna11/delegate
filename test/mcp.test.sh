@@ -136,6 +136,7 @@ reset_globals() {
   unset DG_MCP_JSON DG_MCP_TOOLS DG_MCP_RULES
   DG_MCP_ENV=()
   DG_MCP_NEED=()
+  DG_MCP_OAUTH=()
 }
 
 # A refusal must leave nothing behind. `''` when unset, so this reads as "no
@@ -147,6 +148,7 @@ assert_globals_unset() {
   assert_eq '' "${DG_MCP_RULES+set}" "$msg: DG_MCP_RULES is not set"
   assert_eq '' "${DG_MCP_ENV+set}" "$msg: DG_MCP_ENV is not set"
   assert_eq '' "${DG_MCP_NEED+set}" "$msg: DG_MCP_NEED is not set"
+  assert_eq '' "${DG_MCP_OAUTH+set}" "$msg: DG_MCP_OAUTH is not set"
 }
 
 # ── dg_mcp_dir ──────────────────────────────────────────────────────────────
@@ -650,6 +652,33 @@ test_no_server_requested_grants_nothing() {
   assert_eq '' "$(dg_global DG_MCP_RULES)" "and it is empty"
   assert_eq 0 "${#DG_MCP_ENV[@]}" "DG_MCP_ENV is an empty array"
   assert_eq 0 "${#DG_MCP_NEED[@]}" "DG_MCP_NEED is an empty array"
+  assert_eq 0 "${#DG_MCP_OAUTH[@]}" "DG_MCP_OAUTH is an empty array"
+}
+
+test_resolve_reports_only_the_entries_that_need_claude_code_oauth() {
+  local dir="$TMP/oauthdir"
+  mkdir -p "$dir"
+  # A remote entry with no env_passthrough can only use the login Claude Code
+  # saved: its <id>\t<url> pair is reported.
+  write_kv "$dir/figma" transport http url 'https://mcp.figma.com/mcp' tools_read 'get_design_context'
+  # A token forwarded from the parent is the server's own: nothing to copy.
+  write_kv "$dir/token" transport http url 'https://token.example.test/mcp' \
+    tools_read 'get_thing' env_passthrough 'SERVER_TOKEN'
+  # stdio runs on this machine and never touches the saved login.
+  write_kv "$dir/local" transport stdio command npx trust local-exec tools_read 'get_thing'
+  # sse is remote too, and has the same one-place-for-a-token shape.
+  write_kv "$dir/events" transport sse url 'https://events.example.test/mcp' tools_read 'get_thing'
+
+  reset_globals
+  capture dg_mcp_resolve "$dir" figma,token,local,events ''
+  assert_eq 0 "$RC" "the four servers resolve"
+  assert_eq 2 "${#DG_MCP_OAUTH[@]}" "only the two remote entries without env_passthrough are reported"
+  assert_eq $'figma\thttps://mcp.figma.com/mcp' "${DG_MCP_OAUTH[0]}" "the first pair, in requested order"
+  assert_eq $'events\thttps://events.example.test/mcp' "${DG_MCP_OAUTH[1]}" "and the second"
+  assert_not_contains "$(printf '%s\n' "${DG_MCP_OAUTH[@]}")" 'token' \
+    "an entry with env_passthrough is not reported"
+  assert_not_contains "$(printf '%s\n' "${DG_MCP_OAUTH[@]}")" 'local' \
+    "a stdio entry is not reported"
 }
 
 test_read_only_server_builds_the_json_and_the_allowlist() {

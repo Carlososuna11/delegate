@@ -276,6 +276,31 @@ otra no tenga. Su login OAuth lo guarda Claude Code indexado por nombre y config
 servidor, así que una entrada `figma` apuntando a `https://mcp.figma.com/mcp` reusa ese
 login y **ningún token pasa por acá** — por eso su `env_passthrough` está vacío.
 
+**El login guardado y el sandbox.** Un `http` o `sse` sin `env_passthrough` no tiene
+token propio: la única fuente es el login que Claude Code guardó en
+`~/.claude/.credentials.json`, bajo `mcpOAuth`, con la clave `<id>|<url>`. El sandbox
+esconde el HOME, así que sin una copia el servidor no conecta y la corrida arranca con
+cero herramientas. Por eso, y solo cuando la corrida pide una entrada así bajo
+`--sandbox bwrap`, `delegate` arma **afuera** del sandbox y **antes** de leer la key un
+store mínimo en el directorio privado de la corrida (700, archivo 600): una sola clave,
+con `accessToken`, `expiresAt`, `serverName` y `serverUrl` de ese servidor. Nada más de
+`~/.claude` ni de `~/.claude.json` cruza: ni el login de Anthropic, ni tokens de otros
+servidores MCP, ni historial, ni settings. Se monta en solo lectura en
+`$HOME/.claude/.credentials.json` y se borra con el resto del directorio privado al
+terminar, en todo camino de salida que se pueda atrapar. Sin sandbox el hijo ve el
+archivo real y no se arma nada; una corrida que no pide un servidor así ni lo abre.
+
+**Refresh: solo un access token todavía válido.** No se copia el `refreshToken`: si el
+hijo refrescara con él y el autorizador rota el token en cada uso, el login original del
+usuario quedaría invalidado mientras el store efímero se descarta, y la próxima sesión
+interactiva tendría que autenticarse de nuevo. Si el access token venció o le quedan
+menos de cinco minutos, la corrida se rechaza con 2 y un mensaje que pide abrir Claude
+Code una vez para renovarlo. Si el archivo o la entrada no existen, también se rechaza
+antes de leer la key, nombrando el par `<id>|<url>` que se buscó, en vez de arrancar con
+cero herramientas. El límite de la heurística: la ausencia de `env_passthrough` se lee
+como "usa el login guardado", así que un servidor remoto público sin auth no encaja en
+esta forma de entrada.
+
 ## Cuentas
 
 `<key_dir>/api_key.<cuenta>` (modo 600) es la fuente de verdad. `--account <nombre>` y
@@ -470,7 +495,12 @@ Lo que ve el hijo:
 - `/usr` (y los symlinks `/bin`, `/lib*`) y `/etc` en solo lectura, `/proc` propio,
   `/dev` mínimo, y del `/run` solo el archivo al que apunta `/etc/resolv.conf`.
 - `/tmp` y `HOME` como tmpfs privados: del home real no hay nada salvo lo que se monta
-  encima (el directorio del binario de `claude`, en solo lectura).
+  encima (el directorio del binario de `claude`, en solo lectura) y, cuando la corrida
+  pidió un servidor MCP que usa el login OAuth guardado por Claude Code, un archivo
+  `$HOME/.claude/.credentials.json` en solo lectura con **solo** la entrada de ese
+  servidor (access token, vencimiento, nombre y url). El directorio `~/.claude` existe
+  en el tmpfs para que el harness escriba su estado, pero el resto de `~/.claude` y
+  `~/.claude.json` no está adentro. Ver "MCP = data" para la decisión de refresh.
 - El worktree en escritura; el gitdir del repo (común y del worktree) en solo lectura,
   montado **después**: git lee historia, pero ni una ref, ni la config, ni un hook del
   repo del usuario se pueden escribir (un `git commit` adentro falla, y el runner hace
@@ -506,6 +536,10 @@ Lo que **no** cierra:
   proveedor exige un proxy y `--unshare-net`: trabajo futuro.
 - La key está en el environment del harness, dentro del sandbox: con `bash` el modelo
   la lee de `/proc/self/environ` y, con la red abierta, puede mandarla a donde quiera.
+  Lo mismo vale para el access token del servidor MCP cuyo OAuth se copió: está en un
+  archivo legible adentro y, con `--bash`, el modelo puede leerlo y exfiltrarlo. No
+  alcanza el login de Anthropic ni los tokens de otros servidores, y vence; el
+  `refreshToken` no cruza justamente para que no pueda renovarlo.
 - Los checks corren en su propio sandbox (abajo), pero con lo que se monta para la
   toolchain: un ejecutable de esos directorios lo puede leer el código del modelo.
 - `/usr` y `/etc` completos son legibles; las herramientas instaladas en el home
@@ -718,6 +752,14 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   servidor, y **antes** de leer la key; presente, la deja pasar. Se resuelve contra
   `--dir`, no contra el cwd del CLI. Y una entrada declarada pero **no pedida** no bloquea
   nada: la precondición de un servidor que no se alcanza no es precondición de la corrida.
+- Con `--sandbox bwrap`, un servidor `http`/`sse` sin `env_passthrough` recibe un store
+  de credenciales mínimo con **solo** su entrada: ni el login de Anthropic, ni tokens de
+  otros servidores, ni `refreshToken`, ni historial, ni settings; el archivo queda en 600
+  dentro de un directorio 700 y montado en `$HOME/.claude/.credentials.json`, con el resto
+  de `~/.claude` invisible. Sin ese pedido no se monta nada (el archivo real puede estar
+  ilegible y la corrida igual pasa). El store desaparece al terminar, también cuando el
+  hijo falla. Una entrada ausente o un token vencido o por vencer rechazan la corrida con
+  2, nombrando el servidor y el par buscado, **antes** de leer la key.
 - Una entrada vacía, relativa o dentro de `--dir` en el `PATH` nunca aporta un
   binario, ni al hijo ni al propio CLI. Hasta que `cmd_run` filtra el `PATH` del
   llamador contra `--dir`, el CLI corre todo por nombre con `PATH=/usr/bin:/bin`: el

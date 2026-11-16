@@ -67,7 +67,7 @@ unset -v _dg_fn
 for _dg_fn in $(compgen -e); do
   case "$_dg_fn" in
     _DG_*|_dg_*) unset -v "$_dg_fn" 2>/dev/null || true ;;
-    DG_ROOT|DG_BIN|DG_LINK|DG_TOOLS|DG_ALLOWED|DG_RULES|DG_MCP_JSON|DG_MCP_TOOLS|DG_MCP_ENV|DG_MCP_RULES)
+    DG_ROOT|DG_BIN|DG_LINK|DG_TOOLS|DG_ALLOWED|DG_RULES|DG_MCP_JSON|DG_MCP_TOOLS|DG_MCP_ENV|DG_MCP_RULES|DG_MCP_OAUTH)
       unset -v "$_dg_fn" 2>/dev/null || true ;;
   esac
 done
@@ -124,6 +124,8 @@ source "$DG_ROOT/lib/accounts.sh"
 source "$DG_ROOT/lib/permissions.sh"
 # shellcheck source=../lib/mcp.sh
 source "$DG_ROOT/lib/mcp.sh"
+# shellcheck source=../lib/claude_oauth.sh
+source "$DG_ROOT/lib/claude_oauth.sh"
 
 if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
   B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
@@ -536,6 +538,17 @@ dg_sandbox_argv() {
   if [[ "${HOME:-}" == /?* ]]; then
     _DG_X_SBX+=(--perms 0700 --tmpfs "$HOME")
   fi
+  # An MCP server that uses the OAuth login Claude Code saved gets a MINIMAL
+  # store: one entry, mounted read-only at the one path Claude Code reads, on
+  # top of the private HOME. The file is the only thing from ~/.claude that
+  # enters, and it is read-only so nothing can write a refreshed token back to
+  # the user's real login. Built outside the sandbox; see lib/claude_oauth.sh.
+  if [[ -n "${_DG_SBX_OAUTH_CREDS:-}" ]]; then
+    [[ "${HOME:-}" == /?* ]] ||
+      die "el login OAuth del sandbox necesita un HOME absoluto"
+    _DG_X_SBX+=(--dir "$HOME/.claude"
+      --ro-bind "$_DG_SBX_OAUTH_CREDS" "$HOME/.claude/.credentials.json")
+  fi
   # The harness: a native (ELF) binary is mounted alone; a script (an npm
   # install's cli.js) needs its package directory. Never a directory that is
   # HOME or holds it: a `claude` sitting in ~/bin or ~ would mount all of it.
@@ -570,6 +583,12 @@ cmd_run() {
   local format='text' timeout_s='' model=''
   # Repeatable, so they accumulate as comma-separated lists for lib/mcp.sh.
   local mcp_read='' mcp_write=''
+  # The minimal OAuth store, when a sandboxed run needs one: the credentials
+  # file it came from and the JSON body built from it. `local +x` because an
+  # exported variable of the same name would keep its export attribute and put
+  # the token in the environment of every helper between here and the child.
+  local +x oauth_file='' oauth_json=''
+  _DG_SBX_OAUTH_CREDS=''
   local sandbox='off'
   local -a sandbox_ro=()
 
@@ -677,6 +696,7 @@ cmd_run() {
   DG_MCP_RULES=''
   DG_MCP_ENV=()
   DG_MCP_NEED=()
+  DG_MCP_OAUTH=()
   if [[ "$mode" == 'agent' ]]; then
     # Which servers exist is the machine owner's declaration; which ones this run
     # reaches is the invocation's. Resolving the entries first means an unknown
@@ -778,6 +798,17 @@ cmd_run() {
     # file owns the local tool lattice and must stay ignorant of which servers
     # exist.
     [[ -n "$DG_MCP_TOOLS" ]] && DG_ALLOWED="$DG_ALLOWED,$DG_MCP_TOOLS"
+    # A sandboxed run has a private tmpfs for HOME, so the login Claude Code
+    # saved for an MCP server (an http or sse entry with no env_passthrough) is
+    # invisible to the child and the server never connects. Build the minimal
+    # store here, after every other validation and before the key is read: a
+    # missing entry or an expired token stops the run with a message instead of
+    # starting it with zero tools. Runs without a sandbox see the real file and
+    # need nothing; runs that ask for no such server never open it.
+    if [[ "$sandbox" == 'bwrap' ]] && (( ${#DG_MCP_OAUTH[@]} )); then
+      oauth_file="$(dg_oauth_source_file)"
+      oauth_json="$(dg_oauth_minimal_json "$oauth_file" "${DG_MCP_OAUTH[@]}")" || exit 2
+    fi
   else
     DG_TOOLS=''
     DG_ALLOWED=''
@@ -841,6 +872,18 @@ cmd_run() {
   stub_dir="$(mktemp -d -p "$stub_parent" delegate-stubs.XXXXXXXX)" ||
     die "no pude crear el directorio de stubs en $stub_parent"
   _DG_X_STUBS="$stub_dir"
+  # The minimal OAuth store goes INSIDE the run's private directory, so the
+  # existing cleanup removes it on every exit path that can be trapped (the
+  # child's exit, TERM/INT/HUP, and this shell's own EXIT trap until the exec).
+  # The file is 600 and the directory 700 from creation.
+  if [[ -n "$oauth_json" ]]; then
+    dg_oauth_write_store "$stub_dir/claude-oauth" "$oauth_json" ||
+      die "no pude crear el store OAuth temporal del sandbox"
+    oauth_json=''
+    _DG_SBX_OAUTH_CREDS="$stub_dir/claude-oauth/.credentials.json"
+    dg_sbx_overlaps "$(readlink -f -- "$_DG_SBX_OAUTH_CREDS")" "$_DG_SBX_KEYDIR" &&
+      die "el store OAuth temporal del sandbox se cruza con el key_dir"
+  fi
   # Absolute: the cleanup runs after the environment wipe, when PATH is gone.
   _DG_X_RM="$(type -P rm)" || die "no encuentro rm en el PATH"
   trap 'dg_cleanup_stubs' EXIT

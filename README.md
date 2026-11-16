@@ -132,6 +132,7 @@ Reglas de la declaración:
 - Un servidor `http` o `sse` solo acepta URLs `https`.
 - Un servidor `stdio` necesita además la línea `trust local-exec`, porque es un binario que corre con los privilegios del proceso delegado.
 - `env_passthrough` lista **nombres** de variables, nunca valores.
+- Un servidor `http` o `sse` sin `env_passthrough` usa el login OAuth que Claude Code guardó para ese nombre y esa URL. Con sandbox, `delegate` monta solo esa entrada, en solo lectura; si no existe o el access token venció, la corrida se rechaza en vez de arrancar sin herramientas. Abre Claude Code una vez para renovarlo. El `refreshToken` nunca cruza al sandbox.
 - `rules` agrega instrucciones al prompt de la corrida solo cuando ese servidor está habilitado. `delegate mcp list` las muestra completas para que las revises.
 
 ## delegate-run: corridas aisladas y en paralelo
@@ -175,7 +176,7 @@ El `report` del modelo es evidencia, no una autorización.
 **Sandbox.** Con `bwrap` disponible, el proceso delegado y los checks corren en bubblewrap:
 
 - `/usr` y `/etc` en solo lectura;
-- `HOME` y `/tmp` vacíos;
+- `HOME` y `/tmp` vacíos, salvo el archivo mínimo de login OAuth del servidor MCP pedido, si lo hay;
 - el worktree en escritura;
 - la historia de git en solo lectura;
 - ningún archivo de keys montado.
