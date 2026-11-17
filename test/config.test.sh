@@ -531,11 +531,11 @@ test_lists_nothing_for_an_empty_or_missing_directory() {
 test_reads_the_provider_files_that_ship_with_the_tool() {
   local root path expected
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  expected="$(printf '%s\n' deepseek qwen)"
+  expected="$(printf '%s\n' deepseek opencode-go qwen)"
   capture dg_config_providers "$root/providers.d"
-  assert_eq "$expected" "$OUT" "providers.d holds deepseek and qwen"
+  assert_eq "$expected" "$OUT" "providers.d holds deepseek, opencode-go and qwen"
 
-  for path in deepseek qwen; do
+  for path in deepseek opencode-go qwen; do
     capture dg_config_parse "$root/providers.d/$path" "$path"
     assert_eq 0 "$RC" "providers.d/$path parses"
     assert_contains "$OUT" $'key_dir\t~/.' "providers.d/$path points key_dir at ~/"
@@ -549,6 +549,9 @@ test_reads_the_provider_files_that_ship_with_the_tool() {
   assert_contains "$OUT" $'auth_env\tANTHROPIC_API_KEY' "deepseek sends x-api-key"
   capture dg_config_parse "$root/providers.d/qwen" qwen
   assert_contains "$OUT" $'auth_env\tANTHROPIC_AUTH_TOKEN' "qwen sends a bearer token"
+  # OpenCode Go answers a bearer token with 401 Missing API key.
+  capture dg_config_parse "$root/providers.d/opencode-go" opencode-go
+  assert_contains "$OUT" $'auth_env\tANTHROPIC_API_KEY' "opencode-go sends x-api-key"
 }
 
 run_tests
