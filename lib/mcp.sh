@@ -55,6 +55,15 @@
 #                   none. Whether a path exists is not decided here — this
 #                   library never touches the filesystem outside the entry
 #                   directory, and the working directory belongs to bin/delegate.
+#     DG_MCP_OAUTH  array of `<id>\t<url>` entries, one per requested server
+#                   whose transport is http or sse and whose entry sets no
+#                   env_passthrough. Such an entry has no token of its own, so
+#                   the only login it can use is the OAuth one Claude Code
+#                   saved under `mcpOAuth` for that name and url; bin/delegate
+#                   finds it by those fields and builds a minimal, read-only
+#                   store from it when the run is sandboxed. Empty array when
+#                   no requested server is of that shape. This library only
+#                   reports the pair: it never reads the credentials file.
 #
 #   On an unknown id, an id that appears twice in the same list, an entry that
 #   fails to parse, or a write request against an entry with no tools_write,
@@ -144,6 +153,13 @@
 # `figma` pointing at https://mcp.figma.com/mcp reuses the saved login and no
 # token passes through here — which is exactly why env_passthrough is empty for
 # it, and worth a comment in the example.
+#
+# That absence is also how resolve recognises an entry that depends on the saved
+# login: http or sse with no env_passthrough has no other place to get a token.
+# It reports the `<id>\t<url>` pair in DG_MCP_OAUTH and touches no file. The
+# sandboxed run is where that pair is matched against the saved login and turns
+# into a minimal credentials store; see lib/claude_oauth.sh and the MCP section
+# of CLAUDE.md.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests go in test/mcp.test.sh. Every rejection rule needs a case proving it
@@ -615,7 +631,7 @@ dg_mcp_resolve() {
   # Cleared on entry, before any return. The globals were only assigned on
   # success, so a refusal kept the JSON, tools and env names of the previous
   # call — a refused run readable as a granted one. Verified.
-  unset DG_MCP_JSON DG_MCP_TOOLS DG_MCP_RULES DG_MCP_ENV DG_MCP_NEED
+  unset DG_MCP_JSON DG_MCP_TOOLS DG_MCP_RULES DG_MCP_ENV DG_MCP_NEED DG_MCP_OAUTH
 
   if (( $# != 3 )); then
     _dg_mcp_usage dg_mcp_resolve '<dir> <read_ids> <write_ids>'
@@ -624,7 +640,7 @@ dg_mcp_resolve() {
 
   local dir="$1" read_ids="$2" write_ids="$3"
   local -a reads=() writes=() ids=()
-  local -a env_names=() tools=() json_parts=() needs=()
+  local -a env_names=() tools=() json_parts=() needs=() oauth=()
   local id='' srv='' file='' parsed='' line='' key='' value='' fragment=''
   local in_write='' transport='' url='' command='' args='' entry_env='' entry_req=''
   local t_read='' t_write='' tool='' name='' list='' rest='' seen_tools=' '
@@ -659,6 +675,7 @@ dg_mcp_resolve() {
     DG_MCP_RULES=''
     DG_MCP_ENV=()
     DG_MCP_NEED=()
+    DG_MCP_OAUTH=()
     return 0
   fi
 
@@ -704,6 +721,15 @@ dg_mcp_resolve() {
       # that merely had fewer tools.
       _dg_mcp_err "$id" 'no tools_write in this entry, write cannot be requested'
       return 2
+    fi
+
+    # A remote entry with no env_passthrough has no token of its own: the login
+    # Claude Code saved for this name and url is the only one it can use.
+    # Reported, not read: this library never opens the credentials file.
+    # bin/delegate matches the pair against the entries' own serverName and
+    # serverUrl fields (their keys are a hash) to build a minimal sandbox store.
+    if [[ "$transport" == http || "$transport" == sse ]] && [[ -z "$entry_env" ]]; then
+      oauth+=("$id"$'\t'"$url")
     fi
 
     # A write request grants the read tools too: the entry's own tools_read, plus
@@ -786,5 +812,7 @@ dg_mcp_resolve() {
   if (( ${#env_names[@]} )); then DG_MCP_ENV=("${env_names[@]}"); fi
   DG_MCP_NEED=()
   if (( ${#needs[@]} )); then DG_MCP_NEED=("${needs[@]}"); fi
+  DG_MCP_OAUTH=()
+  if (( ${#oauth[@]} )); then DG_MCP_OAUTH=("${oauth[@]}"); fi
   return 0
 }
