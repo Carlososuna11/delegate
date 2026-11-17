@@ -1228,6 +1228,29 @@ test_account_default_sets_and_prints() {
   assert_eq "uno" "$OUT" "the default is printed"
 }
 
+test_account_current_prints_the_account_a_run_would_use() {
+  setup_env
+  write_provider alpha
+  write_key uno
+  write_key dos
+  activate_key uno
+  dg_run account alpha current
+  assert_eq 0 "$RC" "current exits 0"
+  assert_eq "uno" "$OUT" "the active account when there is no default"
+  printf 'dos\n' > "$TMP/keys/default_account"
+  dg_run account alpha current
+  assert_eq "dos" "$OUT" "the default wins over the active one, as in a run"
+  export DELEGATE_ACCOUNT=uno
+  dg_run account alpha current
+  unset DELEGATE_ACCOUNT
+  assert_eq "uno" "$OUT" "DELEGATE_ACCOUNT wins over both"
+  assert_no_key_leak "account current"
+  rm "$TMP/keys/api_key" "$TMP/keys/default_account"
+  dg_run account alpha current
+  assert_eq 2 "$RC" "no account to fall back to exits 2"
+  assert_eq "" "$OUT" "and prints nothing on stdout"
+}
+
 test_account_rm_needs_the_name_to_confirm() {
   setup_env
   write_provider alpha

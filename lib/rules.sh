@@ -55,11 +55,18 @@ _DG_RULES_MAX_BYTES=2000
 # Above this, step 1 asks for the file's headings instead of the whole file.
 _DG_RULES_POINTER_MAX_LINES=300
 _DG_RULES_PLACEHOLDER='@REPO_RULES@'
+# The pointer counts lines in at most this many bytes of the file.
+_DG_RULES_POINTER_MAX_SCAN=1048576
+# What the pointer says the repository's file may decide, and which of its
+# @includes to follow. Step numbers are the core's with step 1 present.
+_DG_RULES_POINTER_SCOPE='sus convenciones mandan sobre los pasos 2 a 6. Si tiene líneas @archivo, lee solo las de ruta relativa dentro del repositorio, nunca una ruta absoluta ni una que empiece con ~.'
 # A remote pattern is a regular expression matched by delegate-run (Python
 # re.search) against `remote.origin.url`. The charset is the subset where
 # POSIX ERE and Python agree, and it excludes the comma that separates them.
 _DG_RULES_RE_REMOTE='^[]A-Za-z0-9._:/@^$|()?+*[-]+$'
 _DG_RULES_RE_SHA='^[0-9a-f]{64}$'
+# `[:name:]` or `[.name.]`: the POSIX bracket classes Python does not have.
+_DG_RULES_RE_POSIX_CLASS='\[:[^]]*:\]|\[\.[^]]*\.\]'
 
 # Every C0 control character except the line feed, plus DEL. Built once.
 _dg_rules_ctl=''
@@ -173,11 +180,15 @@ _dg_rules_valid_list() {
   return 0
 }
 
-# _dg_rules_valid_remotes <value>: the charset, and every pattern compiles.
+# _dg_rules_valid_remotes <value>: the charset, no POSIX bracket class, and
+# every pattern compiles as an ERE. Cheap: it runs on every pack load.
 _dg_rules_valid_remotes() {
   local item rc
   local -a items=()
   _dg_rules_valid_list "$1" "$_DG_RULES_RE_REMOTE" || return 1
+  # `[:alpha:]` and `[.a.]` inside a bracket are classes to ERE and plain
+  # characters to Python. `[:/]` alone is fine: both read it as `:` or `/`.
+  [[ ! "$1" =~ $_DG_RULES_RE_POSIX_CLASS ]] || return 1
   IFS=, read -r -a items <<<"$1"
   for item in "${items[@]}"; do
     rc=0
@@ -185,6 +196,19 @@ _dg_rules_valid_remotes() {
     (( rc != 2 )) || return 1
   done
   return 0
+}
+
+# _dg_rules_remotes_agree <value>: every pattern also compiles in Python's re,
+# warnings as errors, which is what delegate-run matches with (`a**` and `x)`
+# are ERE but not Python). Only `rules add` and `rules check` call it: a run
+# never uses `remotes`, so a run does not need python3.
+_dg_rules_remotes_agree() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -I -W error -c '
+import re, sys
+for p in sys.argv[1].split(","):
+    re.compile(p)
+' "$1" >/dev/null 2>&1
 }
 
 # _dg_rules_parse_pack <file> <id>: the metadata, strictly, into _DG_PACK_*.
@@ -270,12 +294,17 @@ dg_rules_pointer() {
     [[ -f "$root/$name" ]] || continue
     real="$(readlink -f -- "$root/$name")" || continue
     [[ "$real" == "$root"/* && -f "$real" ]] || continue
-    n="$(wc -l <"$real")" || continue
+    # Bounded in time and bytes: the file can be swapped for a FIFO after the
+    # -f check, or be huge. A failed count is no pointer.
+    n="$(timeout 5 head -c "$_DG_RULES_POINTER_MAX_SCAN" -- "$real" | wc -l)" || continue
+    # The repository's file rules its own conventions (steps 2 to 6), never
+    # the rest of the system prompt; and an @include out of the tree (the
+    # owner's ~/.config, an absolute path) is not the repository's to give.
     if (( n <= _DG_RULES_POINTER_MAX_LINES )); then
-      printf 'Lee %s completo antes de nada; sus reglas mandan sobre estas. Si tiene líneas @archivo, lee esos también.' "$name"
+      printf 'Lee %s completo antes de nada; %s' "$name" "$_DG_RULES_POINTER_SCOPE"
     else
-      printf "%s tiene %d líneas: corre grep -n '^#' %s y lee solo las secciones de lo que vas a tocar. Sus reglas mandan sobre estas." \
-        "$name" "$n" "$name"
+      printf "%s tiene %d líneas: corre grep -n '^#' %s y lee solo las secciones de lo que vas a tocar; %s" \
+        "$name" "$n" "$name" "$_DG_RULES_POINTER_SCOPE"
     fi
     return 0
   done
@@ -336,8 +365,8 @@ dg_rules_add() {
   fi
   _dg_rules_valid_list "$accounts" "$_DG_ACCOUNT_NAME_RE" ||
     { _dg_rules_err "$id: --accounts must list at least one valid account name, separated by commas"; return 2; }
-  if [[ -n "$remotes" ]] && ! _dg_rules_valid_remotes "$remotes"; then
-    _dg_rules_err "$id: --remotes must be patterns separated by commas, from A-Z a-z 0-9 and . _ : / @ ^ \$ | ( ) ? + * [ ] -, and valid as a regex"
+  if [[ -n "$remotes" ]] && ! { _dg_rules_valid_remotes "$remotes" && _dg_rules_remotes_agree "$remotes"; }; then
+    _dg_rules_err "$id: --remotes must be patterns separated by commas, from A-Z a-z 0-9 and . _ : / @ ^ \$ | ( ) ? + * [ ] -, valid as a regex the same way in POSIX ERE and in Python (no [: or [. classes; python3 checks it)"
     return 2
   fi
   [[ -f "$from" ]] || { _dg_rules_err "$id: $from is not a file"; return 2; }

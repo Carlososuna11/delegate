@@ -186,6 +186,7 @@ ${B}CUENTAS${R}
   delegate account <proveedor> use <cuenta>      ${D}cambia la activa (global)${R}
   delegate account <proveedor> rm <cuenta>
   delegate account <proveedor> default [cuenta]  ${D}default por invocación${R}
+  delegate account <proveedor> current           ${D}la cuenta que usa una corrida sin --account${R}
 
 ${B}PAQUETES DE REGLAS${R} ${D}(~/.config/delegate/rules.d, o DELEGATE_RULES_DIR)${R}
   delegate rules list                            ${D}imprime cada paquete completo${R}
@@ -339,6 +340,14 @@ cmd_account() {
         ok "borrada la cuenta ${B}${name}${R}"
       fi
       ;;
+    current)
+      # What a run without --account resolves to, by the same function, and
+      # without touching the key. delegate-run asks this to choose code-rule
+      # packs the run's account may use.
+      local resolved
+      resolved="$(resolve_account_name '')" || exit 2
+      printf '%s\n' "$resolved"
+      ;;
     default)
       if [[ -z "$name" ]]; then
         dg_account_default_get "$kd" || die "no hay cuenta default para $provider"
@@ -350,7 +359,7 @@ cmd_account() {
       fi
       ;;
     *)
-      die "acción desconocida: $action ${D}(list | add | use | rm | default)${R}"
+      die "acción desconocida: $action ${D}(list | add | use | rm | default | current)${R}"
       ;;
   esac
 }
@@ -498,10 +507,13 @@ cmd_rules() {
       fi
       (( ${#ids[@]} )) || { warn "no hay paquetes de reglas en $dir"; return 1; }
       for id in "${ids[@]}"; do
-        if dg_rules_load_pack "$dir" "$id"; then
-          ok "$id"
-        else
+        if ! dg_rules_load_pack "$dir" "$id"; then
           rc=2
+        elif [[ -n "$_DG_PACK_REMOTES" ]] && ! _dg_rules_remotes_agree "$_DG_PACK_REMOTES"; then
+          warn "$id: sus remotes no compilan igual en Python (delegate-run no lo va a elegir); reinstálalo con delegate rules add"
+          rc=2
+        else
+          ok "$id"
         fi
       done
       return "$rc"
