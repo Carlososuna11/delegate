@@ -8,7 +8,7 @@ argument-hint: "<order> | status | questions N | N: <answer> | cancel N"
 
 These phrases mean **delegate**. They never mean "do it yourself in this chat". The chat stays free for Carlos to keep dictating; each order becomes an *encargo* that one agent takes to the end.
 
-Every Claude encargo carries the behaviour contract (`crew/contract.md` in the delegate repo): questions first, then to the end, more in the how and not in the how much, test before delivering, deliver a pushed branch without a PR.
+Every Claude encargo carries the behaviour contract (`crew/contract.md` in the delegate repo): questions first, then to the end, more in the how and not in the how much, test before delivering, deliver a pushed branch, with its PR opened in Innovares repos and without one in Kontigo.
 
 ## Launch
 
