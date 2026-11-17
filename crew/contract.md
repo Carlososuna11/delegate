@@ -38,8 +38,9 @@ Thermos (calidad y bugs) y anti-slop si hay UI.
 
 ## 5. Entrega
 
-Empuja una rama, sin PR, para no disparar el CI: Carlos decide cuándo abrir el PR
-o juntarla con otras. Escribe un resumen corto con:
+Empuja una rama. En un repo de Innovares, abre el PR contra la rama base (sin
+mergearlo) y pon el enlace en el resumen. En Kontigo, la rama va sin PR: Carlos
+decide cuándo abrirlo. Escribe un resumen corto con:
 
 - qué hiciste;
 - qué probaste y cómo;
