@@ -97,8 +97,8 @@ está mal, aunque simplifique el código. Si uno estorba, se discute antes de to
    (`timeout` y el harness) sigue vivo hasta su timeout, y el directorio de stubs
    queda en disco. Bajo `delegate-run` ese caso queda cubierto mientras el runner
    viva: es subreaper y limpia el árbol completo (ver "delegate-run").
-6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor
-   y para las entradas de MCP: no pueden inyectar fragmentos de shell, ni valores de
+6. **La config se parsea, nunca se `source`a.** Vale igual para los archivos de proveedor,
+   para las entradas de MCP y para los paquetes de reglas: no pueden inyectar fragmentos de shell, ni valores de
    variables de entorno, ni reescribir lo que la corrida fija. Una entrada declara
    **nombres** de variables a reenviar, nunca valores. Dos familias de nombres se
    **rechazan**:
@@ -187,16 +187,18 @@ delegate deepseek --mcp context7 "cómo se usa el hook nuevo de esta librería"
 delegate deepseek --edit --mcp-write figma "aplica estos cambios al frame Login"
 delegate qwen --timeout 2400 "segunda opinión de este PR"
 delegate deepseek chat "explica este regex"      # sin herramientas
+delegate deepseek --edit --rules innovares "agrega el endpoint"
 
 delegate account deepseek list|add|use
 delegate mcp list
+delegate rules list|add|check
 delegate providers
 delegate help
 ```
 
 `--mcp` y `--mcp-write` son repetibles y se acumulan; `--mcp-write <id>` implica las
-herramientas de lectura de ese mismo servidor. En modo `chat` los dos son un error, igual
-que `--edit` y `--bash`.
+herramientas de lectura de ese mismo servidor. `--rules` también es repetible. En modo
+`chat` los tres son un error, igual que `--edit` y `--bash`.
 
 ## Proveedor = data
 
@@ -311,6 +313,57 @@ hash de Claude Code—, en vez de arrancar con cero herramientas. El límite de 
 heurística: la ausencia de `env_passthrough` se lee como "usa el login guardado", así
 que un servidor remoto público sin auth no encaja en esta forma de entrada.
 
+## Reglas de código = data
+
+Lo que se le dice al delegado sobre **cómo** escribir código, en tres capas. Solo las dos
+primeras entran al system prompt, anexadas a `DG_RULES` por el mismo y único
+`--append-system-prompt`: no se carga ningún plugin, skill ni hook, y `--bare`,
+`--restricted` y `--disable-slash-commands` siguen igual.
+
+- **Núcleo** (`rules/core.md`, en este repo, tope 2.000 bytes probado en test). Pasos de
+  procedimiento neutros: buscar antes de crear, un valor se define una vez, copiar la forma
+  del archivo vecino, revisar `git diff` y terminar con una sección "Reutilización". Es el
+  texto que se probó en A/B (literales duplicados de una mediana de 28 a 5 con DeepSeek y de
+  27 a 4 con Qwen; ediciones a archivos generados de 4 de 6 corridas a 0 de 6). **Solo con
+  `--edit`.** El paso 1 es `@REPO_RULES@`, que `delegate` reemplaza por el puntero; sin
+  puntero la línea se quita y los pasos se renumeran.
+- **Puntero al repo** (paso 1). Si `$wroot/CLAUDE.md` o, si no, `$wroot/AGENTS.md` es un
+  archivo regular que resuelve **dentro** del árbol, el paso dice "léelo completo" (hasta 300
+  líneas) o "tiene N líneas: lee por secciones". `delegate` solo hace `stat` y cuenta líneas:
+  el **texto** del repo nunca entra al system prompt, lo lee el modelo con `Read` como
+  cualquier otro archivo. Un repo no es el dueño de la máquina, y el system prompt es la
+  posición más fuerte. Un symlink que sale del árbol, un FIFO o un directorio no generan
+  puntero. Se comprobó que el harness con `--bare` no carga solo el `CLAUDE.md` del
+  directorio de trabajo; por eso hace falta el puntero.
+- **Paquetes** de organización en `$DELEGATE_RULES_DIR` (por defecto
+  `~/.config/delegate/rules.d`), uno por directorio `<id>/`: `rules.md` (el texto) y `pack`
+  (`clave<TAB>valor`: `accounts` obligatoria, `remotes`, `source`, `sha256` obligatoria).
+  Dato del dueño de la máquina, nunca del repo, igual que `mcp.d`. Entran **solo** si la
+  corrida los pide por nombre (`--rules <id>`), con o sin `--edit`. El texto del paquete
+  Innovares vive en el devkit, no aquí.
+
+Validación, toda **antes de leer la key** y con salida 2: id válido; el directorio de
+paquetes, el del paquete y sus dos archivos son del usuario, no son symlinks y nadie más
+puede escribirlos; `pack` se parsea estricto (claves desconocidas o repetidas se rechazan);
+el texto tiene hasta 2.000 bytes, es UTF-8 y no tiene caracteres de control salvo el salto
+de línea; el sha256 de los bytes **leídos** coincide con el fijado; y la cuenta de la
+corrida está en `accounts`. La cuenta es la misma que paga: `cmd_run` resuelve el
+**nombre** de la cuenta una vez y de él salen el chequeo del paquete y la ruta de la key
+(la key se sigue leyendo una sola vez, después). Así Kontigo nunca recibe el paquete
+Innovares: no está en su `accounts`.
+
+`delegate rules add <id> --from <archivo> --accounts <c,...> [--remotes <p,...>]` valida el
+archivo como lo haría una corrida, lo copia y fija su sha (reemplaza un paquete existente,
+archivo por archivo con temporal más `rename(2)`, nunca a través de un symlink). Mergear
+un cambio en la fuente no lo instala: el texto queda fijado hasta que alguien lo revise y
+lo vuelva a agregar, en cada máquina. `delegate rules list` imprime cada texto **completo**,
+la misma defensa que `mcp list` con `rules`. `delegate rules check [id...]` valida sin
+correr nada.
+
+`remotes` son expresiones regulares (charset que ERE y Python leen igual, sin coma) contra
+`remote.origin.url`. Las usa solo `delegate-run` para elegir paquetes; `delegate` nunca
+elige solo.
+
 ## Cuentas
 
 `<key_dir>/api_key.<cuenta>` (modo 600) es la fuente de verdad. `--account <nombre>` y
@@ -393,7 +446,14 @@ nunca una cadena de shell), `scope` (globs relativos a la raíz: `*` no cruza `/
 `**` cruza segmentos, una ruta sin comodín cubre todo lo que tiene debajo),
 `snapshot` (`false`), `wait` (`true`), `run_id` (lo elige quien llama, con la forma
 de siempre; si ya existe o lo reservó un cliente remoto, exit 3 y no se crea nada;
-con `--remote` se rechaza: el id lo elige el cliente).
+con `--remote` se rechaza: el id lo elige el cliente), `rules` (lista de ids de
+paquetes, hasta 8, que llegan como `--rules`; `[]` los apaga; sin la clave, en una
+corrida con `edit` el runner elige los paquetes cuyo `remotes` calza con el
+`remote.origin.url` del repo, leído antes del hijo, y que la cuenta pedida puede usar).
+
+`result.json` trae `rules`: `{"core": <sha256 de rules/core.md o null sin edit>,
+"packs": {<id>: <sha256 fijado o null si esta máquina no lo tiene>}}`. `request.json`
+guarda lo pedido (`null` = automático).
 
 Salida: exit 0 solo con `completed`; 1 con cualquier otro status (el JSON dice cuál);
 2 si la petición o los argumentos son inválidos, y entonces no hay corrida ni stdout.
@@ -653,7 +713,12 @@ La petición es la de siempre, con `repo` local. El cliente:
 3. `git push` de la base a `refs/delegate/base/<run_id>`: un namespace propio, nunca
    forzado, nunca una rama del usuario.
 4. `ssh host delegate-run` con la petición por stdin: `repo` es el mirror, `base` el
-   sha completo, `run_id` el del cliente.
+   sha completo, `run_id` el del cliente y `rules` la lista ya resuelta en el cliente
+   (sin paquetes, la clave no se manda, y un host anterior a `rules` la sigue
+   aceptando; el mirror no tiene `origin`, así que el host nunca elige; usa su propia copia de
+   cada paquete y, si le falta uno, `delegate` sale con 2 antes de leer la key). Al
+   volver, si los sha del `result.json` remoto difieren de los locales, el cliente lo
+   avisa: la deriva se detecta, no se evita.
 5. Trae `delegate/<run_id>` a una ref privada (`refs/delegate/fetch/<run_id>`, que no
    puede existir antes), verifica que sea un commit sobre la base y recién ahí crea la
    rama con un `update-ref` que solo crea y no sigue symrefs: una rama local existente
@@ -792,6 +857,17 @@ Los invariantes son testeables y en los scripts originales no estaban testeados.
   `--ignore-su*`, `--sub*` y todo prefijo de `--output`; con `--bash`, el `git` es
   el de la máquina.
 - Un `env_passthrough` con cualquier nombre `GIT_*` se rechaza con 2.
+- Reglas de código (`test/rules.test.sh`, `test/py/test_rules.py`): sin `--edit` no
+  hay núcleo; con `--edit` va después de las reglas de la corrida; un paquete pedido
+  con una cuenta que no está en su `accounts` (por `--account` o por
+  `DELEGATE_ACCOUNT`), con el sha alterado, desconocido, de más de 2.000 bytes, con
+  caracteres de control, que no es UTF-8, escribible por otros o con un symlink sale
+  con 2 antes de leer la key; un `CLAUDE.md` que es symlink hacia fuera del árbol, o un
+  FIFO, no genera puntero (y el FIFO no bloquea); el texto del `CLAUDE.md` nunca llega
+  al prompt; `rules add` rechaza lo mismo que una corrida y no escribe a través de un
+  symlink; el runner elige por `origin` solo en corridas con `edit`, respeta `[]` y una
+  lista explícita, y no elige un paquete que la cuenta pedida no puede usar; el cliente
+  remoto manda la lista resuelta y avisa si los sha del host difieren.
 - Un rechazo de `dg_perm_resolve` o de `dg_mcp_resolve` justo después de un grant
   no deja ningún global del grant, probado en el **mismo** shell: inspeccionar
   los globals del padre después de correr el resolver en un subshell no prueba
