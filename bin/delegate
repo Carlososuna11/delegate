@@ -67,7 +67,7 @@ unset -v _dg_fn
 for _dg_fn in $(compgen -e); do
   case "$_dg_fn" in
     _DG_*|_dg_*) unset -v "$_dg_fn" 2>/dev/null || true ;;
-    DG_ROOT|DG_BIN|DG_LINK|DG_TOOLS|DG_ALLOWED|DG_RULES|DG_MCP_JSON|DG_MCP_TOOLS|DG_MCP_ENV|DG_MCP_RULES|DG_MCP_OAUTH)
+    DG_ROOT|DG_BIN|DG_LINK|DG_TOOLS|DG_ALLOWED|DG_RULES|DG_CODE_RULES|DG_MCP_JSON|DG_MCP_TOOLS|DG_MCP_ENV|DG_MCP_RULES|DG_MCP_OAUTH)
       unset -v "$_dg_fn" 2>/dev/null || true ;;
   esac
 done
@@ -124,6 +124,8 @@ source "$DG_ROOT/lib/accounts.sh"
 source "$DG_ROOT/lib/permissions.sh"
 # shellcheck source=../lib/mcp.sh
 source "$DG_ROOT/lib/mcp.sh"
+# shellcheck source=../lib/rules.sh
+source "$DG_ROOT/lib/rules.sh"
 # shellcheck source=../lib/claude_oauth.sh
 source "$DG_ROOT/lib/claude_oauth.sh"
 
@@ -152,6 +154,7 @@ ${B}USO${R}
   ${CYAN}delegate${R} <proveedor> chat [opciones] "texto"  una pregunta, sin herramientas
   ${CYAN}delegate account${R} <proveedor> <acción>         cuentas (API keys)
   ${CYAN}delegate mcp list${R}                              servidores MCP declarados
+  ${CYAN}delegate rules${R} list|add|check                 reglas de código por organización
   ${CYAN}delegate providers${R}                            proveedores configurados
   ${CYAN}delegate help${R}                                 esta ayuda
 
@@ -162,6 +165,11 @@ ${B}ACCESO${R} ${D}(el más angosto que alcance para la tarea)${R}
   ${CYAN}--mcp${R} <srv>     agrega las herramientas de LECTURA de ese servidor MCP
   ${CYAN}--mcp-write${R} <s> agrega también las de escritura
                   ${D}Repetibles. Sin ellos, la corrida no alcanza ningún MCP.${R}
+
+${B}REGLAS DE CÓDIGO${R}
+  ${D}(con --edit)${R}    la hoja núcleo de delegate y un puntero al CLAUDE.md o
+                  AGENTS.md del árbol, que el modelo lee con Read
+  ${CYAN}--rules${R} <id>    agrega un paquete de rules.d ${D}(repetible; también sin --edit)${R}
 
 ${B}OPCIONES${R}
   ${CYAN}--account${R} <n>   usa la key de esa cuenta, sin tocar la activa
@@ -178,6 +186,11 @@ ${B}CUENTAS${R}
   delegate account <proveedor> use <cuenta>      ${D}cambia la activa (global)${R}
   delegate account <proveedor> rm <cuenta>
   delegate account <proveedor> default [cuenta]  ${D}default por invocación${R}
+
+${B}PAQUETES DE REGLAS${R} ${D}(~/.config/delegate/rules.d, o DELEGATE_RULES_DIR)${R}
+  delegate rules list                            ${D}imprime cada paquete completo${R}
+  delegate rules add <id> --from <archivo> --accounts <c1,c2> [--remotes <patrón,...>]
+  delegate rules check [id...]                   ${D}revisa archivos, permisos y sha${R}
 
   La cuenta activa es global: otra sesión puede cambiarla a mitad de tu corrida.
   Un pipeline que dependa de una cuenta específica pasa ${CYAN}--account${R}.
@@ -219,8 +232,10 @@ load_provider() {
 # ─── cuentas ─────────────────────────────────────────────────────────────────
 
 # Resolution order, most explicit first. A concrete account always beats the
-# global active symlink, which another session can change under us.
-resolve_account_path() {
+# global active symlink, which another session can change under us. Prints the
+# NAME only: cmd_run resolves it once and uses that same name for the pack
+# checks and for the key path, so the two can never disagree.
+resolve_account_name() {
   local requested="$1" name
   if [[ -n "$requested" ]]; then
     name="$requested"
@@ -240,7 +255,7 @@ resolve_account_path() {
     fi
     die "no hay ninguna key configurada para ${B}${PROVIDER}${R}. Agrega una: ${B}delegate account $PROVIDER add <cuenta>${R}"
   fi
-  dg_account_path "${CFG[key_dir]}" "${CFG[key_pattern]}" "$name" || exit 2
+  printf '%s\n' "$name"
 }
 
 cmd_account() {
@@ -431,6 +446,70 @@ cmd_mcp() {
   (( found )) || { warn "no hay servidores MCP declarados en $dir"; return 1; }
 }
 
+cmd_rules() {
+  # The machine owner's packs of code rules. `list` prints every text in full,
+  # for the same reason `mcp list` prints an entry's `rules`: a pack goes into
+  # the strongest position of the prompt, and being readable is the defence.
+  # Nothing here enables a pack for a run; that is --rules, by name.
+  local sub="${1:-list}"; shift || true
+  local dir id rc=0 found=0
+  dir="$(dg_rules_dir)"
+  case "$sub" in
+    list)
+      (( $# == 0 )) || die "uso: delegate rules list"
+      while read -r id; do
+        [[ -n "$id" ]] || continue
+        found=1
+        if dg_rules_load_pack "$dir" "$id" 2>/dev/null; then
+          printf '  %s%-12s%s %ssha256 %s%s\n' "$B" "$id" "$R" "$D" "${_DG_PACK_SHA:0:12}" "$R"
+          printf '      %scuentas:%s %s\n' "$D" "$R" "$_DG_PACK_ACCOUNTS"
+          [[ -n "$_DG_PACK_REMOTES" ]] && printf '      %sorigin:%s %s\n' "$D" "$R" "$_DG_PACK_REMOTES"
+          [[ -n "$_DG_PACK_SOURCE" ]] && printf '      %sfuente:%s %s\n' "$D" "$R" "$_DG_PACK_SOURCE"
+          printf '      %sle dice al modelo:%s\n' "$D" "$R"
+          printf '%s\n' "${_dg_rules_text%$'\n'}" | sed 's/^/        /'
+        else
+          printf '  %s%-12s%s %spaquete inválido%s %s(delegate rules check %s dice por qué)%s\n' \
+            "$B" "$id" "$R" "$RED" "$R" "$D" "$id" "$R"
+        fi
+      done < <(dg_rules_packs "$dir")
+      (( found )) || { warn "no hay paquetes de reglas en $dir"; return 1; }
+      ;;
+    add)
+      local from='' accounts='' remotes=''
+      id="${1:-}"; shift || true
+      [[ -n "$id" ]] || die "uso: delegate rules add <id> --from <archivo> --accounts <c1,c2> [--remotes <patrón,...>]"
+      while (( $# )); do
+        case "$1" in
+          --from)     from="${2:?--from necesita un archivo}"; shift 2 ;;
+          --accounts) accounts="${2:?--accounts necesita cuentas}"; shift 2 ;;
+          --remotes)  remotes="${2:?--remotes necesita patrones}"; shift 2 ;;
+          *)          die "opción desconocida: $1" ;;
+        esac
+      done
+      [[ -n "$from" ]] || dg_reject "falta --from <archivo>"
+      dg_rules_add "$dir" "$id" "$from" "$accounts" "$remotes" || exit 2
+      ok "paquete ${B}${id}${R} instalado ${D}(sha256 ${_DG_PACK_SHA:0:12}, cuentas $accounts)${R}"
+      printf '    %srevísalo entero:%s delegate rules list\n' "$D" "$R" >&2
+      ;;
+    check)
+      local -a ids=("$@")
+      if (( ${#ids[@]} == 0 )); then
+        while read -r id; do [[ -n "$id" ]] && ids+=("$id"); done < <(dg_rules_packs "$dir")
+      fi
+      (( ${#ids[@]} )) || { warn "no hay paquetes de reglas en $dir"; return 1; }
+      for id in "${ids[@]}"; do
+        if dg_rules_load_pack "$dir" "$id"; then
+          ok "$id"
+        else
+          rc=2
+        fi
+      done
+      return "$rc"
+      ;;
+    *) die "acción desconocida: $sub ${D}(list | add | check)${R}" ;;
+  esac
+}
+
 # ─── sandbox (bubblewrap) ────────────────────────────────────────────────────
 #
 # `--sandbox bwrap` runs the child (timeout's command: the harness and
@@ -583,6 +662,8 @@ cmd_run() {
   local format='text' timeout_s='' model=''
   # Repeatable, so they accumulate as comma-separated lists for lib/mcp.sh.
   local mcp_read='' mcp_write=''
+  # Code-rule packs asked for by name, comma-separated for lib/rules.sh.
+  local rule_ids=''
   # The minimal OAuth store, when a sandboxed run needs one: the credentials
   # file it came from and the JSON body built from it. `local +x` because an
   # exported variable of the same name would keep its export attribute and put
@@ -598,6 +679,7 @@ cmd_run() {
       --bash)        want_bash=1; shift ;;
       --mcp)         mcp_read="${mcp_read:+$mcp_read,}${2:?--mcp necesita un servidor}"; shift 2 ;;
       --mcp-write)   mcp_write="${mcp_write:+$mcp_write,}${2:?--mcp-write necesita un servidor}"; shift 2 ;;
+      --rules)       rule_ids="${rule_ids:+$rule_ids,}${2:?--rules necesita un paquete}"; shift 2 ;;
       --json)        format='json'; shift ;;
       --account)     account="${2:?--account necesita un nombre}"; shift 2 ;;
       --dir)         workdir="${2:?--dir necesita una ruta}"; shift 2 ;;
@@ -638,6 +720,7 @@ cmd_run() {
     # quietly ignore.
     (( want_edit || want_bash )) && die "chat no tiene herramientas: quita --edit y --bash, o usa el modo agente"
     [[ -n "$mcp_read$mcp_write" ]] && die "chat no tiene herramientas: quita --mcp y --mcp-write, o usa el modo agente"
+    [[ -n "$rule_ids" ]] && die "chat no lleva reglas de código: quita --rules, o usa el modo agente"
   fi
 
   [[ -n "$timeout_s" ]] || timeout_s="${CFG[timeout]}"
@@ -815,6 +898,28 @@ cmd_run() {
     DG_RULES='Responde en español venezolano neutro (tú, nunca voseo). No tienes herramientas: no puedes leer archivos ni ejecutar nada. Responde solo con lo que te den en el mensaje. Si te falta información para responder, dilo en vez de suponerla.'
   fi
 
+  # The account NAME is resolved once, here, and both the pack checks below and
+  # the key path come from it: a pack limited to `personal` must be checked
+  # against the account whose key is about to be read, not against a second
+  # resolution that another process could have changed in between. Resolving a
+  # name reads no key, and dg_account_path only validates it and builds the
+  # path; the key is still read once, below.
+  local acct_name acct_path
+  acct_name="$(resolve_account_name "$account")"
+  acct_path="$(dg_account_path "${CFG[key_dir]}" "${CFG[key_pattern]}" "$acct_name")" || exit 2
+
+  # Code rules, the last refusal that comes before the key. The core sheet only
+  # on runs that can edit; packs only when asked for by name. Appended after
+  # the run's rules through the same single --append-system-prompt, so nothing
+  # new reaches the child but text: no plugin, no skill, no file of the tree
+  # (step 1 only names the tree's CLAUDE.md; the model reads it with Read).
+  if [[ "$mode" == 'agent' ]]; then
+    local core_file=''
+    if (( want_edit )); then core_file="$DG_ROOT/rules/core.md"; fi
+    dg_rules_resolve "$core_file" "$acct_name" "$rule_ids" "$wroot" || exit 2
+    if [[ -n "$DG_CODE_RULES" ]]; then DG_RULES="$DG_RULES"$'\n\n'"$DG_CODE_RULES"; fi
+  fi
+
   # ── la key: se lee UNA sola vez, acá, después de validar todo lo demás ──
   # Entre resolver la cuenta y abrir el archivo hay una carrera: otro proceso
   # puede cambiar el symlink de la activa. Leerla una vez y en este punto acota
@@ -824,8 +929,7 @@ cmd_run() {
   # caller's shell the account key silently joined the environment of every
   # helper this script runs afterwards — including the `grep` in the process
   # substitution, which is not the child. Verified on Bash 5.2.
-  local +x key_path key
-  key_path="$(resolve_account_path "$account")"
+  local +x key_path="$acct_path" key
   # One descriptor for the checks and the read: validating a name and then
   # reading it again let the file be swapped in between.
   key="$(dg_account_load "${CFG[key_dir]}" "$key_path")" || exit 1
@@ -1283,6 +1387,7 @@ case "${1:-help}" in
   help|--help|-h) usage ;;
   providers)      cmd_providers ;;
   mcp)            shift; cmd_mcp "$@" ;;
+  rules)          shift; cmd_rules "$@" ;;
   account)        shift; cmd_account "$@" ;;
   -*)             die "las opciones van después del proveedor: delegate <proveedor> $1 ..." ;;
   *)
