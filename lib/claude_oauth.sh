@@ -3,14 +3,18 @@
 #
 # An MCP entry with transport http or sse and no env_passthrough has no token
 # of its own: the only login it can use is the one Claude Code saved, on Linux
-# in ~/.claude/.credentials.json, under `mcpOAuth`, keyed by
-# `<server name>|<server url>`. The sandbox hides HOME, so without a copy the
-# child starts with zero tools and nothing says why.
+# in ~/.claude/.credentials.json, under `mcpOAuth`. Claude Code keys those
+# entries as `<serverName>|<16 hex>`, the hash being one it computes from the
+# server's configuration; the key text is NOT `<name>|<url>` and cannot be
+# rebuilt from the pair a run asks for. So the lookup matches on the entry's
+# own `serverName` and `serverUrl` fields and then keeps the key it found under,
+# because that key is what Claude Code looks the entry up by. The sandbox hides
+# HOME, so without a copy the child starts with zero tools and nothing says why.
 #
-# What crosses into the sandbox is a MINIMAL store: one object under one key,
-# with the access token and its expiry. Nothing else from ~/.claude or
-# ~/.claude.json — no Anthropic token, no other server's token, no history,
-# no settings — and, deliberately, NO refresh token:
+# What crosses into the sandbox is a MINIMAL store: one object under that
+# original key, with the server's identity, the access token and its expiry.
+# Nothing else from ~/.claude or ~/.claude.json — no Anthropic token, no other
+# server's token, no history, no settings — and, deliberately, NO refresh token:
 #
 #   A refresh token may be rotated by the authorization server on use. If the
 #   child refreshed with the user's refresh token and this store is thrown away
@@ -20,6 +24,18 @@
 #   the run and before the provider key is read, when it is expired or close to
 #   expiring. The message tells the user to open Claude Code once, which
 #   refreshes it through the flow that is allowed to write the real file.
+#
+# Which fields are kept, and why only those: `serverName`, `serverUrl` (the
+# identity the rest of the store is checked against), `accessToken`, and
+# `expiresAt` when the file has one. That is all Claude Code needs to send the
+# bearer token without refreshing: with an `expiresAt` in the future there is
+# nothing to renew, and an entry written without `expiresAt` has no deadline to
+# compare against, so the token is used as it is — the real file already holds
+# such entries, so that is a shape Claude Code accepts. The rest of the entry
+# only feeds a refresh or a new authorization: `refreshToken`, `clientSecret`,
+# `clientId`, `scope`, `issuer`, `redirectUri` and `discoveryState` stay behind.
+# (`clientId` is left out too: the real file has entries without one, so its
+# absence is something Claude Code already handles.)
 #
 # The store is written by bin/delegate inside the run's private stub directory
 # (a fresh mktemp directory, mode 700, removed on every exit path; the store
@@ -32,10 +48,16 @@
 #     Prints $HOME/.claude/.credentials.json. No other location is consulted.
 #
 #   dg_oauth_minimal_json <credentials-file> <id<TAB>url>...
-#     Prints `{"mcpOAuth":{"<id>|<url>":{...}}}` on stdout with only the entry
-#     the pairs name. Returns 2 with a `delegate: ...` message on stderr when
-#     the file, the section, an entry, or a still-valid access token is
-#     missing. Never prints a token anywhere but the returned JSON.
+#     Prints `{"mcpOAuth":{"<key>":{...}}}` on stdout with only the entry each
+#     pair names, under the ORIGINAL key it had in <credentials-file>: Claude
+#     Code looks the entry up by that key, so it is copied and never rebuilt.
+#     An entry matches when its `serverName` equals the id and its `serverUrl`
+#     equals the pair's url — never by the key text. If several match, the one
+#     with the latest `expiresAt` wins; an entry without `expiresAt` never
+#     expires, so it wins over any dated one. Returns 2 with a `delegate: ...`
+#     message on stderr when the file, the section, an entry, or a still-valid
+#     access token is missing. Never prints a token anywhere but the returned
+#     JSON.
 #
 #   dg_oauth_write_store <dir> <json>
 #     Creates <dir> (mode 700) and <dir>/.credentials.json (mode 600) with
@@ -54,6 +76,12 @@
 _dg_oauth_pos=0
 _dg_oauth_value=''
 _dg_oauth_string=''
+_dg_oauth_walk_pos=0
+_dg_oauth_walk_key=''
+_dg_oauth_walk_value=''
+_dg_oauth_found_key=''
+_dg_oauth_found_entry=''
+_dg_oauth_found_expires=''
 
 # Five minutes. A token that expires earlier than this is treated as expired:
 # the run is about to start, and a server that disconnects mid-run is the
@@ -185,6 +213,126 @@ _dg_oauth_member() {
   done
 }
 
+_dg_oauth_walk_start() {
+  # <object-string>: points the member cursor at the first member. 1 when the
+  # value is not an object.
+  local s="$1"
+  _dg_oauth_skip_ws "$s" 0
+  _dg_oauth_walk_pos=$_dg_oauth_pos
+  [[ "${s:_dg_oauth_walk_pos:1}" == '{' ]] || return 1
+  _dg_oauth_walk_pos=$(( _dg_oauth_walk_pos + 1 ))
+  return 0
+}
+
+_dg_oauth_walk_next() {
+  # <object-string>: 0 with the next top-level member in _dg_oauth_walk_key and
+  # its raw value in _dg_oauth_walk_value; 1 at the closing brace; 2 when the
+  # object is malformed. Iterating the members, not asking for one known key, is
+  # what lets the lookup go by the entry's fields: the key is Claude Code's own
+  # hash and the pair a run asks for cannot produce it.
+  local s="$1" i c kstart kend vstart
+  i=$_dg_oauth_walk_pos
+  _dg_oauth_skip_ws "$s" "$i"
+  i=$_dg_oauth_pos
+  c="${s:i:1}"
+  if [[ "$c" == '}' ]]; then
+    _dg_oauth_walk_pos=$(( i + 1 ))
+    return 1
+  fi
+  [[ "$c" == '"' ]] || return 2
+  kstart=$(( i + 1 ))
+  _dg_oauth_skip_string "$s" "$i" || return 2
+  kend=$(( _dg_oauth_pos - 1 ))
+  _dg_oauth_walk_key="${s:kstart:kend-kstart}"
+  i=$_dg_oauth_pos
+  _dg_oauth_skip_ws "$s" "$i"
+  i=$_dg_oauth_pos
+  [[ "${s:i:1}" == ':' ]] || return 2
+  i=$(( i + 1 ))
+  _dg_oauth_skip_ws "$s" "$i"
+  i=$_dg_oauth_pos
+  vstart=$i
+  _dg_oauth_skip_value "$s" "$i" || return 2
+  i=$_dg_oauth_pos
+  _dg_oauth_walk_value="${s:vstart:i-vstart}"
+  _dg_oauth_skip_ws "$s" "$i"
+  i=$_dg_oauth_pos
+  case "${s:i:1}" in
+    ',') _dg_oauth_walk_pos=$(( i + 1 )) ;;
+    '}') _dg_oauth_walk_pos=$i ;;   # the next call reports the end
+    *) return 2 ;;
+  esac
+  return 0
+}
+
+_dg_oauth_find_entry() {
+  # <section> <id> <url>: 0 when an entry of the section has serverName == id
+  # and serverUrl == url, with its original key in _dg_oauth_found_key, its raw
+  # object in _dg_oauth_found_entry and its raw expiresAt (empty when absent) in
+  # _dg_oauth_found_expires. 1 when none matches; 2 when the section cannot be
+  # walked; 3 when the only matches are entries whose key cannot be pasted into
+  # JSON. The key is copied verbatim and never rebuilt: it is Claude Code's
+  # `<serverName>|<hash>`, and Claude Code looks the entry up by it.
+  local s="$1" want_id="$2" want_url="$3"
+  local wrc=0 key entry name url exp norm best_norm='' best_set='' bad=0
+  _dg_oauth_found_key=''
+  _dg_oauth_found_entry=''
+  _dg_oauth_found_expires=''
+  _dg_oauth_walk_start "$s" || return 2
+  while :; do
+    _dg_oauth_walk_next "$s"
+    wrc=$?
+    (( wrc == 0 )) || break
+    key="$_dg_oauth_walk_key"
+    entry="$_dg_oauth_walk_value"
+    [[ "${entry:0:1}" == '{' ]] || continue
+    _dg_oauth_member "$entry" serverName || continue
+    _dg_oauth_raw_string "$_dg_oauth_value" || continue
+    name="$_dg_oauth_string"
+    [[ "$name" == "$want_id" ]] || continue
+    _dg_oauth_member "$entry" serverUrl || continue
+    _dg_oauth_raw_string "$_dg_oauth_value" || continue
+    url="$_dg_oauth_string"
+    [[ "$url" == "$want_url" ]] || continue
+
+    exp=''
+    if _dg_oauth_member "$entry" expiresAt; then
+      exp="$_dg_oauth_value"
+    fi
+    # Ranking: a non-expiring entry (no expiresAt) beats every dated one; among
+    # dated ones the largest value wins; a value that is not a number ranks as
+    # zero, so a usable entry is preferred and the caller still refuses if it is
+    # the only match. The first entry wins a tie, which keeps the choice stable.
+    if [[ -z "$exp" ]]; then
+      norm="$(( 2 ** 62 ))"
+    elif [[ "$exp" =~ ^[0-9]{1,15}$ ]]; then
+      norm="$(( 10#$exp ))"
+      # The same read the caller makes: a value too small to be milliseconds is
+      # read as seconds, so both rank against the same clock.
+      (( norm < 100000000000 )) && norm=$(( norm * 1000 ))
+    else
+      norm=0
+    fi
+    if [[ -z "$best_set" ]] || (( norm > best_norm )); then
+      # Only a key made of characters that need no escaping can be concatenated
+      # into the store; anything else is skipped, not copied.
+      if [[ "$key" =~ ^[A-Za-z0-9._~+|=-]+$ ]]; then
+        best_set=1
+        best_norm="$norm"
+        _dg_oauth_found_key="$key"
+        _dg_oauth_found_entry="$entry"
+        _dg_oauth_found_expires="$exp"
+      else
+        bad=1
+      fi
+    fi
+  done
+  (( wrc == 1 )) || return 2
+  [[ -n "$best_set" ]] && return 0
+  (( bad )) && return 3
+  return 1
+}
+
 _dg_oauth_raw_string() {
   # <value token>: 0 when it is a JSON string whose body needs no escaping, with
   # the body in _dg_oauth_string. Refusing the quote, the backslash and control
@@ -222,8 +370,8 @@ dg_oauth_minimal_json() {
   fi
 
   local file="$1"; shift
-  local s='' section='' entry='' pair='' id='' url='' key=''
-  local access='' expires_ms=0 now_ms=0 ttl_s=0
+  local s='' section='' entry='' pair='' id='' url='' key='' expires_raw=''
+  local access='' expires_ms=0 has_expiry=0 now_ms=0 ttl_s=0 frc=0
   local fields='' items='' isep=''
   local -a pairs=("$@")
 
@@ -266,18 +414,30 @@ dg_oauth_minimal_json() {
       _dg_oauth_err "el servidor MCP $id no tiene una url https que pueda usar en el store OAuth"
       return 2
     }
-    key="$id|$url"
-
-    if ! _dg_oauth_member "$section" "$key"; then
-      _dg_oauth_err "el login OAuth de Claude Code no tiene una entrada para el servidor MCP $id ($key);" \
-        "abre Claude Code una vez y autentícalo con /mcp"
-      return 2
-    fi
-    entry="$_dg_oauth_value"
-    if [[ "${entry:0:1}" != '{' ]]; then
-      _dg_oauth_err "la entrada OAuth del servidor MCP $id no es un objeto"
-      return 2
-    fi
+    _dg_oauth_find_entry "$section" "$id" "$url"
+    frc=$?
+    case "$frc" in
+      0) ;;
+      1)
+        _dg_oauth_err "el login OAuth de Claude Code no tiene una entrada para el servidor MCP $id ($url);" \
+          "abre Claude Code una vez y autentícalo con /mcp"
+        return 2
+        ;;
+      3)
+        _dg_oauth_err "la entrada OAuth del servidor MCP $id tiene una clave que no puedo copiar al store;" \
+          "abre Claude Code una vez y autentícalo con /mcp"
+        return 2
+        ;;
+      *)
+        _dg_oauth_err "no pude recorrer la sección mcpOAuth del login OAuth de Claude Code en $file"
+        return 2
+        ;;
+    esac
+    key="$_dg_oauth_found_key"
+    entry="$_dg_oauth_found_entry"
+    # The entry was found by its fields, so the identity is the requested pair;
+    # the expiry is the one the file gave for this entry.
+    expires_raw="$_dg_oauth_found_expires"
 
     if ! _dg_oauth_member "$entry" accessToken || ! _dg_oauth_raw_string "$_dg_oauth_value"; then
       _dg_oauth_err "la entrada OAuth del servidor MCP $id no tiene un accessToken utilizable;" \
@@ -291,18 +451,26 @@ dg_oauth_minimal_json() {
       return 2
     fi
 
-    if ! _dg_oauth_member "$entry" expiresAt || [[ ! "$_dg_oauth_value" =~ ^[0-9]+$ ]]; then
-      _dg_oauth_err "la entrada OAuth del servidor MCP $id no dice cuándo vence su access token;" \
-        "abre Claude Code una vez para renovar el login y vuelve a pedir la corrida"
-      return 2
+    has_expiry=0
+    expires_ms=0
+    if [[ -n "$expires_raw" ]]; then
+      if [[ ! "$expires_raw" =~ ^[0-9]{1,15}$ ]]; then
+        _dg_oauth_err "la entrada OAuth del servidor MCP $id tiene un expiresAt que no puedo leer;" \
+          "abre Claude Code una vez para renovar el login y vuelve a pedir la corrida"
+        return 2
+      fi
+      has_expiry=1
+      expires_ms="$(( 10#${expires_raw} ))"
+      # Claude Code writes milliseconds. A value too small to be one is read as
+      # seconds so an older shape still works; nothing legitimate falls in
+      # between.
+      if (( expires_ms < 100000000000 )); then
+        expires_ms=$(( expires_ms * 1000 ))
+      fi
     fi
-    expires_ms="$(( 10#${_dg_oauth_value} ))"
-    # Claude Code writes milliseconds. A value too small to be one is read as
-    # seconds so an older shape still works; nothing legitimate falls in between.
-    if (( expires_ms < 100000000000 )); then
-      expires_ms=$(( expires_ms * 1000 ))
-    fi
-    if (( expires_ms <= now_ms + _DG_OAUTH_MIN_TTL_MS )); then
+    # No expiresAt means nothing to expire against: the token is used as it is,
+    # which is how Claude Code reads an entry it saved without a deadline.
+    if (( has_expiry )) && (( expires_ms <= now_ms + _DG_OAUTH_MIN_TTL_MS )); then
       ttl_s=$(( (expires_ms - now_ms) / 1000 ))
       if (( ttl_s <= 0 )); then
         _dg_oauth_err "el access token OAuth del servidor MCP $id ya venció;" \
@@ -316,8 +484,11 @@ dg_oauth_minimal_json() {
 
     # Only what is needed to send the bearer token and to keep the identity the
     # rest of the store is keyed by. Nothing else from the entry crosses: not
-    # the refresh token, not the client registration, not the scope.
-    fields="\"serverName\":\"$id\",\"serverUrl\":\"$url\",\"accessToken\":\"$access\",\"expiresAt\":$expires_ms"
+    # the refresh token, not the client registration, not the scope. The key is
+    # the entry's ORIGINAL one (`<serverName>|<hash>`): Claude Code looks the
+    # entry up by that key, so it is copied verbatim, never rebuilt.
+    fields="\"serverName\":\"$id\",\"serverUrl\":\"$url\",\"accessToken\":\"$access\""
+    (( has_expiry )) && fields="$fields,\"expiresAt\":$expires_ms"
     items="$items$isep\"$key\":{$fields}"
     isep=','
   done

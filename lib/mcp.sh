@@ -59,11 +59,11 @@
 #                   whose transport is http or sse and whose entry sets no
 #                   env_passthrough. Such an entry has no token of its own, so
 #                   the only login it can use is the OAuth one Claude Code
-#                   saved under `<id>|<url>`; bin/delegate builds a minimal,
-#                   read-only store from it when the run is sandboxed. Empty
-#                   array when no requested server is of that shape. This
-#                   library only reports the pair: it never reads the
-#                   credentials file.
+#                   saved under `mcpOAuth` for that name and url; bin/delegate
+#                   finds it by those fields and builds a minimal, read-only
+#                   store from it when the run is sandboxed. Empty array when
+#                   no requested server is of that shape. This library only
+#                   reports the pair: it never reads the credentials file.
 #
 #   On an unknown id, an id that appears twice in the same list, an entry that
 #   fails to parse, or a write request against an entry with no tools_write,
@@ -157,8 +157,9 @@
 # That absence is also how resolve recognises an entry that depends on the saved
 # login: http or sse with no env_passthrough has no other place to get a token.
 # It reports the `<id>\t<url>` pair in DG_MCP_OAUTH and touches no file. The
-# sandboxed run is where that pair turns into a minimal credentials store; see
-# lib/claude_oauth.sh and the MCP section of CLAUDE.md.
+# sandboxed run is where that pair is matched against the saved login and turns
+# into a minimal credentials store; see lib/claude_oauth.sh and the MCP section
+# of CLAUDE.md.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests go in test/mcp.test.sh. Every rejection rule needs a case proving it
@@ -723,9 +724,10 @@ dg_mcp_resolve() {
     fi
 
     # A remote entry with no env_passthrough has no token of its own: the login
-    # Claude Code saved, keyed by this exact name and url, is the only one it
-    # can use. Reported, not read: this library never opens the credentials
-    # file. bin/delegate turns the pair into a minimal sandbox store.
+    # Claude Code saved for this name and url is the only one it can use.
+    # Reported, not read: this library never opens the credentials file.
+    # bin/delegate matches the pair against the entries' own serverName and
+    # serverUrl fields (their keys are a hash) to build a minimal sandbox store.
     if [[ "$transport" == http || "$transport" == sse ]] && [[ -z "$entry_env" ]]; then
       oauth+=("$id"$'\t'"$url")
     fi

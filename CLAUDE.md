@@ -278,28 +278,38 @@ login y **ningún token pasa por acá** — por eso su `env_passthrough` está v
 
 **El login guardado y el sandbox.** Un `http` o `sse` sin `env_passthrough` no tiene
 token propio: la única fuente es el login que Claude Code guardó en
-`~/.claude/.credentials.json`, bajo `mcpOAuth`, con la clave `<id>|<url>`. El sandbox
-esconde el HOME, así que sin una copia el servidor no conecta y la corrida arranca con
-cero herramientas. Por eso, y solo cuando la corrida pide una entrada así bajo
-`--sandbox bwrap`, `delegate` arma **afuera** del sandbox y **antes** de leer la key un
-store mínimo en el directorio privado de la corrida (700, archivo 600): una sola clave,
-con `accessToken`, `expiresAt`, `serverName` y `serverUrl` de ese servidor. Nada más de
-`~/.claude` ni de `~/.claude.json` cruza: ni el login de Anthropic, ni tokens de otros
-servidores MCP, ni historial, ni settings. Se monta en solo lectura en
-`$HOME/.claude/.credentials.json` y se borra con el resto del directorio privado al
-terminar, en todo camino de salida que se pueda atrapar. Sin sandbox el hijo ve el
-archivo real y no se arma nada; una corrida que no pide un servidor así ni lo abre.
+`~/.claude/.credentials.json`, bajo `mcpOAuth`. Sus claves son
+`<serverName>|<16 hex>`, un hash que Claude Code calcula de la config del servidor, así
+que no se pueden reconstruir desde el par `<id>|<url>`: la búsqueda va por los campos
+`serverName` y `serverUrl` de cada entrada, y de la elegida se copia **su clave
+original**, porque es por esa clave que Claude Code la vuelve a encontrar. Si más de una
+entrada coincide gana la de `expiresAt` más lejano (una sin `expiresAt` no vence y gana
+siempre). El sandbox esconde el HOME, así que sin una copia el servidor no conecta y la
+corrida arranca con cero herramientas. Por eso, y solo cuando la corrida pide una entrada
+así bajo `--sandbox bwrap`, `delegate` arma **afuera** del sandbox y **antes** de leer la
+key un store mínimo en el directorio privado de la corrida (700, archivo 600): una sola
+clave —la original—, con `serverName`, `serverUrl`, `accessToken` y, si el archivo lo
+trae, `expiresAt` de ese servidor; sin `expiresAt` la entrada se toma como no vencible y
+se escribe igual, sin plazo inventado. Nada más de `~/.claude` ni de `~/.claude.json`
+cruza: ni el login de Anthropic (`claudeAiOauth`), ni tokens de otros servidores MCP, ni
+historial, ni settings; del resto de la entrada tampoco, ni `refreshToken`, ni
+`clientSecret`, ni `clientId`, ni `scope`, ni `issuer`, ni `redirectUri`, ni
+`discoveryState`. Se monta en solo lectura en `$HOME/.claude/.credentials.json` y se
+borra con el resto del directorio privado al terminar, en todo camino de salida que se
+pueda atrapar. Sin sandbox el hijo ve el archivo real y no se arma nada; una corrida que
+no pide un servidor así ni lo abre.
 
 **Refresh: solo un access token todavía válido.** No se copia el `refreshToken`: si el
 hijo refrescara con él y el autorizador rota el token en cada uso, el login original del
 usuario quedaría invalidado mientras el store efímero se descarta, y la próxima sesión
 interactiva tendría que autenticarse de nuevo. Si el access token venció o le quedan
 menos de cinco minutos, la corrida se rechaza con 2 y un mensaje que pide abrir Claude
-Code una vez para renovarlo. Si el archivo o la entrada no existen, también se rechaza
-antes de leer la key, nombrando el par `<id>|<url>` que se buscó, en vez de arrancar con
-cero herramientas. El límite de la heurística: la ausencia de `env_passthrough` se lee
-como "usa el login guardado", así que un servidor remoto público sin auth no encaja en
-esta forma de entrada.
+Code una vez para renovarlo. Una entrada sin `expiresAt` no tiene plazo contra el cual
+comparar: se acepta y se copia sin él. Si el archivo o la entrada no existen, también se
+rechaza antes de leer la key, nombrando el servidor y su url —no la clave, que es el
+hash de Claude Code—, en vez de arrancar con cero herramientas. El límite de la
+heurística: la ausencia de `env_passthrough` se lee como "usa el login guardado", así
+que un servidor remoto público sin auth no encaja en esta forma de entrada.
 
 ## Cuentas
 
