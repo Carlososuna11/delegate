@@ -1,0 +1,8 @@
+endpoint	https://opencode.ai/inference/go
+auth_env	ANTHROPIC_API_KEY
+key_dir	~/.config/opencode-go
+model	glm-5.3
+small_model	glm-5.3-flash
+timeout	1800
+caps	read,edit,bash,mcp,mcp-write
+residency	OpenCode Go gateway (ZDR per model, see opencode.ai/docs/go)

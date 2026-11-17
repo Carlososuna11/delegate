@@ -100,7 +100,7 @@ narrowest flags that fit. Return its result verbatim, then one line with what yo
 
 ## Proveedores
 
-Cada proveedor es un archivo `clave<TAB>valor` en `providers.d/`. El repo trae `deepseek` y `qwen`:
+Cada proveedor es un archivo `clave<TAB>valor` en `providers.d/`. El repo trae `deepseek`, `qwen` y `opencode-go`. `opencode-go` es el gateway de OpenCode Go: usa `glm-5.3` por defecto, y con `--model` corre cualquier ID que liste `https://opencode.ai/inference/go/v1/models` (por ejemplo `deepseek-v4.1-flash` o `kimi-k3.1-pro`). Los modelos alojados fuera de EE. UU. y Europa necesitan la región Global activa en el Console. Así se ve un archivo de proveedor:
 
 ```text
 endpoint	https://api.deepseek.com/anthropic
