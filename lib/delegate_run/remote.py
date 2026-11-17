@@ -402,16 +402,39 @@ def _compare_rules(pending: dict, remote_result: dict) -> None:
     """Say so when the host ran with other rules than the laptop has: drift is
     detected, not prevented (merging a rules change does not install it)."""
     local, remote_rules = pending.get("rules"), remote_result.get("rules")
-    if not isinstance(local, dict) or not isinstance(remote_rules, dict) or local == remote_rules:
+    if not isinstance(local, dict) or remote_rules is None or local == remote_rules:
         return
-    names = []
-    if local.get("core") != remote_rules.get("core"):
-        names.append("núcleo")
-    lp, rp = local.get("packs") or {}, remote_rules.get("packs") or {}
-    names += sorted(p for p in set(lp) | set(rp) if lp.get(p) != rp.get(p))
+    lp = _packs_or_none(local.get("packs"))
+    if lp is None:
+        return
+    # The host's result.json is another machine's data: a shape other than
+    # {"core": str|None, "packs": {id: str|None}} is a mismatch to report,
+    # and only ids that are valid pack ids are ever printed.
+    rp = _packs_or_none(remote_rules.get("packs")) if isinstance(remote_rules, dict) else None
+    if rp is None:
+        names = ["formato inválido"]
+    else:
+        names = []
+        if local.get("core") != remote_rules.get("core"):
+            names.append("núcleo")
+        differing = {p for p in set(lp) | set(rp) if lp.get(p) != rp.get(p)}
+        valid = sorted(p for p in differing if _request._ID_PATTERN.match(p))
+        names += valid
+        if len(valid) < len(differing):
+            names.append("ids inválidos")
     if names:
         _say(f"las reglas de {pending['host']} difieren de las locales ({', '.join(names)}); "
              "reinstala la versión que corresponda en uno de los dos")
+
+
+def _packs_or_none(packs) -> dict | None:
+    """`packs` when it is a {str: str|None} dict, else None."""
+    if not isinstance(packs, dict):
+        return None
+    for key, value in packs.items():
+        if not isinstance(key, str) or not (value is None or isinstance(value, str)):
+            return None
+    return packs
 
 
 def _unknown(pending: dict, why: str) -> tuple[dict, int]:

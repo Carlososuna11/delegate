@@ -14,7 +14,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
 
-from delegate_run import contract, request, runner  # noqa: E402
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+from delegate_run import contract, remote, request, rules, runner  # noqa: E402
 
 from .test_remote import RemoteBase  # noqa: E402
 from .test_runner import RunnerBase  # noqa: E402
@@ -135,6 +138,51 @@ class RunnerRulesTest(RunnerBase):
         runner.execute(self._req(grants=("edit",), account="kontigo"))
         self.assertEqual(self.rules_args(), [])
 
+    def test_no_account_selects_by_the_account_delegate_would_use(self):
+        # No account in the request: delegate falls back to its default. When
+        # that default may not use the pack, selecting it would only set up a
+        # refusal (exit 2), so it is not selected.
+        self.set_origin(INNOVARES_ORIGIN)
+        os.environ["FAKE_DEFAULT_ACCOUNT"] = "kontigo"
+        try:
+            result = runner.execute(self._req(grants=("edit",)))
+        finally:
+            del os.environ["FAKE_DEFAULT_ACCOUNT"]
+        self.assertEqual(result.status, contract.COMPLETED, result.error)
+        self.assertEqual(self.rules_args(), [])
+
+    def test_no_resolvable_account_selects_nothing(self):
+        self.set_origin(INNOVARES_ORIGIN)
+        os.environ["FAKE_DEFAULT_ACCOUNT"] = ""
+        try:
+            runner.execute(self._req(grants=("edit",)))
+        finally:
+            del os.environ["FAKE_DEFAULT_ACCOUNT"]
+        self.assertEqual(self.rules_args(), [])
+
+    def test_packs_delegate_would_refuse_are_never_selected(self):
+        # Cheap format checks match delegate's: a pack it would refuse on its
+        # metadata is not chosen (anything else, permissions or a sha that no
+        # longer matches the text, fails the run closed with exit 2).
+        self.set_origin(INNOVARES_ORIGIN)
+        bad = {
+            "badaccount": ("Mal Nombre", INNOVARES_REMOTE, None),
+            "badsha": ("personal", INNOVARES_REMOTE, "xyz"),
+            "posixclass": ("personal", "github.com[:/]Innovares/[[:alpha:]]", None),
+            "pythononly": ("personal", "github.com[:/]Innovares/\\w", None),
+        }
+        for pack_id, (accounts, remotes, sha) in bad.items():
+            write_pack(self.rules_dir, pack_id, accounts, remotes)
+            if sha:
+                pack = self.rules_dir / pack_id / "pack"
+                pack.write_text(pack.read_text().replace(
+                    pack.read_text().split("sha256\t")[1].strip(), sha))
+        for pack_id in bad:
+            with self.subTest(pack=pack_id):
+                self.assertIsNone(rules.read_pack(pack_id))
+        runner.execute(self._req(grants=("edit",)))
+        self.assertEqual(self.rules_args(), ["innovares"])
+
     def test_unknown_explicit_pack_is_recorded_without_a_sha(self):
         result = runner.execute(self._req(rules=("nadie",)))
         self.assertEqual(self.rules_args(), ["nadie"])
@@ -147,12 +195,51 @@ class RunnerRulesTest(RunnerBase):
         self.assertIsNone(req_doc["rules"])
 
 
+class CompareRulesTest(unittest.TestCase):
+    """The host's result.json is data from another machine: a malformed
+    `rules` is a mismatch to report, never a crash in the fetch."""
+
+    def compare(self, remote_rules):
+        pending = {"host": "buildbox",
+                   "rules": {"core": "c" * 64, "packs": {"innovares": "a" * 64}}}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            remote._compare_rules(pending, {"rules": remote_rules})
+        return err.getvalue()
+
+    def test_malformed_packs_are_a_mismatch(self):
+        for packs in (["innovares"], "innovares", {"innovares": 3}, {1: "a"}, None):
+            with self.subTest(packs=packs):
+                err = self.compare({"core": "c" * 64, "packs": packs})
+                self.assertIn("difieren", err)
+
+    def test_malformed_rules_are_a_mismatch(self):
+        for value in (["x"], "x", 3):
+            with self.subTest(value=value):
+                self.assertIn("difieren", self.compare(value))
+
+    def test_pack_ids_from_the_host_are_not_printed_raw(self):
+        evil = "\x1b]0;pwn\x07innovares"
+        err = self.compare({"core": "c" * 64,
+                            "packs": {"innovares": "a" * 64, evil: "b" * 64}})
+        self.assertIn("difieren", err)
+        self.assertNotIn("\x1b", err)
+        self.assertNotIn("pwn", err)
+
+    def test_equal_rules_say_nothing(self):
+        self.assertEqual(self.compare({"core": "c" * 64,
+                                       "packs": {"innovares": "a" * 64}}), "")
+
+
 class RemoteRulesTest(RemoteBase):
     def setUp(self):
         super().setUp()
         self.laptop_rules = self.tmp / "laptop-rules"
         self.laptop_rules.mkdir(mode=0o700)
         self.env["DELEGATE_RULES_DIR"] = str(self.laptop_rules)
+        # The laptop asks its own delegate which account a run without one
+        # falls back to (the fake says `personal`).
+        self.env["DELEGATE_BIN"] = self.remote_env["DELEGATE_BIN"]
         self.remote_rules = self.tmp / "remote-rules"
         self.remote_rules.mkdir(mode=0o700)
         self.remote_env["DELEGATE_RULES_DIR"] = str(self.remote_rules)
