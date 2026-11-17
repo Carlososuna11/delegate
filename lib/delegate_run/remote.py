@@ -51,7 +51,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import contract, request as _request, runner
+from . import contract, request as _request, rules as _rules, runner
 
 # A host as ssh_config names it, optionally user@: no ':' (git would read
 # host:path wrongly), no '/', and never a leading '-' (an ssh option).
@@ -393,8 +393,25 @@ def _complete(pending: dict, remote_result: dict) -> tuple[dict, int]:
                 remote_result["branch"] = None
                 remote_result["status"] = contract.INFRA_FAILED
                 remote_result["error"] = why
+    _compare_rules(pending, remote_result)
     result = _local_copy(run_id, host, remote_result, pending["local_request"], pending)
     return result, _exit_for(result)
+
+
+def _compare_rules(pending: dict, remote_result: dict) -> None:
+    """Say so when the host ran with other rules than the laptop has: drift is
+    detected, not prevented (merging a rules change does not install it)."""
+    local, remote_rules = pending.get("rules"), remote_result.get("rules")
+    if not isinstance(local, dict) or not isinstance(remote_rules, dict) or local == remote_rules:
+        return
+    names = []
+    if local.get("core") != remote_rules.get("core"):
+        names.append("núcleo")
+    lp, rp = local.get("packs") or {}, remote_rules.get("packs") or {}
+    names += sorted(p for p in set(lp) | set(rp) if lp.get(p) != rp.get(p))
+    if names:
+        _say(f"las reglas de {pending['host']} difieren de las locales ({', '.join(names)}); "
+             "reinstala la versión que corresponda en uno de los dos")
 
 
 def _unknown(pending: dict, why: str) -> tuple[dict, int]:
@@ -593,6 +610,10 @@ def _run_remote(req: contract.Request, host: str, detach: bool):
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+    # The packs are chosen HERE, from the laptop's origin and rules.d: the
+    # host's mirror has no origin. The host gets the list and checks each pack
+    # against its own installed copy (delegate exits 2 if one is missing).
+    req = runner.resolve_rules(req, repo, bare)
     local_req = runner._request_dict(req)
     local_req.update(repo=str(repo), base=base, run_id=run_id, host=host)
     try:
@@ -608,10 +629,16 @@ def _run_remote(req: contract.Request, host: str, detach: bool):
     remote_req = runner._request_dict(req)
     remote_req.update(v=contract.SCHEMA_VERSION, repo=mirror, base=base, snapshot=False,
                       run_id=run_id)
+    # No packs: the key is left out rather than sent as []. Same run (the
+    # mirror has no origin, so the host selects nothing), and a host installed
+    # before `rules` existed keeps accepting requests that do not use it.
+    if not remote_req["rules"]:
+        del remote_req["rules"]
     payload = json.dumps(remote_req, ensure_ascii=True).encode()
     pending = {"v": 1, "run_id": run_id, "host": host, "mirror": mirror,
                "repo": str(repo), "base": base, "created_at": time.time(),
-               "local_request": local_req}
+               "local_request": local_req,
+               "rules": _rules.summary(req.rules, req.grants)}
     contract.write_json_atomic(_pending_path(run_id), pending)
     try:
         if detach:

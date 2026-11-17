@@ -29,7 +29,7 @@ BIN = Path(__file__).resolve().parents[2] / "bin" / "delegate-run"
 
 _ENV_KEYS = ("DELEGATE_STATE_DIR", "DELEGATE_BIN", "DELEGATE_SLOTS",
              "DELEGATE_RUN_GRACE", "DELEGATE_RUN_SLACK", "FAKE_MODE",
-             "FAKE_ARGV_FILE")
+             "FAKE_ARGV_FILE", "DELEGATE_RULES_DIR")
 
 
 class RunnerBase(unittest.TestCase):
@@ -49,6 +49,9 @@ class RunnerBase(unittest.TestCase):
         os.environ["DELEGATE_RUN_GRACE"] = "0.5"
         os.environ["DELEGATE_RUN_SLACK"] = "0.5"
         os.environ.pop("FAKE_ARGV_FILE", None)
+        # Never the real ~/.config/delegate/rules.d: a pack installed on this
+        # machine would change what the runner selects.
+        os.environ["DELEGATE_RULES_DIR"] = str(self.tmp / "rules.d")
         os.chmod(FAKE, 0o755)
 
     @staticmethod

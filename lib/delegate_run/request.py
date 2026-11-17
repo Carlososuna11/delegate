@@ -21,7 +21,7 @@ from .scope import ScopeError, compile_glob
 # never silently becomes a default.
 _KNOWN_KEYS = frozenset({
     "v", "provider", "account", "repo", "base", "grants", "mcp",
-    "timeout", "task", "checks", "scope", "snapshot", "wait", "run_id",
+    "timeout", "task", "checks", "scope", "snapshot", "wait", "run_id", "rules",
 })
 
 # Keys the dataclass has no default for: they must be present.
@@ -39,6 +39,7 @@ BASE_MAX = 200
 TASK_MAX = 100000
 CHECKS_MAX = 20
 SCOPE_MAX = 50
+RULES_MAX = 8
 
 DEFAULT_BASE = "HEAD"
 DEFAULT_TIMEOUT = 1800
@@ -219,6 +220,26 @@ def _check_mcp(obj: dict) -> tuple[str, ...]:
     return tuple(raw)
 
 
+def _check_rules(obj: dict) -> tuple[str, ...] | None:
+    """Pack ids for --rules. Absent: the runner chooses by origin. [] turns
+    that choice off. Whether a pack exists and may be used is delegate's call."""
+    if "rules" not in obj:
+        return None
+    raw = _text_list(obj, "rules")
+    if len(raw) > RULES_MAX:
+        raise RequestError(f"'rules' admite hasta {RULES_MAX} paquetes")
+    seen: set[str] = set()
+    for index, pack in enumerate(raw):
+        if not _ID_PATTERN.match(pack):
+            raise RequestError(
+                f"'rules'[{index}]={pack!r} no es un id válido: empieza con "
+                "letra; letras, dígitos y '-'; hasta 32 caracteres")
+        if pack in seen:
+            raise RequestError(f"'rules' repite {pack!r}")
+        seen.add(pack)
+    return tuple(raw)
+
+
 def _check_timeout(obj: dict) -> int:
     timeout = obj.get("timeout", DEFAULT_TIMEOUT)
     if not _is_int(timeout):
@@ -343,4 +364,5 @@ def parse_request(raw: bytes | str) -> Request:
         snapshot=_flag(obj, "snapshot", False),
         wait=_flag(obj, "wait", True),
         run_id=_check_run_id(obj),
+        rules=_check_rules(obj),
     )

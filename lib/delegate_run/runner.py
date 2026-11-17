@@ -41,6 +41,7 @@ is shared: see CLAUDE.md, "Sandbox".
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import fcntl
 import json
 import os
@@ -52,7 +53,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import contract, report as _report, sandbox as _sandbox, scope as _scope
+from . import contract, report as _report, rules as _rules, sandbox as _sandbox, scope as _scope
 from .contract import CheckResult, Request, Result
 
 DEFAULT_SLOTS = 2
@@ -816,6 +817,26 @@ def _sandbox_ro(worktree: Path, gitdir: str) -> list[str]:
     return paths
 
 
+# --- rules ------------------------------------------------------------------
+
+def _origin(repo: Path, bare: bool) -> str | None:
+    """remote.origin.url of the user's repository, read before the child runs
+    (until then the repository's config is the user's and is respected). A
+    bare repository is a host's mirror: its origin says nothing."""
+    if bare:
+        return None
+    proc = _git(repo, ["config", "--get", "remote.origin.url"], check=False)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def resolve_rules(req: Request, repo: Path, bare: bool) -> Request:
+    """The request with `rules` decided: its own list, or the packs chosen by
+    origin. The remote client calls this on the laptop, where the origin is."""
+    return dataclasses.replace(req, rules=_rules.effective(req, _origin(repo, bare)))
+
+
 # --- child ------------------------------------------------------------------
 
 def _child_argv(req: Request, worktree: Path, sandbox_ro: list[str] | None = None) -> list[str]:
@@ -832,6 +853,8 @@ def _child_argv(req: Request, worktree: Path, sandbox_ro: list[str] | None = Non
         argv.append("--bash")
     for server in req.mcp:
         argv += ["--mcp", server]
+    for pack in req.rules or ():
+        argv += ["--rules", pack]
     argv += ["--dir", str(worktree), "--timeout", str(req.timeout), "--", req.task]
     return argv
 
@@ -1084,6 +1107,7 @@ def _request_dict(req: Request) -> dict:
     data = dict(req.__dict__)
     data["grants"] = list(req.grants)
     data["mcp"] = list(req.mcp)
+    data["rules"] = None if req.rules is None else list(req.rules)
     data["checks"] = [list(c) for c in req.checks]
     data["scope"] = list(req.scope)
     return data
@@ -1095,6 +1119,8 @@ def _run(req: Request, result: Result, run: _Run) -> None:
     sandboxed = _decide_sandbox(result)
     _PINNED_GIT = _resolve("git")
     repo, bare = _toplevel(req.repo)
+    req = resolve_rules(req, repo, bare)
+    result.rules = _rules.summary(req.rules, req.grants)
     run.check_stop()
     base = _resolve_base(repo, req, result.run_id, rd, bare)
     result.base = base

@@ -74,7 +74,7 @@ def parse(argv):
         if arg == "--dir":
             workdir = args[i + 1]
             i += 2
-        elif arg in ("--account", "--timeout", "--mcp"):
+        elif arg in ("--account", "--timeout", "--mcp", "--rules"):
             i += 2
         elif arg == "--":
             task = " ".join(args[i + 1:])
