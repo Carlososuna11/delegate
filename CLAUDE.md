@@ -329,7 +329,12 @@ primeras entran al system prompt, anexadas a `DG_RULES` por el mismo y único
   puntero la línea se quita y los pasos se renumeran.
 - **Puntero al repo** (paso 1). Si `$wroot/CLAUDE.md` o, si no, `$wroot/AGENTS.md` es un
   archivo regular que resuelve **dentro** del árbol, el paso dice "léelo completo" (hasta 300
-  líneas) o "tiene N líneas: lee por secciones". `delegate` solo hace `stat` y cuenta líneas:
+  líneas) o "tiene N líneas: lee por secciones". En los dos casos acota su alcance: sus
+  convenciones mandan sobre los pasos 2 a 6, no sobre el resto del system prompt, y de sus
+  líneas `@archivo` solo se leen las de ruta relativa dentro del repo, nunca una absoluta ni
+  una con `~` (un `@~/.config/...` en el CLAUDE.md de un repo mandaría config privada al
+  proveedor). El texto exacto está fijado en un test. `delegate` solo hace `stat` y cuenta
+  líneas (en a lo sumo 1 MiB y 5 s, por si el archivo es enorme o lo cambian por un FIFO):
   el **texto** del repo nunca entra al system prompt, lo lee el modelo con `Read` como
   cualquier otro archivo. Un repo no es el dueño de la máquina, y el system prompt es la
   posición más fuerte. Un symlink que sale del árbol, un FIFO o un directorio no generan
@@ -360,9 +365,19 @@ lo vuelva a agregar, en cada máquina. `delegate rules list` imprime cada texto 
 la misma defensa que `mcp list` con `rules`. `delegate rules check [id...]` valida sin
 correr nada.
 
-`remotes` son expresiones regulares (charset que ERE y Python leen igual, sin coma) contra
-`remote.origin.url`. Las usa solo `delegate-run` para elegir paquetes; `delegate` nunca
-elige solo.
+`remotes` son expresiones regulares contra `remote.origin.url`, con un charset sin coma
+ni backslash y sin clases POSIX (`[:alpha:]`, `[.a.]`), que en Python son caracteres
+sueltos. `rules add` y `rules check` además las compilan con `python3 -I -W error` (`a**`
+y `x)` son ERE válidas y Python las rechaza); una corrida no las usa, así que no necesita
+python3. Las usa solo `delegate-run` para elegir paquetes; `delegate` nunca elige solo.
+
+`delegate-run` aplica las mismas comprobaciones de formato de `pack` y nunca elige un
+paquete que `delegate` rechazaría por ellas (lo avisa en stderr). Elige solo los que la
+cuenta de la corrida puede usar; sin `account` en la petición, se lo pregunta a
+`delegate account <proveedor> current` (la misma función que resuelve la cuenta de una
+corrida, sin tocar la key), y si no hay respuesta no elige ninguno. Un paquete que pasa
+el formato pero falla otra comprobación (permisos, sha) se elige igual y la corrida sale
+con 2: falla cerrada, nunca corre con reglas sin revisar.
 
 ## Cuentas
 
@@ -449,7 +464,8 @@ de siempre; si ya existe o lo reservó un cliente remoto, exit 3 y no se crea na
 con `--remote` se rechaza: el id lo elige el cliente), `rules` (lista de ids de
 paquetes, hasta 8, que llegan como `--rules`; `[]` los apaga; sin la clave, en una
 corrida con `edit` el runner elige los paquetes cuyo `remotes` calza con el
-`remote.origin.url` del repo, leído antes del hijo, y que la cuenta pedida puede usar).
+`remote.origin.url` del repo, leído antes del hijo, y que la cuenta de la corrida puede
+usar: la pedida o, sin ella, la que responde `delegate account <proveedor> current`).
 
 `result.json` trae `rules`: `{"core": <sha256 de rules/core.md o null sin edit>,
 "packs": {<id>: <sha256 fijado o null si esta máquina no lo tiene>}}`. `request.json`
@@ -717,8 +733,13 @@ La petición es la de siempre, con `repo` local. El cliente:
    (sin paquetes, la clave no se manda, y un host anterior a `rules` la sigue
    aceptando; el mirror no tiene `origin`, así que el host nunca elige; usa su propia copia de
    cada paquete y, si le falta uno, `delegate` sale con 2 antes de leer la key). Al
-   volver, si los sha del `result.json` remoto difieren de los locales, el cliente lo
-   avisa: la deriva se detecta, no se evita.
+   volver, si los sha del `result.json` remoto difieren de los locales (o su `rules`
+   no tiene la forma esperada), el cliente lo avisa: la deriva se detecta, no se evita.
+   Sin `account`, el cliente elige con la cuenta por defecto de la laptop; si la del
+   host es otra y no puede usar el paquete, la corrida sale con 2. Orden al desplegar un
+   cambio de reglas: primero actualizar `delegate` en el host e instalar ahí el paquete,
+   después en la laptop; al revés, el host recibe `rules` que no conoce o un paquete que
+   no tiene y rechaza la corrida.
 5. Trae `delegate/<run_id>` a una ref privada (`refs/delegate/fetch/<run_id>`, que no
    puede existir antes), verifica que sea un commit sobre la base y recién ahí crea la
    rama con un `update-ref` que solo crea y no sigue symrefs: una rama local existente

@@ -158,7 +158,7 @@ delegate rules check      # archivos, permisos y sha de cada paquete
 ```
 
 - `--accounts` dice qué cuentas pueden usarlo: con otra cuenta, la corrida sale con 2 antes de leer la key.
-- `--remotes` son patrones (expresiones regulares) contra el `remote.origin.url` del repo. `delegate-run` elige solo los paquetes que calzan, en corridas con `edit` y cuando la petición no trae `rules`.
+- `--remotes` son patrones (expresiones regulares) contra el `remote.origin.url` del repo, sin coma, sin backslash y sin clases POSIX como `[:alpha:]`; `rules add` comprueba con `python3` que compilen igual que en `delegate-run`. `delegate-run` elige solo los paquetes que calzan, en corridas con `edit`, cuando la petición no trae `rules` y si la cuenta de la corrida puede usarlos (sin `account`, la que dice `delegate account <proveedor> current`).
 - Los archivos tienen que ser tuyos y no escribibles por nadie más. Mergear un cambio en la fuente no lo instala: hay que correr `rules add` otra vez, en cada máquina.
 
 ## delegate-run: corridas aisladas y en paralelo
@@ -222,7 +222,7 @@ delegate-run fetch <run_id> --remote <host>      # recupera una corrida que qued
 
 El cliente empuja la base a un mirror en el host y le manda la petición por ssh. Luego trae la rama de vuelta: nunca mueve una rama local que ya exista. El host usa sus propias keys de delegación.
 
-Los paquetes de reglas los elige el cliente, con el `origin` y el `rules.d` locales, y la petición llega al host con la lista ya resuelta. El host usa su propia copia instalada (si le falta un paquete, la corrida se rechaza antes de leer la key), y si sus sha difieren de los locales el cliente lo avisa.
+Los paquetes de reglas los elige el cliente, con el `origin` y el `rules.d` locales, y la petición llega al host con la lista ya resuelta. El host usa su propia copia instalada (si le falta un paquete, la corrida se rechaza antes de leer la key), y si sus sha difieren de los locales el cliente lo avisa. Para desplegar un paquete nuevo o un cambio de reglas, actualiza primero `delegate` en el host e instala ahí el paquete, y después en la laptop: al revés, el host rechaza la corrida.
 
 ## Seguridad
 
