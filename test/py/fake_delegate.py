@@ -31,6 +31,9 @@ Modes (FAKE_MODE):
   script             exec the Python in $FAKE_SCRIPT with --dir as cwd, then
                      print the valid JSON result (or exit with what it sets)
 
+`account <provider> current` prints $FAKE_DEFAULT_ACCOUNT (default `personal`),
+or exits 2 when it is set to the empty string: the account delegate would use.
+
 If FAKE_ARGV_FILE is set, the full argv is also dumped there as JSON so a test
 can assert the exact command line the runner built.
 """
@@ -74,7 +77,7 @@ def parse(argv):
         if arg == "--dir":
             workdir = args[i + 1]
             i += 2
-        elif arg in ("--account", "--timeout", "--mcp"):
+        elif arg in ("--account", "--timeout", "--mcp", "--rules"):
             i += 2
         elif arg == "--":
             task = " ".join(args[i + 1:])
@@ -114,6 +117,12 @@ def _git(workdir, *args):
 
 
 def main(argv):
+    if argv[1:2] == ["account"] and argv[3:4] == ["current"]:
+        name = os.environ.get("FAKE_DEFAULT_ACCOUNT", "personal")
+        if not name:
+            return 2
+        print(name)
+        return 0
     mode = os.environ.get("FAKE_MODE", "ok_noop")
     workdir, _task = parse(argv)
 

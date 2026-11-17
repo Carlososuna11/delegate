@@ -65,6 +65,9 @@ class Request:
     snapshot: bool = False       # allow a dirty tree by committing it to a temp ref
     wait: bool = True            # wait for a free slot instead of returning BUSY
     run_id: str | None = None    # chosen by the caller (remote client); None = generate
+    # Code-rule packs passed to delegate as --rules. None = chosen by the
+    # runner from the repository's origin (edit runs only); () = none.
+    rules: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -111,6 +114,9 @@ class Result:
     # From the harness JSON; None when it did not say. Additive to schema v1.
     num_turns: int | None = None
     harness_seconds: float | None = None  # the harness's own duration_ms / 1000
+    # {"core": sha256 | None, "packs": {id: pinned sha256 | None}}: the rules
+    # this run was given, as this machine has them. Additive to schema v1.
+    rules: dict | None = None
     v: int = SCHEMA_VERSION
 
     def to_json(self) -> dict:

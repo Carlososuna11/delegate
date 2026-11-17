@@ -56,6 +56,7 @@ delegate <proveedor> [opciones] "tarea"       agente con herramientas
 delegate <proveedor> chat [opciones] "texto"  una pregunta, sin herramientas
 delegate account <proveedor> <acción>         cuentas (API keys)
 delegate mcp list                             servidores MCP declarados
+delegate rules list|add|check                 paquetes de reglas de código
 delegate providers                            proveedores configurados
 delegate help
 ```
@@ -73,6 +74,16 @@ Pide siempre el acceso más angosto que alcance para la tarea:
 | `--mcp-write <id>` | También las de escritura de ese servidor |
 
 `--mcp` y `--mcp-write` se pueden repetir. Sin ellos, la corrida no alcanza ningún MCP.
+
+### Reglas de código
+
+Con `--edit`, el prompt de sistema lleva además una hoja corta de procedimiento (`rules/core.md`): buscar antes de crear, definir cada valor una sola vez, copiar la forma del archivo vecino, revisar el diff y terminar con una sección "Reutilización". Su primer paso le dice al modelo qué archivo de reglas del árbol leer (`CLAUDE.md` o, si no hay, `AGENTS.md`; por secciones si pasa de 300 líneas). El texto de ese archivo nunca entra al prompt de sistema: el modelo lo lee con `Read`, como cualquier otro archivo.
+
+| Opción | Uso |
+|---|---|
+| `--rules <id>` | Agrega un paquete de reglas de organización. Repetible; vale también sin `--edit` |
+
+Sin `--edit` no hay hoja; un paquete solo entra si se pide por nombre.
 
 ### Otras opciones
 
@@ -135,6 +146,21 @@ Reglas de la declaración:
 - Un servidor `http` o `sse` sin `env_passthrough` usa el login OAuth que Claude Code guardó para ese nombre y esa URL. Con sandbox, `delegate` monta solo esa entrada, en solo lectura; si no existe o el access token venció, la corrida se rechaza en vez de arrancar sin herramientas. Abre Claude Code una vez para renovarlo. El `refreshToken` nunca cruza al sandbox.
 - `rules` agrega instrucciones al prompt de la corrida solo cuando ese servidor está habilitado. `delegate mcp list` las muestra completas para que las revises.
 
+## Paquetes de reglas
+
+Un paquete son las reglas de código de una organización, instaladas por el dueño de la máquina en `~/.config/delegate/rules.d/<id>/` (o en `$DELEGATE_RULES_DIR`): `rules.md` con el texto (hasta 2.000 bytes, UTF-8, sin caracteres de control) y `pack` con sus metadatos. El texto queda fijado por su sha256: si cambia, la corrida se rechaza hasta que lo vuelvas a instalar.
+
+```bash
+delegate rules add innovares --from <devkit>/delegate/rules.md \
+  --accounts personal --remotes 'github.com[:/]Innovares/'
+delegate rules list       # imprime cada paquete completo, para revisarlo
+delegate rules check      # archivos, permisos y sha de cada paquete
+```
+
+- `--accounts` dice qué cuentas pueden usarlo: con otra cuenta, la corrida sale con 2 antes de leer la key.
+- `--remotes` son patrones (expresiones regulares) contra el `remote.origin.url` del repo, sin coma, sin backslash y sin clases POSIX como `[:alpha:]`; `rules add` comprueba con `python3` que compilen igual que en `delegate-run`. `delegate-run` elige solo los paquetes que calzan, en corridas con `edit`, cuando la petición no trae `rules` y si la cuenta de la corrida puede usarlos (sin `account`, la que dice `delegate account <proveedor> current`).
+- Los archivos tienen que ser tuyos y no escribibles por nadie más. Mergear un cambio en la fuente no lo instala: hay que correr `rules add` otra vez, en cada máquina.
+
 ## delegate-run: corridas aisladas y en paralelo
 
 `delegate-run` envuelve a `delegate` para tareas que **editan**. Recibe una petición JSON por stdin, corre la tarea en un worktree aislado, mide qué cambió y corre los checks que pediste. El resultado queda en la rama `delegate/<run_id>`.
@@ -152,6 +178,7 @@ cat > peticion.json <<'EOF'
   "timeout": 1800
 }
 EOF
+# "rules": ["innovares"] fija los paquetes; [] los apaga; sin la clave, los elige el origin del repo
 delegate-run < peticion.json      # imprime result.json; exit 0 solo si quedó "completed"
 ```
 
@@ -194,6 +221,8 @@ delegate-run fetch <run_id> --remote <host>      # recupera una corrida que qued
 ```
 
 El cliente empuja la base a un mirror en el host y le manda la petición por ssh. Luego trae la rama de vuelta: nunca mueve una rama local que ya exista. El host usa sus propias keys de delegación.
+
+Los paquetes de reglas los elige el cliente, con el `origin` y el `rules.d` locales, y la petición llega al host con la lista ya resuelta. El host usa su propia copia instalada (si le falta un paquete, la corrida se rechaza antes de leer la key), y si sus sha difieren de los locales el cliente lo avisa. Para desplegar un paquete nuevo o un cambio de reglas, actualiza primero `delegate` en el host e instala ahí el paquete, y después en la laptop: al revés, el host rechaza la corrida.
 
 ## Seguridad
 

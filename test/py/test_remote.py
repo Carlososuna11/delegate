@@ -41,7 +41,10 @@ _ALLOWED_CMD = (r"\Adelegate-run\Z",
 SLOW_EDIT = "import time; time.sleep(%s); open('edited.txt', 'w').write('remote\\n')"
 
 
-class RemoteTest(unittest.TestCase):
+class RemoteBase(unittest.TestCase):
+    """The laptop/host fixture and its helpers, without tests: other suites
+    subclass it without running these cases again."""
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="dlgremote-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -161,6 +164,8 @@ class RemoteTest(unittest.TestCase):
             self.assertTrue(any(re.match(p, call["cmd"]) for p in _ALLOWED_CMD),
                             f"unexpected remote command: {call['cmd']!r}")
 
+
+class RemoteTest(RemoteBase):
     # -- happy path ------------------------------------------------------------
 
     def test_happy_path_pushes_base_and_fetches_branch(self):
