@@ -58,6 +58,7 @@ last=''
   printf 'SMALL:%s\n' "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}"
   printf 'SUBAGENT:%s\n' "${CLAUDE_CODE_SUBAGENT_MODEL:-}"
   printf 'CTX:%s\n' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-unset}"
+  printf 'COMPACT:%s\n' "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-unset}"
 } > "$log"
 env > "$env_log"
 exit 0
@@ -411,6 +412,22 @@ test_no_context_tokens_without_the_key() {
   setup_runnable
   dg_run alpha --dir "$TMP/work" "haz algo"
   assert_contains "$(claude_log)" "CTX:unset" "no window is invented"
+}
+
+test_compact_window_reaches_the_child_for_any_model() {
+  setup_runnable
+  write_provider alpha $'compact_window\t200000'
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  assert_eq 0 "$RC" "run with compact_window succeeds"
+  assert_contains "$(claude_log)" "COMPACT:200000" "the window reaches the child"
+  dg_run alpha --dir "$TMP/work" --model other-model "haz algo"
+  assert_contains "$(claude_log)" "COMPACT:200000" "a --model override keeps the cost cap"
+}
+
+test_no_compact_window_without_the_key() {
+  setup_runnable
+  dg_run alpha --dir "$TMP/work" "haz algo"
+  assert_contains "$(claude_log)" "COMPACT:unset" "no window is invented"
 }
 
 test_provider_model_used_without_the_flag() {

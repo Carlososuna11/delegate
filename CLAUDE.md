@@ -203,7 +203,7 @@ que `--edit` y `--bash`.
 Un archivo por proveedor en `providers.d/`, formato `clave<TAB>valor`.
 
 **En config:** `endpoint`, `auth_env`, `key_dir`, `key_pattern`, `default_account`,
-`model`, `small_model`, `context_tokens`, `timeout`, `caps`, `residency`.
+`model`, `small_model`, `context_tokens`, `compact_window`, `timeout`, `caps`, `residency`.
 
 `context_tokens` es la ventana de contexto real de `model`, tal como la documenta el
 proveedor, y llega al hijo como `CLAUDE_CODE_MAX_CONTEXT_TOKENS` solo cuando la corrida
@@ -212,6 +212,13 @@ harness no conoce se asume de 200k y se auto-compacta ahí, con un aviso. qwen l
 983616: el valor de la guía de Claude Code de Alibaba para el Token Plan (el máximo de
 entrada en modo thinking de una ventana de 1M); no se usa `[1m]` porque esa entrada no
 llega al millón.
+
+`compact_window` llega al hijo como `CLAUDE_CODE_AUTO_COMPACT_WINDOW` en toda corrida,
+con o sin `--model`: no describe al modelo, pone tope al costo. Cada turno reenvía el
+contexto completo, así que una corrida larga que crece hasta 400k paga 400k por turno
+aunque casi todo sea caché. deepseek lleva 200000: con `[1m]` el harness compactaba
+cerca del millón, y entre 7 y 20 % del gasto de noviembre de 2026 eran turnos de más de
+200k.
 
 **En el script, no configurable:** validación de argumentos y config, el lattice de
 permisos locales, el enforcement de `caps`, `--bare`, la restricción de setting-sources,

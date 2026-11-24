@@ -112,7 +112,7 @@ timeout	1800
 caps	read,edit,bash,mcp,mcp-write
 ```
 
-- **Claves:** `endpoint`, `auth_env`, `key_dir`, `key_pattern`, `default_account`, `model`, `small_model`, `context_tokens`, `timeout`, `caps` y `residency`.
+- **Claves:** `endpoint`, `auth_env`, `key_dir`, `key_pattern`, `default_account`, `model`, `small_model`, `context_tokens`, `compact_window`, `timeout`, `caps` y `residency`.
 - **Validación:** el parser rechaza claves desconocidas o duplicadas.
 - **`auth_env`:** solo acepta `ANTHROPIC_API_KEY` (se manda como `x-api-key`) o `ANTHROPIC_AUTH_TOKEN` (como `Authorization: Bearer`).
 - **Otra carpeta:** con `DELEGATE_PROVIDERS_DIR` usas una carpeta de proveedores distinta.
