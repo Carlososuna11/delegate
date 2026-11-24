@@ -412,6 +412,16 @@ test_context_tokens_is_validated() {
   done
 }
 
+test_compact_window_is_validated() {
+  local v
+  for v in '9999' '0' '0200000' '10000001' '2e5' '200k' '-10000' '200 000'; do
+    assert_reject_value compact_window "$v" "compact_window '$v'"
+  done
+  for v in '10000' '200000' '10000000'; do
+    assert_accept_value compact_window "$v" "compact_window '$v'"
+  done
+}
+
 test_rejects_an_invalid_caps_element() {
   local v
   for v in 'nope' 'Read' 'read,nope' 'read, bash' 'edit,bash,all' 'read,edit,write' 'rwx'; do

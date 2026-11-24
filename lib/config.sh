@@ -67,6 +67,10 @@
 #                      `model` (not a --model override): a model the harness's
 #                      catalog does not know is otherwise assumed to have 200k
 #                      and auto-compacted there.
+#     compact_window   Tokens at which the harness auto-compacts, integer
+#                      10000..10000000. Exported as CLAUDE_CODE_AUTO_COMPACT_WINDOW
+#                      on every run. Every turn re-sends the whole context, so a
+#                      lower window caps what each call costs on long runs.
 #     caps             Comma-separated subset of: read,edit,bash,mcp,mcp-write
 #                      No duplicates, no empty elements. `read` is implied but
 #                      may be listed. This is the provider's CEILING, enforced in
@@ -209,6 +213,10 @@ _dg_config_validate() {
       [[ "$value" =~ ^[1-9][0-9]{3,7}$ ]] && (( value <= 10000000 )) ||
         { _dg_config_reason="line $lineno: context_tokens must be a whole number between 1000 and 10000000"; return 1; }
       ;;
+    compact_window)
+      [[ "$value" =~ ^[1-9][0-9]{4,7}$ ]] && (( value <= 10000000 )) ||
+        { _dg_config_reason="line $lineno: compact_window must be a whole number between 10000 and 10000000"; return 1; }
+      ;;
     caps)
       # Comma-separated subset, no duplicates, no empty elements. Elements are
       # matched whole, so `edit` cannot be satisfied by `mcp-write`.
@@ -294,7 +302,7 @@ dg_config_parse() {
     fi
 
     case "$key" in
-      endpoint|auth_env|key_dir|model|small_model|key_pattern|default_account|timeout|context_tokens|caps|residency) ;;
+      endpoint|auth_env|key_dir|model|small_model|key_pattern|default_account|timeout|context_tokens|compact_window|caps|residency) ;;
       *) _dg_config_err "$provider" "line $lineno: unknown key '$key'"; return 2 ;;
     esac
 

@@ -4,4 +4,5 @@ key_dir	~/.config/deepseek
 model	deepseek-flash[1m]
 small_model	deepseek-flash
 timeout	1800
+compact_window	200000
 caps	read,edit,bash,mcp,mcp-write

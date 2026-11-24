@@ -1138,6 +1138,12 @@ WRAP
   if [[ -n "${CFG[context_tokens]:-}" && "$model" == "${CFG[model]}" ]]; then
     _DG_X_CTX=("CLAUDE_CODE_MAX_CONTEXT_TOKENS=${CFG[context_tokens]}")
   fi
+  # Applies whatever the model: it bounds the cost of each turn, not a fact
+  # about one model.
+  _DG_X_COMPACT=()
+  if [[ -n "${CFG[compact_window]:-}" ]]; then
+    _DG_X_COMPACT=("CLAUDE_CODE_AUTO_COMPACT_WINDOW=${CFG[compact_window]}")
+  fi
   _DG_X_AUTHENV="${CFG[auth_env]}"
   _DG_X_KEY="$key"
   _DG_X_ARGS=("${claude_args[@]}")
@@ -1200,6 +1206,7 @@ dg_exec_child() {
     "ANTHROPIC_DEFAULT_HAIKU_MODEL=$_DG_X_SMALL"
     "CLAUDE_CODE_SUBAGENT_MODEL=$_DG_X_SMALL"
     ${_DG_X_CTX[@]+"${_DG_X_CTX[@]}"}
+    ${_DG_X_COMPACT[@]+"${_DG_X_COMPACT[@]}"}
     # Last, so nothing above can shadow it.
     "${_DG_X_AUTHENV}=$_DG_X_KEY"
   )
